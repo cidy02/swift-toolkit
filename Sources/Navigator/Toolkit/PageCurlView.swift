@@ -297,6 +297,34 @@ final class PageCurlView: UIView {
         if fingerUV.x.isFinite, fingerUV.y.isFinite {
             self.fingerUV = fingerUV
         }
+        logGrab()
+    }
+
+    private var grabLogCount = 0
+
+    /// Every eighth sample: the grab, the finger and the moved edge, in points.
+    /// The flap is the strip between `fold` and `p`, half the finger's travel.
+    private func logGrab() {
+        guard PageCurlDebug.enabled else {
+            return
+        }
+        grabLogCount += 1
+        guard grabLogCount % 8 == 1 else {
+            return
+        }
+        let aspect = pageAspect()
+        let leaf = PageCurlGeometry.span(spine: spine, peelSign: peelSign)
+        let grab = liveGrab(span: leaf, aspect: aspect)
+        let w = bounds.width
+        func pt(_ q: CGPoint) -> String {
+            String(format: "%.0f,%.0f", q.x * w, q.y * w)
+        }
+        let fold = PageCurlGeometry.mix(grab.p0, grab.p, 0.5)
+        PageCurlDebug.log(
+            "curl-grab phase=\(interactivePhase) start=\(String(format: "%.0f,%.0f", grabUV.x * w, grabUV.y * bounds.height)) "
+                + "finger=\(String(format: "%.0f,%.0f", fingerUV.x * w, fingerUV.y * bounds.height)) "
+                + "p0=\(pt(grab.p0)) p=\(pt(grab.p)) fold=\(pt(fold)) progress=\(String(format: "%.3f", progress))"
+        )
     }
 
     /// Runs the critically damped spring from the live progress. `progressVelocity`

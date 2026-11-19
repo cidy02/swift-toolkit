@@ -689,6 +689,54 @@ class PageCurlGeometryTests: XCTestCase {
         XCTAssertEqual(PageCurlGeometry.curlColumnCorrection(offset: 1170, target: 783), -387, accuracy: 0.001)
     }
 
+    /// T-561g. The back is the paper, darker only next to the fold. On a
+    /// mid-edge drag of 0.5 view widths the flap is 0.25 wide; all but the
+    /// band next to the fold is the paper itself.
+    func testBackIsPaperAwayFromTheFold() {
+        XCTAssertEqual(PageCurlGeometry.backShade(distanceFromFold: 0), PageCurlGeometry.backFoldShade, accuracy: 0.0001)
+        XCTAssertGreaterThanOrEqual(PageCurlGeometry.backFoldShade, 0.8)
+        XCTAssertEqual(PageCurlGeometry.backShade(distanceFromFold: PageCurlGeometry.backShadeBand), 1, accuracy: 0.0001)
+        XCTAssertEqual(PageCurlGeometry.backShade(distanceFromFold: 0.2), 1, accuracy: 0.0001)
+        XCTAssertLessThanOrEqual(PageCurlGeometry.backShadeBand, 0.25 * 0.3)
+        var last: CGFloat = 0
+        for step in 0 ... 10 {
+            let shade = PageCurlGeometry.backShade(distanceFromFold: CGFloat(step) * 0.01)
+            XCTAssertGreaterThanOrEqual(shade, last)
+            last = shade
+        }
+        // Light: white paper, so the back is near-white away from the fold.
+        let light = PageCurlGeometry.backsidePaper(background: PageCurlRGB(r: 1, g: 1, b: 1))
+        XCTAssertGreaterThan(light.r * PageCurlGeometry.backShade(distanceFromFold: 0.1), 0.95)
+        let source = PageCurlShader.source
+        XCTAssertTrue(source.contains(String(format: "mix(%.4f, 1.0, smoothstep(0.0, %.4f, s))",
+                                             PageCurlGeometry.backFoldShade, PageCurlGeometry.backShadeBand)))
+        XCTAssertFalse(source.contains("0.74, 0.98"))
+    }
+
+    /// T-561g. A mid-edge drag: the moved edge lands on P, the fold is the
+    /// midpoint, so the flap is half the finger's travel wide.
+    func testMidEdgeFlapIsHalfTheTravel() {
+        let p0 = CGPoint(x: 1, y: 1)
+        let travel: CGFloat = 0.54
+        let p = CGPoint(x: 1 - travel, y: 1)
+        let fold = tryGrab(p0: p0, p: p, radius: 0.08, spineX: 0, pageHeight: 2)
+        XCTAssertEqual(fold.point.x, 1 - travel / 2, accuracy: 0.0001)
+        let width = fold.point.x - p.x
+        XCTAssertEqual(width, travel / 2, accuracy: 0.0001)
+        // Just inside the moved edge is the back; just past it is the page.
+        let inside = sample(
+            uvX: p.x + 0.01, uvY: 0.5, progress: 0.5, spineX: 0, peelSign: 1, span: 1,
+            twoPage: false, realVerso: false, p0: p0, p: p, radius: 0.08, aspect: 0.5
+        )
+        XCTAssertEqual(inside.sheet, .outgoing)
+        XCTAssertNotEqual(inside.region, .flatOutgoing)
+        let outside = sample(
+            uvX: p.x - 0.01, uvY: 0.5, progress: 0.5, spineX: 0, peelSign: 1, span: 1,
+            twoPage: false, realVerso: false, p0: p0, p: p, radius: 0.08, aspect: 0.5
+        )
+        XCTAssertEqual(outside.region, .flatOutgoing)
+    }
+
     func testShaderDrawsAnOpaqueBackFromTheGrab() {
         let source = PageCurlShader.source
         XCTAssertTrue(source.contains("versoAlong"))

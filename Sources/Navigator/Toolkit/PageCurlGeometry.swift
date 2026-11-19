@@ -121,6 +121,15 @@ enum PageCurlGeometry {
     /// How far the mirrored front is pulled into the paper. 0.78 still read as
     /// reversed type, including at 0.90, so the ghost is a light stain.
     static let backsideMix: CGFloat = 0.96
+    /// Back of the leaf at the fold, as a multiple of its paper. The back is
+    /// the theme's paper everywhere else; only a band next to the fold, where
+    /// the sheet rolls away from the light, is darker. The previous ramp
+    /// (0.74 at the fold to 0.98 by 0.45 view widths) never reached the paper
+    /// on a half-page flap, so Light read as a flat mid-grey.
+    static let backFoldShade: CGFloat = 0.84
+    /// Width of that darker band, in view widths from the fold (about 24 pt on
+    /// an iPhone).
+    static let backShadeBand: CGFloat = 0.06
     /// A vertical fold reported outside this band is clamped, not trusted.
     static let divisionRange: ClosedRange<CGFloat> = 0.35 ... 0.65
 
@@ -679,6 +688,15 @@ enum PageCurlGeometry {
     /// neighbour resource is a fade. `.curl` is then rendered, not slid.
     static func rendered(_ request: PageTransitionPolicy.Request) -> PageTransition {
         PageTransitionPolicy.rendered(PageTransitionPolicy.resolve(request))
+    }
+
+    /// Multiplier on the back's colour at `distance` (view widths) from the
+    /// fold, toward the moved edge. Matches the shader's `shade`.
+    static func backShade(distanceFromFold distance: CGFloat) -> CGFloat {
+        let d = distance.isFinite ? max(0, distance) : 0
+        let t = min(1, d / max(backShadeBand, 0.0001))
+        let smooth = t * t * (3 - 2 * t)
+        return backFoldShade + (1 - backFoldShade) * smooth
     }
 
     /// Underside of a one-page leaf. The colour is the theme's own paper.

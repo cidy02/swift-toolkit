@@ -15,6 +15,9 @@ import Foundation
 /// `PageCurlGeometry.spreadSample`, which this fragment matches). The back of
 /// the leaf is opaque. The next page is drawn only where the leaf does not cover it.
 enum PageCurlShader {
+    private static let backFoldShade = String(format: "%.4f", PageCurlGeometry.backFoldShade)
+    private static let backShadeBand = String(format: "%.4f", PageCurlGeometry.backShadeBand)
+
     static let source = #"""
     #include <metal_stdlib>
     using namespace metal;
@@ -131,7 +134,7 @@ enum PageCurlShader {
         }
 
         // Back of the leaf. Opaque: one page is a paper ghost of the mirrored
-        // front, two pages are the incoming facing half. Darker toward the fold.
+        // front, two pages are the incoming facing half. Darker only near the fold.
         // A soft highlight sits on the cylinder axis (the bisector, offset by R).
         if (s > 0.0 && peeled) {
             float3 back;
@@ -144,7 +147,9 @@ enum PageCurlShader {
             } else {
                 back = paperBack(sampleTex(outgoing, paperUV(pre, aspect)), u);
             }
-            float shade = mix(0.74, 0.98, smoothstep(0.0, 0.45, s));
+            // Paper everywhere but a band next to the fold
+            // (PageCurlGeometry.backShade).
+            float shade = mix(\#(backFoldShade), 1.0, smoothstep(0.0, \#(backShadeBand), s));
             float axisDist = abs(s - R);
             float crest = exp(-pow(axisDist / max(R * 1.1, 0.015), 2.0));
             float spec = crest * u.specular * 0.22 * envelope;
