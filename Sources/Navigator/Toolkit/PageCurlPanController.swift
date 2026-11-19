@@ -194,6 +194,13 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
         )
         metalArmed = armed
         phase = .armed
+        // The snapshot await is long enough for the finger to move. The
+        // progress passed above is from before that wait. Sample again before
+        // the first frame, while the gesture is still down.
+        if armed, gesture.state == .began || gesture.state == .changed {
+            let now = fingerState(of: gesture, in: host)
+            curl.track(progress: now.progress, touchY: now.touchY)
+        }
         if let pending = pendingRelease {
             pendingRelease = nil
             await finish(commit: pending.commit && !aborted, velocity: pending.velocity)

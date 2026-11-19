@@ -493,6 +493,12 @@ final class PaginationView: UIView, Loggable {
     /// or re-running the current page's location.
     private func ensureLoadedForCurl(at index: Int, location: PageLocation) async -> (UIView & PageView)? {
         if let view = loadedViews[index] {
+            // Preload queues the neighbour at the right end, but the scroll
+            // may not have run, and a resource kept in the window can still
+            // be sitting on the other edge. Position it under the cover.
+            view.setSuppressingProgressionUpdates(true)
+            await view.go(to: location, animated: false)
+            await view.readyForPresentation()
             return view
         }
         loadingIndexQueue.removeAll { $0.index == index }
