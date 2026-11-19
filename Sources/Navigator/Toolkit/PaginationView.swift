@@ -589,13 +589,12 @@ final class PaginationView: UIView, Loggable {
             curl.removeFromSuperview()
             // A reload already reset these for the new spread. Writing them
             // again would unpin that spread or re-enable a scroll it disabled.
-            guard ownsFlags, generation == reloadGeneration else {
-                return
+            if ownsFlags, generation == reloadGeneration {
+                suppressProgressionDuringLoad = false
+                loadedViews[index]?.setSuppressingProgressionUpdates(false)
+                isAnimatingContentOffset = false
+                scrollView.isScrollEnabled = isScrollEnabled
             }
-            suppressProgressionDuringLoad = false
-            loadedViews[index]?.setSuppressingProgressionUpdates(false)
-            isAnimatingContentOffset = false
-            scrollView.isScrollEnabled = isScrollEnabled
         }
 
         guard pageTurnAttached(generation) else {
