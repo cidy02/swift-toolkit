@@ -133,7 +133,8 @@ enum PageCurlShader {
         float curlWidth = 2.0 * R;
         if (dist >= curlWidth) {
             float past = dist - curlWidth;
-            float shadow = (exp(-past / 0.050) * 0.26 + exp(-past / 0.18) * 0.07) * envelope;
+            // Short falloff. A wide tail reads as a grey veil on the next page.
+            float shadow = exp(-past / 0.038) * 0.20 * envelope;
             return float4(clamp(inC * (1.0 - shadow), 0.0, 1.0), 1.0);
         }
 

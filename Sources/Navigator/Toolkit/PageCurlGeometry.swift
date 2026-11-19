@@ -60,9 +60,9 @@ enum PageCurlGeometry {
     /// Peak cylinder radius as a fraction of view width, at progress 0.5.
     static let peakRadius: CGFloat = 0.070
     /// How far the mirrored front is pulled into the paper. The design note
-    /// said ~78%. On the filmed leaf that still read as reversed type, so the
-    /// ghost is stronger.
-    static let backsideMix: CGFloat = 0.90
+    /// said ~78%. Filmed frames still read the reversed type, including at
+    /// 0.90, so the ghost is a light stain.
+    static let backsideMix: CGFloat = 0.96
     /// A vertical fold reported outside this band is clamped, not trusted.
     static let divisionRange: ClosedRange<CGFloat> = 0.35 ... 0.65
 
@@ -213,7 +213,7 @@ struct PageCurlUniforms {
     var paperR: Float = 1
     var paperG: Float = 1
     var paperB: Float = 1
-    var paperMix: Float = 0.90
+    var paperMix: Float = 0.96
     var aspect: Float = 1
     var twoPage: Float = 0
     var pad0: Float = 0
