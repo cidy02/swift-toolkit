@@ -181,3 +181,21 @@ public struct MouseButtons: OptionSet, Equatable, CustomStringConvertible {
         return "[" + buttons.joined(separator: ",") + "]"
     }
 }
+
+extension PointerEvent {
+    /// What a navigator that is turning or loading still delivers. A down or a
+    /// move is dropped. An up or a cancel still ends the pointer's sequence, as
+    /// a cancel: a tap observer that saw the down resets instead of waiting
+    /// forever for an up, and nothing activates mid-turn. Dropping the up of a
+    /// finger curl's touch left every tap observer `.failed` on that pointer.
+    func deliveredWhileNavigatorBusy() -> PointerEvent? {
+        switch phase {
+        case .down, .move:
+            return nil
+        case .up, .cancel:
+            var event = self
+            event.phase = .cancel
+            return event
+        }
+    }
+}

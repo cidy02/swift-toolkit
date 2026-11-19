@@ -1330,14 +1330,17 @@ extension EPUBNavigatorViewController: EPUBSpreadViewDelegate {
     }
 
     func spreadView(_ spreadView: EPUBSpreadView, didReceive event: PointerEvent) {
+        // A finger curl moves the state off `.idle` between its own touch's
+        // down and up. The up must still reach the observers, as a cancel.
+        let delivered = state == .idle ? event : event.deliveredWhileNavigatorBusy()
         if PageCurlDebug.enabled, event.phase != .move || state != .idle {
-            PageCurlDebug.log("pointer \(event.phase) id=\(event.pointer.id) state=\(state) \(state == .idle ? "delivered" : "dropped")")
+            PageCurlDebug.log("pointer \(event.phase) id=\(event.pointer.id) state=\(state) \(delivered.map { "delivered \($0.phase)" } ?? "dropped")")
         }
-        guard state == .idle else {
+        guard let delivered else {
             return
         }
         Task {
-            var event = event
+            var event = delivered
             event.location = view.convert(event.location, from: spreadView)
             if let targetElement = event.targetElement {
                 event.targetElement?.frame = view.convert(targetElement.frame, from: spreadView)
