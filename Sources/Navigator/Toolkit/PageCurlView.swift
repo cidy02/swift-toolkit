@@ -124,11 +124,13 @@ final class PageCurlView: UIView {
             tapContinuation = continuation
             tapStart = CACurrentMediaTime()
             tapDuration = duration
-            // `preferredFrameRateRange` asks for 120 Hz. The scene's
-            // `displayLink` is optional on this SDK and nil off-screen;
-            // a display link created here still tracks the screen once added.
+            // Prefer 120 Hz. A minimum above the screen's maximum (a 60 Hz
+            // simulator, a ProMotion display that is currently throttled)
+            // can skip the callback entirely, which snaps the leaf.
             let link = CADisplayLink(target: self, selector: #selector(stepTap))
-            link.preferredFrameRateRange = CAFrameRateRange(minimum: 80, maximum: 120, preferred: 120)
+            let hz = Float(window?.screen.maximumFramesPerSecond ?? 60)
+            let cap = min(120, max(hz, 1))
+            link.preferredFrameRateRange = CAFrameRateRange(minimum: min(30, cap), maximum: cap, preferred: cap)
             displayLink = link
             link.add(to: .main, forMode: .common)
         }
@@ -327,15 +329,19 @@ private final class PageCurlRenderer {
         ])
     }
 
+    /// `MTKView.currentDrawable` is filled at the end of `-draw`. This path
+    /// never calls `-draw` (the view stays paused), so that property stays
+    /// empty after the first accidental grab and the leaf never moves.
+    /// `nextDrawable()` is the layer's own drawable, valid from the display link.
     private func encode(uniforms: PageCurlUniforms, in view: MTKView) -> MTLCommandBuffer? {
         guard
             let pipeline,
             let outgoing,
             let incoming,
-            let drawable = view.currentDrawable,
-            let pass = view.currentRenderPassDescriptor,
+            let layer = view.layer as? CAMetalLayer,
+            let drawable = nextDrawable(from: layer, view: view),
             let buffer = queue.makeCommandBuffer(),
-            let encoder = buffer.makeRenderCommandEncoder(descriptor: pass)
+            let encoder = buffer.makeRenderCommandEncoder(descriptor: pass(for: drawable, clear: view.clearColor))
         else {
             return nil
         }
@@ -348,5 +354,35 @@ private final class PageCurlRenderer {
         encoder.endEncoding()
         buffer.present(drawable)
         return buffer
+    }
+
+    private func nextDrawable(from layer: CAMetalLayer, view: MTKView) -> CAMetalDrawable? {
+        let scale = max(view.window?.screen.scale ?? view.contentScaleFactor, 1)
+        if layer.contentsScale != scale {
+            layer.contentsScale = scale
+        }
+        let size = CGSize(
+            width: max(view.bounds.width, 1) * scale,
+            height: max(view.bounds.height, 1) * scale
+        )
+        if layer.drawableSize != size {
+            layer.drawableSize = size
+        }
+        // Nil instead of blocking the display link when the pool is busy.
+        layer.allowsNextDrawableTimeout = false
+        layer.pixelFormat = view.colorPixelFormat
+        layer.framebufferOnly = true
+        layer.device = device
+        layer.isOpaque = true
+        return layer.nextDrawable()
+    }
+
+    private func pass(for drawable: CAMetalDrawable, clear: MTLClearColor) -> MTLRenderPassDescriptor {
+        let pass = MTLRenderPassDescriptor()
+        pass.colorAttachments[0].texture = drawable.texture
+        pass.colorAttachments[0].loadAction = .clear
+        pass.colorAttachments[0].storeAction = .store
+        pass.colorAttachments[0].clearColor = clear
+        return pass
     }
 }
