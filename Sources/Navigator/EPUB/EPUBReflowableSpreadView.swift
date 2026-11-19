@@ -269,15 +269,16 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
     }
 
     private func scrollByAwaitingPaint(_ offsetX: CGFloat) async {
-        let result: PaintScroll = await withCheckedContinuation { continuation in
-            let box = ReadyResumeBox(continuation)
-            Task { @MainActor [weak box] in
+        // Same retain as `ReadyResume.awaitFirst`. A weak box here never
+        // resumes, so the fade cover stays up and the column looks unturned.
+        let result: PaintScroll = await ReadyResume.awaitFirst { box in
+            Task { @MainActor in
                 try? await Task.sleep(seconds: PageTransitionAnimator.paintTimeout)
-                box?.resume(returning: .timedOut)
+                box.resume(returning: .timedOut)
             }
-            Task { @MainActor [weak box] in
+            Task { @MainActor in
                 do {
-                    _ = try await webView.callAsyncJavaScript(
+                    _ = try await self.webView.callAsyncJavaScript(
                         """
                         window.scrollBy({ left: offsetX, behavior: 'instant' });
                         return await new Promise((resolve) => {
@@ -290,9 +291,9 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
                         in: nil,
                         contentWorld: .page
                     )
-                    box?.resume(returning: .painted)
+                    box.resume(returning: .painted)
                 } catch {
-                    box?.resume(returning: .failed)
+                    box.resume(returning: .failed)
                 }
             }
         }
