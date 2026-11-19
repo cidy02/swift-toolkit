@@ -1,0 +1,400 @@
+//
+//  Copyright 2026 Readium Foundation. All rights reserved.
+//  Use of this source code is governed by the BSD-style license
+//  available in the top-level LICENSE file of the project.
+//
+
+@testable import ReadiumNavigator
+import XCTest
+
+class PageCurlPanStateMachineTests: XCTestCase {
+    private func context(
+        rtl: Bool = false,
+        width: CGFloat = 390,
+        height: CGFloat = 844,
+        canGoForward: Bool = true,
+        canGoBackward: Bool = true,
+        hasSelection: Bool = false,
+        enabled: Bool = true,
+        zoomed: Bool = false,
+        acceptsGesture: Bool = true
+    ) -> PageCurlPanContext {
+        PageCurlPanContext(
+            rtl: rtl,
+            viewWidth: width,
+            viewHeight: height,
+            canGoForward: canGoForward,
+            canGoBackward: canGoBackward,
+            hasSelection: hasSelection,
+            interactiveCurlEnabled: enabled,
+            zoomed: zoomed,
+            acceptsGesture: acceptsGesture
+        )
+    }
+
+    private func sample(
+        translationX: CGFloat = 0,
+        translationY: CGFloat = 0,
+        velocityX: CGFloat = 0,
+        velocityY: CGFloat = 0,
+        locationX: CGFloat = 200,
+        locationY: CGFloat = 400
+    ) -> PageCurlPanSample {
+        PageCurlPanSample(
+            translationX: translationX,
+            translationY: translationY,
+            velocityX: velocityX,
+            velocityY: velocityY,
+            locationX: locationX,
+            locationY: locationY
+        )
+    }
+
+    func testInteractiveCurlIsPagedOnly() {
+        XCTAssertTrue(PageCurlPanStateMachine.allowsInteractiveCurl(
+            preference: .curl, scrolls: false, reduceMotion: false, voiceOverRunning: false
+        ))
+        XCTAssertFalse(PageCurlPanStateMachine.allowsInteractiveCurl(
+            preference: .slide, scrolls: false, reduceMotion: false, voiceOverRunning: false
+        ))
+        XCTAssertFalse(PageCurlPanStateMachine.allowsInteractiveCurl(
+            preference: .fade, scrolls: false, reduceMotion: false, voiceOverRunning: false
+        ))
+        XCTAssertFalse(PageCurlPanStateMachine.allowsInteractiveCurl(
+            preference: .none, scrolls: false, reduceMotion: false, voiceOverRunning: false
+        ))
+        XCTAssertFalse(PageCurlPanStateMachine.allowsInteractiveCurl(
+            preference: .curl, scrolls: true, reduceMotion: false, voiceOverRunning: false
+        ))
+        XCTAssertFalse(PageCurlPanStateMachine.allowsInteractiveCurl(
+            preference: .curl, scrolls: false, reduceMotion: true, voiceOverRunning: false
+        ))
+        XCTAssertFalse(PageCurlPanStateMachine.allowsInteractiveCurl(
+            preference: .curl, scrolls: false, reduceMotion: false, voiceOverRunning: true
+        ))
+    }
+
+    func testDistanceThresholdAndVelocityProjection() {
+        // Strictly above 0.35. Sitting on the line is not a commit.
+        XCTAssertEqual(
+            PageCurlPanStateMachine.release(progress: 0.35, turnVelocity: 0, width: 390, cancelled: false),
+            .cancel
+        )
+        XCTAssertEqual(
+            PageCurlPanStateMachine.release(progress: 0.351, turnVelocity: 0, width: 390, cancelled: false),
+            .commit
+        )
+        XCTAssertEqual(
+            PageCurlPanStateMachine.release(progress: 0.2, turnVelocity: 0, width: 390, cancelled: false),
+            .cancel
+        )
+
+        // Addendum: progress + (v / width) * 0.18 > 0.50.
+        // 500 pt/s on a 390 pt page from 0.30 crosses the line. From 0.10 it does not.
+        // The older "any velocity over 500 commits" rule does not.
+        XCTAssertEqual(
+            PageCurlPanStateMachine.release(progress: 0.30, turnVelocity: 500, width: 390, cancelled: false),
+            .commit
+        )
+        XCTAssertEqual(
+            PageCurlPanStateMachine.release(progress: 0.10, turnVelocity: 500, width: 390, cancelled: false),
+            .cancel
+        )
+        let width: CGFloat = 400
+        let velocity = (0.31 / PageCurlPanStateMachine.velocityHorizon) * width
+        XCTAssertEqual(
+            PageCurlPanStateMachine.release(progress: 0.20, turnVelocity: velocity, width: width, cancelled: false),
+            .commit
+        )
+        XCTAssertEqual(
+            PageCurlPanStateMachine.release(progress: 0.20, turnVelocity: 100, width: width, cancelled: false),
+            .cancel
+        )
+        // A backward flick does not commit a short drag.
+        XCTAssertEqual(
+            PageCurlPanStateMachine.release(progress: 0.20, turnVelocity: -800, width: width, cancelled: false),
+            .cancel
+        )
+    }
+
+    func testCancelledReleaseNeverCommits() {
+        XCTAssertEqual(
+            PageCurlPanStateMachine.release(progress: 0.9, turnVelocity: 2000, width: 390, cancelled: true),
+            .cancel
+        )
+        XCTAssertEqual(
+            PageCurlPanStateMachine.release(progress: 1, turnVelocity: 0, width: 390, cancelled: true),
+            .cancel
+        )
+    }
+
+    func testRTLSignFlip() {
+        // LTR forward is a leftward drag. RTL forward is a rightward drag.
+        let ltr = PageCurlPanStateMachine.progress(translationX: -195, width: 390, forward: true, rtl: false)
+        XCTAssertEqual(ltr, 0.5, accuracy: 0.001)
+        let ltrOpposite = PageCurlPanStateMachine.progress(translationX: 195, width: 390, forward: true, rtl: false)
+        XCTAssertEqual(ltrOpposite, 0, accuracy: 0.001)
+
+        let rtl = PageCurlPanStateMachine.progress(translationX: 195, width: 390, forward: true, rtl: true)
+        XCTAssertEqual(rtl, 0.5, accuracy: 0.001)
+        let rtlOpposite = PageCurlPanStateMachine.progress(translationX: -195, width: 390, forward: true, rtl: true)
+        XCTAssertEqual(rtlOpposite, 0, accuracy: 0.001)
+
+        XCTAssertEqual(
+            PageCurlPanStateMachine.turnVelocity(velocityX: -400, forward: true, rtl: false),
+            400,
+            accuracy: 0.001
+        )
+        XCTAssertEqual(
+            PageCurlPanStateMachine.turnVelocity(velocityX: 400, forward: true, rtl: true),
+            400,
+            accuracy: 0.001
+        )
+        XCTAssertTrue(PageCurlPanStateMachine.spreadGoesRight(forward: true, rtl: false))
+        XCTAssertFalse(PageCurlPanStateMachine.spreadGoesRight(forward: true, rtl: true))
+        XCTAssertFalse(PageCurlPanStateMachine.spreadGoesRight(forward: false, rtl: false))
+        XCTAssertTrue(PageCurlPanStateMachine.spreadGoesRight(forward: false, rtl: true))
+
+        XCTAssertEqual(
+            PageCurlPanStateMachine.shouldBegin(
+                sample: sample(velocityX: -800, velocityY: 40, locationX: 300),
+                context: context()
+            ),
+            .track(.forward)
+        )
+        XCTAssertEqual(
+            PageCurlPanStateMachine.shouldBegin(
+                sample: sample(velocityX: 800, velocityY: 40, locationX: 300),
+                context: context(rtl: true)
+            ),
+            .track(.forward)
+        )
+        XCTAssertEqual(
+            PageCurlPanStateMachine.shouldBegin(
+                sample: sample(velocityX: 800, velocityY: 40, locationX: 200),
+                context: context()
+            ),
+            .track(.backward)
+        )
+    }
+
+    func testBoundaries() {
+        XCTAssertEqual(
+            PageCurlPanStateMachine.shouldBegin(
+                sample: sample(velocityX: -600, velocityY: 10),
+                context: context(canGoForward: false)
+            ),
+            .rejectBoundary
+        )
+        XCTAssertEqual(
+            PageCurlPanStateMachine.shouldBegin(
+                sample: sample(velocityX: 600, velocityY: 10, locationX: 200),
+                context: context(canGoBackward: false)
+            ),
+            .rejectBoundary
+        )
+        XCTAssertEqual(
+            PageCurlPanStateMachine.shouldBegin(
+                sample: sample(velocityX: 600, velocityY: 10, locationX: 300),
+                context: context(rtl: true, canGoForward: false)
+            ),
+            .rejectBoundary
+        )
+        XCTAssertEqual(
+            PageCurlPanStateMachine.shouldBegin(
+                sample: sample(velocityX: -600, velocityY: 10, locationX: 200),
+                context: context(rtl: true, canGoBackward: false)
+            ),
+            .rejectBoundary
+        )
+    }
+
+    func testVerticalRejectionAndDominance() {
+        XCTAssertEqual(
+            PageCurlPanStateMachine.shouldBegin(
+                sample: sample(velocityX: 100, velocityY: 400),
+                context: context()
+            ),
+            .rejectVertical
+        )
+        // 100 is not greater than 80 * 1.25.
+        XCTAssertEqual(
+            PageCurlPanStateMachine.shouldBegin(
+                sample: sample(velocityX: 100, velocityY: 80),
+                context: context()
+            ),
+            .rejectVertical
+        )
+        XCTAssertEqual(
+            PageCurlPanStateMachine.shouldBegin(
+                sample: sample(velocityX: -200, velocityY: 100),
+                context: context()
+            ),
+            .track(.forward)
+        )
+        // A tap with no travel is not a curl.
+        XCTAssertEqual(
+            PageCurlPanStateMachine.shouldBegin(sample: sample(), context: context()),
+            .rejectVertical
+        )
+        // Translation is the fallback while velocity is still tiny.
+        XCTAssertEqual(
+            PageCurlPanStateMachine.shouldBegin(
+                sample: sample(translationX: -12, translationY: 2, velocityX: 0, velocityY: 0),
+                context: context()
+            ),
+            .track(.forward)
+        )
+    }
+
+    func testLeftBezelExclusion() {
+        XCTAssertEqual(
+            PageCurlPanStateMachine.shouldBegin(
+                sample: sample(velocityX: 700, velocityY: 20, locationX: 10),
+                context: context()
+            ),
+            .rejectBezel
+        )
+        XCTAssertEqual(
+            PageCurlPanStateMachine.shouldBegin(
+                sample: sample(velocityX: 700, velocityY: 20, locationX: 20),
+                context: context()
+            ),
+            .track(.backward)
+        )
+        // The finger has left the bezel, but the touch went down inside it.
+        XCTAssertEqual(
+            PageCurlPanStateMachine.shouldBegin(
+                sample: sample(translationX: 24, velocityX: 700, velocityY: 20, locationX: 32),
+                context: context()
+            ),
+            .rejectBezel
+        )
+        // A forward drag in the left bezel is still a page turn.
+        XCTAssertEqual(
+            PageCurlPanStateMachine.shouldBegin(
+                sample: sample(velocityX: -700, velocityY: 20, locationX: 8),
+                context: context()
+            ),
+            .track(.forward)
+        )
+        // RTL dismiss comes off the right edge, dragging left.
+        XCTAssertEqual(
+            PageCurlPanStateMachine.shouldBegin(
+                sample: sample(velocityX: -700, velocityY: 20, locationX: 380),
+                context: context(rtl: true, width: 390)
+            ),
+            .rejectBezel
+        )
+        XCTAssertEqual(
+            PageCurlPanStateMachine.shouldBegin(
+                sample: sample(velocityX: -700, velocityY: 20, locationX: 300),
+                context: context(rtl: true)
+            ),
+            .track(.backward)
+        )
+    }
+
+    func testSelectionZoomAndDisabledReject() {
+        XCTAssertEqual(
+            PageCurlPanStateMachine.shouldBegin(
+                sample: sample(velocityX: -800, velocityY: 10),
+                context: context(hasSelection: true)
+            ),
+            .rejectSelection
+        )
+        XCTAssertEqual(
+            PageCurlPanStateMachine.shouldBegin(
+                sample: sample(velocityX: -800, velocityY: 10),
+                context: context(zoomed: true)
+            ),
+            .rejectZoomed
+        )
+        XCTAssertEqual(
+            PageCurlPanStateMachine.shouldBegin(
+                sample: sample(velocityX: -800, velocityY: 10),
+                context: context(enabled: false)
+            ),
+            .rejectDisabled
+        )
+        XCTAssertEqual(
+            PageCurlPanStateMachine.shouldBegin(
+                sample: sample(velocityX: -800, velocityY: 10),
+                context: context(acceptsGesture: false)
+            ),
+            .rejectDisabled
+        )
+    }
+
+    func testTouchYAndSmoothedVelocity() {
+        XCTAssertEqual(PageCurlPanStateMachine.touchY(locationY: 0, height: 800), 0, accuracy: 0.001)
+        XCTAssertEqual(PageCurlPanStateMachine.touchY(locationY: 800, height: 800), 1, accuracy: 0.001)
+        XCTAssertEqual(PageCurlPanStateMachine.touchY(locationY: 400, height: 800), 0.5, accuracy: 0.001)
+        XCTAssertEqual(PageCurlPanStateMachine.touchY(locationY: -20, height: 800), 0, accuracy: 0.001)
+        XCTAssertEqual(PageCurlPanStateMachine.touchY(locationY: 900, height: 800), 1, accuracy: 0.001)
+        XCTAssertEqual(PageCurlPanStateMachine.touchY(locationY: .nan, height: 800), 0.5, accuracy: 0.001)
+
+        XCTAssertEqual(PageCurlPanStateMachine.smoothedVelocity([100, 200, 300]), 200, accuracy: 0.001)
+        XCTAssertEqual(PageCurlPanStateMachine.smoothedVelocity([10, 100, 200, 300]), 200, accuracy: 0.001)
+        XCTAssertEqual(PageCurlPanStateMachine.smoothedVelocity([40]), 40, accuracy: 0.001)
+        XCTAssertEqual(PageCurlPanStateMachine.smoothedVelocity([]), 0, accuracy: 0.001)
+    }
+
+    func testSpringDoesNotOvershootAndAFlickIsFaster() {
+        let rest = PageCurlPanStateMachine.omega(progressVelocity: 0)
+        XCTAssertEqual(rest, PageCurlPanStateMachine.settleOmega, accuracy: 0.001)
+        let flick = PageCurlPanStateMachine.omega(progressVelocity: 8)
+        XCTAssertEqual(flick, PageCurlPanStateMachine.flickOmega, accuracy: 0.001)
+
+        var previous: CGFloat = 0.4
+        for step in 1 ... 40 {
+            let progress = PageCurlPanStateMachine.springProgress(
+                elapsed: Double(step) * 0.01,
+                from: 0.4,
+                velocity: 0,
+                target: 1,
+                omega: rest
+            )
+            XCTAssertGreaterThanOrEqual(progress, previous - 0.000_1)
+            XCTAssertLessThanOrEqual(progress, 1)
+            previous = progress
+        }
+        let slowAt300 = PageCurlPanStateMachine.springProgress(
+            elapsed: 0.30, from: 0.4, velocity: 0, target: 1, omega: rest
+        )
+        XCTAssertGreaterThan(slowAt300, 0.9)
+        XCTAssertLessThan(slowAt300, 1)
+
+        // A hard flick would cross the target in the raw solution. The clamp stays on it.
+        let overshoot = PageCurlPanStateMachine.springProgress(
+            elapsed: 0.5, from: 0.2, velocity: 30, target: 1, omega: flick
+        )
+        XCTAssertEqual(overshoot, 1, accuracy: 0.000_1)
+
+        let cancel = PageCurlPanStateMachine.springProgress(
+            elapsed: 0.34, from: 0.25, velocity: 0, target: 0, omega: rest
+        )
+        XCTAssertGreaterThan(cancel, 0)
+        XCTAssertLessThan(cancel, 0.05)
+
+        func timeToLand(velocity: CGFloat) -> TimeInterval {
+            let omega = PageCurlPanStateMachine.omega(progressVelocity: velocity)
+            var elapsed = 0.0
+            while elapsed < 1 {
+                elapsed += 0.005
+                let progress = PageCurlPanStateMachine.springProgress(
+                    elapsed: elapsed, from: 0.4, velocity: velocity, target: 1, omega: omega
+                )
+                if progress > 0.98 { return elapsed }
+            }
+            return 1
+        }
+        let slow = timeToLand(velocity: 0)
+        let fast = timeToLand(velocity: 3.8)
+        XCTAssertGreaterThan(slow, 0.26)
+        XCTAssertLessThan(slow, 0.40)
+        XCTAssertGreaterThan(fast, 0.12)
+        XCTAssertLessThan(fast, 0.24)
+        XCTAssertLessThan(fast, slow)
+    }
+}

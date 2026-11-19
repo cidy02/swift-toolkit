@@ -58,7 +58,9 @@ enum PageCurlGeometry {
     /// The axis stays attached to the spine. About ±24°.
     static let maxTilt: CGFloat = 0.42
     /// Peak cylinder radius as a fraction of view width, at progress 0.5.
-    static let peakRadius: CGFloat = 0.070
+    /// The roll on screen is `2 * radius` wide, so 0.10 is a fifth of the page
+    /// at mid-turn. 0.07 read as a thin band rather than a paper roll.
+    static let peakRadius: CGFloat = 0.10
     /// How far the mirrored front is pulled into the paper. The design note
     /// said ~78%. Filmed frames still read the reversed type, including at
     /// 0.90, so the ghost is a light stain.
@@ -180,22 +182,28 @@ enum PageCurlGeometry {
         PageTransitionPolicy.rendered(PageTransitionPolicy.resolve(request))
     }
 
-    /// Underside of a one-page leaf. OLED black is lifted so the sheet does
-    /// not disappear into the background. `mix` is `backsideMix`.
+    /// Underside of a one-page leaf. The colour is the theme's own paper.
+    /// Warming a white page (the previous mix) painted a beige leaf on Light.
+    /// OLED black is lifted so the sheet does not disappear. `mix` is `backsideMix`.
     static func backsidePaper(background: PageCurlRGB) -> PageCurlPaper {
         let y = 0.2126 * background.r + 0.7152 * background.g + 0.0722 * background.b
         if y < 0.06 {
+            // About 7% above black.
             return PageCurlPaper(r: 0.07, g: 0.07, b: 0.075, mix: backsideMix, specular: 0.12)
         }
         if y < 0.28 {
             return PageCurlPaper(r: 0.20, g: 0.20, b: 0.22, mix: backsideMix, specular: 0.16)
         }
+        let chroma = max(background.r, background.g, background.b) - min(background.r, background.g, background.b)
+        // Near-neutral paper (Light): the same hue, 4% darker. Tinted paper
+        // (Sepia): a little darker, still that tint, not a second beige.
+        let scale: CGFloat = chroma < 0.08 ? 0.96 : 0.92
         return PageCurlPaper(
-            r: min(1, background.r * 0.86 + 0.08),
-            g: min(1, background.g * 0.80 + 0.05),
-            b: min(1, background.b * 0.70 + 0.03),
+            r: min(1, background.r * scale),
+            g: min(1, background.g * scale),
+            b: min(1, background.b * scale),
             mix: backsideMix,
-            specular: y > 0.7 ? 0.34 : 0.26
+            specular: y > 0.7 ? 0.28 : 0.22
         )
     }
 }

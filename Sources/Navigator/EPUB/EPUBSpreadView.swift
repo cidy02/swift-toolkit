@@ -636,6 +636,12 @@ class EPUBSpreadView: UIView, Loggable, PageView {
         false
     }
 
+    /// Another column exists in this resource in `direction`. Fixed layout is one
+    /// screen per resource, so the default is false and the turn changes resource.
+    func canGo(to direction: Direction) -> Bool {
+        false
+    }
+
     /// Fixed layout: a double spread is two pages. Reflowable overrides this
     /// with the CSS column count, which is what actually painted.
     func renderedColumnCount() async -> Int {

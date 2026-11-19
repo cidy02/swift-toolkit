@@ -435,6 +435,80 @@ final class PaginationView: UIView, Loggable {
         return true
     }
 
+    /// The next or previous resource exists. Forward increases the index in
+    /// both reading directions; RTL mirrors the offset, not the index.
+    func hasNeighbor(forward: Bool) -> Bool {
+        (0 ..< pageCount).contains(neighborIndex(forward: forward))
+    }
+
+    /// Bitmap of the neighbour, taken on screen under the caller's opaque cover,
+    /// without changing `currentIndex`. The offset is restored before returning.
+    func captureNeighborForCurl(forward: Bool, background: UIColor) async -> UIImage? {
+        let index = neighborIndex(forward: forward)
+        guard (0 ..< pageCount).contains(index) else {
+            return nil
+        }
+        let location: PageLocation = forward ? .start : .end
+        guard let neighbor = await ensureLoadedForCurl(at: index, location: location) else {
+            return nil
+        }
+        let saved = scrollView.contentOffset
+        isAnimatingContentOffset = true
+        neighbor.setSuppressingProgressionUpdates(true)
+        defer {
+            neighbor.setSuppressingProgressionUpdates(false)
+            scrollView.contentOffset = CGPoint(x: xOffsetForIndex(currentIndex), y: saved.y)
+            isAnimatingContentOffset = false
+        }
+        scrollView.contentOffset = CGPoint(x: xOffsetForIndex(index), y: saved.y)
+        layoutIfNeeded()
+        await neighbor.awaitNextPaint()
+        return await PageCurlSnapshotter.capture(of: neighbor, backgroundColor: background)
+    }
+
+    /// Lands on the neighbour under a curl that has already finished. No second animation.
+    func commitCurlNeighbor(forward: Bool) async {
+        let index = neighborIndex(forward: forward)
+        guard (0 ..< pageCount).contains(index) else {
+            return
+        }
+        let location: PageLocation = forward ? .start : .end
+        isAnimatingContentOffset = true
+        scrollView.isScrollEnabled = false
+        suppressProgressionDuringLoad = true
+        let from = scrollView.contentOffset
+        setCurrentIndex(index, location: location)
+        await preparePageInViewport(at: index, fromOffset: from)
+        suppressProgressionDuringLoad = false
+        loadedViews[index]?.setSuppressingProgressionUpdates(false)
+        isAnimatingContentOffset = false
+        scrollView.isScrollEnabled = isScrollEnabled
+    }
+
+    private func neighborIndex(forward: Bool) -> Int {
+        forward ? currentIndex + 1 : currentIndex - 1
+    }
+
+    /// Loads one resource beside the current page without moving `currentIndex`
+    /// or re-running the current page's location.
+    private func ensureLoadedForCurl(at index: Int, location: PageLocation) async -> (UIView & PageView)? {
+        if let view = loadedViews[index] {
+            return view
+        }
+        loadingIndexQueue.removeAll { $0.index == index }
+        guard let view = delegate?.paginationView(self, pageViewAtIndex: index) else {
+            return nil
+        }
+        loadedViews[index] = view
+        scrollView.addSubview(view)
+        setNeedsLayout()
+        layoutIfNeeded()
+        view.setSuppressingProgressionUpdates(true)
+        await view.go(to: location, animated: false)
+        await view.readyForPresentation()
+        return view
+    }
+
     /// Neighbour resource. The outgoing leaf stays up, opaque, until the
     /// incoming spread has loaded and painted, then the cylinder runs.
     private func curlToView(at index: Int, location: PageLocation) async {

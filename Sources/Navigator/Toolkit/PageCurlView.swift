@@ -20,13 +20,32 @@ final class PageCurlView: UIView {
     private var tapStart: CFTimeInterval = 0
     private var tapDuration: CFTimeInterval = PageCurlGeometry.tapDuration
     private var tapContinuation: CheckedContinuation<Void, Never>?
+    private var clockIsTap = true
 
     private var spine: PageCurlSpine = .leading
     private var peelSign: CGFloat = 1
     private var touchY: CGFloat = PageCurlGeometry.tapTouchY
     private var realVerso = false
-    private var paper = PageCurlPaper(r: 0.93, g: 0.9, b: 0.84, mix: PageCurlGeometry.backsideMix, specular: 0.3)
+    private var paper = PageCurlPaper(r: 0.96, g: 0.96, b: 0.96, mix: PageCurlGeometry.backsideMix, specular: 0.3)
     private var progress: CGFloat = 0
+
+    /// Finger position while a drag is in flight. The display link reads it.
+    private var fingerProgress: CGFloat = 0
+    private var interactivePhase: InteractivePhase = .none
+    private var catchUpStart: CFTimeInterval = 0
+    private var springStart: CFTimeInterval = 0
+    private var springFrom: CGFloat = 0
+    private var springVelocity: CGFloat = 0
+    private var springTarget: CGFloat = 1
+    private var springOmega: CGFloat = PageCurlPanStateMachine.settleOmega
+    private var interactiveContinuation: CheckedContinuation<Void, Never>?
+
+    private enum InteractivePhase {
+        case none
+        case catchUp
+        case track
+        case spring
+    }
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -120,24 +139,89 @@ final class PageCurlView: UIView {
             return
         }
 
+        clockIsTap = true
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             tapContinuation = continuation
             tapStart = CACurrentMediaTime()
             tapDuration = duration
-            // Prefer 120 Hz. A minimum above the screen's maximum (a 60 Hz
-            // simulator, a ProMotion display that is currently throttled)
-            // can skip the callback entirely, which snaps the leaf.
-            let link = CADisplayLink(target: self, selector: #selector(stepTap))
-            let hz = Float(window?.screen.maximumFramesPerSecond ?? 60)
-            let cap = min(120, max(hz, 1))
-            link.preferredFrameRateRange = CAFrameRateRange(minimum: min(30, cap), maximum: cap, preferred: cap)
-            displayLink = link
-            link.add(to: .main, forMode: .common)
+            startClock()
+        }
+    }
+
+    /// The outgoing cover is already up. The first presented frame is the flat
+    /// page, then the leaf catches the finger over `catchUpDuration`.
+    func beginInteractive(
+        outgoing: UIImage,
+        incoming: UIImage,
+        spine: PageCurlSpine,
+        peelSign: CGFloat,
+        realVerso: Bool,
+        progress: CGFloat,
+        touchY: CGFloat
+    ) async -> Bool {
+        self.spine = spine
+        self.peelSign = peelSign
+        self.realVerso = realVerso
+        self.touchY = touchY
+        fingerProgress = PageCurlGeometry.clampProgress(progress)
+        self.progress = 0
+        interactivePhase = .catchUp
+
+        guard let renderer, let metalView, renderer.prepare(outgoing: outgoing, incoming: incoming) else {
+            interactivePhase = .none
+            return false
+        }
+        metalView.layoutIfNeeded()
+        let presented = await renderer.drawAndWait(uniforms: uniforms(in: metalView), in: metalView)
+        guard presented else {
+            interactivePhase = .none
+            return false
+        }
+        coverView.isHidden = true
+        catchUpStart = CACurrentMediaTime()
+        clockIsTap = false
+        startClock()
+        return true
+    }
+
+    func track(progress: CGFloat, touchY: CGFloat) {
+        fingerProgress = PageCurlGeometry.clampProgress(progress)
+        self.touchY = touchY
+    }
+
+    /// Runs the critically damped spring from the live progress. `progressVelocity`
+    /// is pages per second and keeps its sign across the finger lifting.
+    func finishInteractive(target: CGFloat, progressVelocity: CGFloat) async {
+        let target = PageCurlGeometry.clampProgress(target)
+        let velocity = progressVelocity.isFinite ? progressVelocity : 0
+        guard interactivePhase != .none else {
+            progress = target
+            return
+        }
+        springFrom = progress
+        springVelocity = velocity
+        springTarget = target
+        springOmega = PageCurlPanStateMachine.omega(progressVelocity: velocity)
+        springStart = CACurrentMediaTime()
+        interactivePhase = .spring
+        if abs(progress - target) < 0.004, abs(velocity) < 0.02 {
+            progress = target
+            drawInteractive()
+            endInteractive()
+            return
+        }
+        if displayLink == nil {
+            clockIsTap = false
+            startClock()
+        }
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            interactiveContinuation = continuation
         }
     }
 
     func releaseResources() {
         finishTap()
+        endInteractive()
         renderer?.releaseTextures()
         coverView.image = nil
         incomingCover.image = nil
@@ -170,7 +254,28 @@ final class PageCurlView: UIView {
         )
     }
 
-    @objc private func stepTap() {
+    /// Prefer 120 Hz. A minimum above the screen's maximum (a 60 Hz simulator,
+    /// a ProMotion display that is currently throttled) skips the callback and
+    /// the leaf snaps, so the floor stays under the screen's own cap.
+    private func startClock() {
+        displayLink?.invalidate()
+        let link = CADisplayLink(target: self, selector: #selector(stepClock))
+        let hz = Float(window?.screen.maximumFramesPerSecond ?? 60)
+        let cap = min(120, max(hz, 1))
+        link.preferredFrameRateRange = CAFrameRateRange(minimum: min(30, cap), maximum: cap, preferred: cap)
+        displayLink = link
+        link.add(to: .main, forMode: .common)
+    }
+
+    @objc private func stepClock() {
+        if clockIsTap {
+            stepTap()
+        } else {
+            stepInteractive()
+        }
+    }
+
+    private func stepTap() {
         let elapsed = CACurrentMediaTime() - tapStart
         let t = tapDuration > 0 ? elapsed / tapDuration : 1
         progress = PageCurlGeometry.easeInOut(CGFloat(min(1, t)))
@@ -182,11 +287,65 @@ final class PageCurlView: UIView {
         }
     }
 
+    private func stepInteractive() {
+        var landed = false
+        switch interactivePhase {
+        case .none:
+            return
+        case .catchUp:
+            let duration = PageCurlPanStateMachine.catchUpDuration
+            let elapsed = CACurrentMediaTime() - catchUpStart
+            let u = duration > 0 ? min(1, elapsed / duration) : 1
+            progress = fingerProgress * PageCurlGeometry.easeInOut(CGFloat(u))
+            if u >= 1 {
+                interactivePhase = .track
+                progress = fingerProgress
+            }
+        case .track:
+            progress = fingerProgress
+        case .spring:
+            let elapsed = CACurrentMediaTime() - springStart
+            progress = PageCurlPanStateMachine.springProgress(
+                elapsed: elapsed,
+                from: springFrom,
+                velocity: springVelocity,
+                target: springTarget,
+                omega: springOmega
+            )
+            if abs(progress - springTarget) < 0.004 || elapsed > 0.7 {
+                progress = springTarget
+                landed = true
+            }
+        }
+        drawInteractive()
+        if landed {
+            endInteractive()
+        }
+    }
+
+    private func drawInteractive() {
+        guard let metalView, let renderer else { return }
+        renderer.drawNow(uniforms: uniforms(in: metalView), in: metalView)
+    }
+
     private func finishTap() {
+        stopClock()
+        let continuation = tapContinuation
+        tapContinuation = nil
+        continuation?.resume()
+    }
+
+    private func endInteractive() {
+        interactivePhase = .none
+        stopClock()
+        let continuation = interactiveContinuation
+        interactiveContinuation = nil
+        continuation?.resume()
+    }
+
+    private func stopClock() {
         displayLink?.invalidate()
         displayLink = nil
-        tapContinuation?.resume()
-        tapContinuation = nil
     }
 
     private func fadeFallback(to incoming: UIImage, duration: TimeInterval) async {

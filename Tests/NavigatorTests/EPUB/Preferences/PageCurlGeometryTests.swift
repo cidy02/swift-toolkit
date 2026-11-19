@@ -51,8 +51,9 @@ class PageCurlGeometryTests: XCTestCase {
         XCTAssertEqual(PageCurlGeometry.cylinderRadius(progress: 1, span: 1), 0, accuracy: 0.0001)
         let mid = PageCurlGeometry.cylinderRadius(progress: 0.5, span: 1)
         XCTAssertEqual(mid, PageCurlGeometry.peakRadius, accuracy: 0.0001)
-        XCTAssertGreaterThan(mid, 0.05)
-        XCTAssertLessThan(mid, 0.2)
+        // Wide enough to read as paper. A thin band was 0.07.
+        XCTAssertGreaterThanOrEqual(PageCurlGeometry.peakRadius, 0.09)
+        XCTAssertLessThanOrEqual(PageCurlGeometry.peakRadius, 0.14)
         // A narrow leaf does not grow a cylinder wider than itself.
         let narrow = PageCurlGeometry.cylinderRadius(progress: 0.5, span: 0.1)
         XCTAssertLessThanOrEqual(narrow, 0.1 * 0.45 + 0.0001)
@@ -175,21 +176,32 @@ class PageCurlGeometryTests: XCTestCase {
         XCTAssertEqual(PageCurlGeometry.rendered(request(animated: false, resourceDistance: 3)), .none)
     }
 
-    func testBacksidePaperLiftsOLEDAndTintsLight() {
+    func testBacksidePaperFollowsTheTheme() {
         let oled = PageCurlGeometry.backsidePaper(background: PageCurlRGB(r: 0, g: 0, b: 0))
         XCTAssertGreaterThan(oled.r, 0.05)
         XCTAssertLessThan(oled.r, 0.10)
         XCTAssertEqual(oled.mix, PageCurlGeometry.backsideMix, accuracy: 0.0001)
         XCTAssertLessThan(oled.specular, 0.2)
 
+        // Light is white, slightly greyed. Warming it produced a beige leaf.
         let light = PageCurlGeometry.backsidePaper(background: PageCurlRGB(r: 1, g: 1, b: 1))
         XCTAssertEqual(light.mix, PageCurlGeometry.backsideMix, accuracy: 0.0001)
-        XCTAssertLessThan(light.r, 1)
-        XCTAssertLessThan(light.b, light.r)
+        XCTAssertEqual(light.r, 0.96, accuracy: 0.001)
+        XCTAssertEqual(light.g, light.r, accuracy: 0.001)
+        XCTAssertEqual(light.b, light.r, accuracy: 0.001)
 
-        let sepia = PageCurlGeometry.backsidePaper(background: PageCurlRGB(r: 0.984, g: 0.941, b: 0.851))
+        let sepiaBackground = PageCurlRGB(r: 0.984, g: 0.941, b: 0.851)
+        let sepia = PageCurlGeometry.backsidePaper(background: sepiaBackground)
         XCTAssertEqual(sepia.mix, PageCurlGeometry.backsideMix, accuracy: 0.0001)
+        XCTAssertEqual(sepia.r, sepiaBackground.r * 0.92, accuracy: 0.001)
+        XCTAssertEqual(sepia.g, sepiaBackground.g * 0.92, accuracy: 0.001)
+        XCTAssertEqual(sepia.b, sepiaBackground.b * 0.92, accuracy: 0.001)
         XCTAssertGreaterThan(sepia.r, sepia.b)
+
+        let dark = PageCurlGeometry.backsidePaper(background: PageCurlRGB(r: 0.12, g: 0.12, b: 0.13))
+        XCTAssertEqual(dark.r, 0.20, accuracy: 0.001)
+        XCTAssertEqual(dark.g, 0.20, accuracy: 0.001)
+        XCTAssertEqual(dark.b, 0.22, accuracy: 0.001)
     }
 
     func testUniformStrideMatchesTheShaderStruct() {

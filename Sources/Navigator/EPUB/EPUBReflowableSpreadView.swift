@@ -23,6 +23,12 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
     /// Set when a hidden scroll changed the progression, so lifting the
     /// suppression emits that one change and no earlier one.
     private var progressionChangedWhileSuppressed = false
+    /// Column step applied for a finger curl. Cancel scrolls it back.
+    private var curlDelta: CGFloat = 0
+    /// A cancel restores the previous column, then a late scroll message can
+    /// still arrive. Drop progression events until this time so the peek does
+    /// not become a location, including on the last page of a work.
+    private var ignoreProgressionUntil: CFTimeInterval = 0
 
     private static let reflowableScript = loadScript(named: "readium-reflowable")
 
@@ -186,19 +192,7 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
             return await super.go(to: direction, options: options)
         }
 
-        let factor: CGFloat = {
-            switch direction {
-            case .left:
-                return -1
-            case .right:
-                return 1
-            }
-        }()
-
-        guard scrollView.bounds.width > 0 else { return false }
-        let offsetX = scrollView.bounds.width * factor
-        let targetX = round((scrollView.contentOffset.x + offsetX) / offsetX) * offsetX
-        guard 0 ..< scrollView.contentSize.width ~= targetX else {
+        guard let offsetX = pageDelta(for: direction) else {
             return false
         }
 
@@ -280,6 +274,64 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         )
     }
 
+    /// Same column step `go(to:)` scrolls. Nil on the first or last column,
+    /// where the navigator turns to the neighbour resource instead.
+    override func canGo(to direction: Direction) -> Bool {
+        pageDelta(for: direction) != nil
+    }
+
+    /// Scrolls one column under the curl cover. The caller has already shown
+    /// the outgoing bitmap. Returns the incoming bitmap, or nil if this
+    /// resource has no further column.
+    func prepareCurlIncoming(direction: Direction, background: UIColor) async -> UIImage? {
+        guard let delta = pageDelta(for: direction) else {
+            return nil
+        }
+        curlDelta = delta
+        setSuppressingProgressionUpdates(true)
+        await scrollByAwaitingPaint(delta)
+        guard let image = await PageCurlSnapshotter.capture(of: self, backgroundColor: background) else {
+            await revertCurlIncoming()
+            return nil
+        }
+        return image
+    }
+
+    /// Puts the column back and drops the peeked progression. No location event.
+    func revertCurlIncoming() async {
+        let delta = curlDelta
+        curlDelta = 0
+        if delta != 0 {
+            await scrollByAwaitingPaint(-delta)
+        }
+        discardSuppressedProgression()
+    }
+
+    /// The column is already the one the finger committed to. Emit that once.
+    func commitCurlIncoming() {
+        curlDelta = 0
+        setSuppressingProgressionUpdates(false)
+    }
+
+    private func pageDelta(for direction: Direction) -> CGFloat? {
+        guard !viewModel.scroll else {
+            return nil
+        }
+        guard scrollView.bounds.width > 0 else {
+            return nil
+        }
+        let factor: CGFloat = direction == .left ? -1 : 1
+        let offsetX = scrollView.bounds.width * factor
+        guard offsetX != 0 else {
+            return nil
+        }
+        let targetX = round((scrollView.contentOffset.x + offsetX) / offsetX) * offsetX
+        guard (0 ..< scrollView.contentSize.width).contains(targetX) else {
+            return nil
+        }
+        return offsetX
+    }
+
     /// LTR forward is `.right` (`goForward`). RTL forward is `.left`.
     private func isForward(_ direction: Direction) -> Bool {
         let rtl = viewModel.readingProgression == .rtl
@@ -354,6 +406,7 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
                 do {
                     _ = try await self.webView.callAsyncJavaScript(
                         """
+                        document.documentElement.dataset.readiumTransitioning = '1';
                         window.scrollBy({ left: offsetX, behavior: 'instant' });
                         return await new Promise((resolve) => {
                           requestAnimationFrame(() => {
@@ -556,6 +609,9 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
 
     /// Called by the javascript code to notify that scrolling ended.
     private func progressionDidChange(_ body: Any) {
+        if CACurrentMediaTime() < ignoreProgressionUntil {
+            return
+        }
         guard
             isSpreadLoaded,
             let body = body as? [String: Any],
@@ -621,7 +677,7 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
 
     override func scrollViewDidScroll(_ scrollView: UIScrollView) {
         super.scrollViewDidScroll(scrollView)
-        if isSuppressingProgressionUpdates {
+        if isSuppressingProgressionUpdates || CACurrentMediaTime() < ignoreProgressionUntil {
             return
         }
         setNeedsNotifyPagesDidChange()
@@ -629,6 +685,7 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
 
     override func setSuppressingProgressionUpdates(_ suppressing: Bool) {
         if suppressing {
+            ignoreProgressionUntil = 0
             progressionChangedWhileSuppressed = false
             NSObject.cancelPreviousPerformRequests(withTarget: self, selector: #selector(notifyPagesDidChange), object: nil)
             isSuppressingProgressionUpdates = true
@@ -642,6 +699,19 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
             progressionChangedWhileSuppressed = false
             notifyPagesDidChange()
         }
+    }
+
+    /// Cancel path. The column is already back where the gesture started, so
+    /// the peeked range must not be reported when suppression lifts.
+    private func discardSuppressedProgression() {
+        if let previousProgression {
+            progression = previousProgression
+        }
+        self.previousProgression = nil
+        progressionChangedWhileSuppressed = false
+        isSuppressingProgressionUpdates = false
+        setTransitioningDataset(false)
+        ignoreProgressionUntil = CACurrentMediaTime() + 0.45
     }
 
     @objc private func reduceMotionStatusDidChange() {
