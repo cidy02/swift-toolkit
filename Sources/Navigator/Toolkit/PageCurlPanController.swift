@@ -69,6 +69,8 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
     /// peeling edge. `.possible` reports the origin, so a settled gesture
     /// keeps the last point from `.began` / `.changed` / `.ended`.
     private var grabStart = CGPoint(x: 0, y: 0)
+    /// First touch of the current sequence, recorded before the pan begins.
+    private var touchDown: CGPoint?
     private var lastFinger = CGPoint(x: 0, y: 0)
     /// Reading direction for this drag. Sampled once so a move does not rebuild
     /// the pan context on every touch.
@@ -162,6 +164,15 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
         }
     }
 
+    /// Records the touch-down. The pan's own translation starts where it was
+    /// recognised, not where the finger landed.
+    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
+        if gestureRecognizer.numberOfTouches == 0, phase == .idle, let view = gestureRecognizer.view {
+            touchDown = touch.location(in: view)
+        }
+        return true
+    }
+
     func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
         guard phase == .idle, let pan = gestureRecognizer as? UIPanGestureRecognizer, let view = pan.view, let delegate else {
             return false
@@ -216,9 +227,13 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
         pendingRelease = nil
         if let host = gesture.view {
             rtl = delegate.curlPanContext(in: host).rtl
+            grabStart = PageCurlPanStateMachine.grabOrigin(
+                touchDown: touchDown,
+                location: gesture.location(in: host),
+                translation: gesture.translation(in: host)
+            )
+            touchDown = nil
             let finger = fingerState(of: gesture, in: host)
-            let translation = gesture.translation(in: host)
-            grabStart = CGPoint(x: finger.point.x - translation.x, y: finger.point.y - translation.y)
             lastFinger = finger.point
             lastProgress = finger.progress
         }
@@ -452,12 +467,13 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
         )
     }
 
+    /// Progress is measured from the touch-down (`grabStart`), the same
+    /// origin the leaf uses, so the commit line and the leaf agree.
     private func fingerState(of pan: UIPanGestureRecognizer, in view: UIView) -> (progress: CGFloat, point: CGPoint) {
-        let translation = pan.translation(in: view)
         let location = pan.location(in: view)
         return (
             PageCurlPanStateMachine.progress(
-                translationX: translation.x,
+                translationX: location.x - grabStart.x,
                 width: view.bounds.width,
                 forward: direction == .forward,
                 rtl: rtl

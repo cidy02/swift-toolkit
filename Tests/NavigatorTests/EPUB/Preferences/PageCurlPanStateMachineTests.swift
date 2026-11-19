@@ -117,6 +117,29 @@ class PageCurlPanStateMachineTests: XCTestCase {
         )
     }
 
+    /// T-561g. The leaf is anchored where the finger landed, not where the
+    /// pan was recognised (about 50 pt later on a slow drag).
+    func testGrabOriginIsTheTouchDown() {
+        let origin = PageCurlPanStateMachine.grabOrigin(
+            touchDown: CGPoint(x: 388, y: 437),
+            location: CGPoint(x: 323, y: 437),
+            translation: CGPoint(x: -14, y: 0)
+        )
+        XCTAssertEqual(origin, CGPoint(x: 388, y: 437))
+        let fallback = PageCurlPanStateMachine.grabOrigin(
+            touchDown: nil,
+            location: CGPoint(x: 323, y: 437),
+            translation: CGPoint(x: -14, y: 2)
+        )
+        XCTAssertEqual(fallback, CGPoint(x: 337, y: 435))
+        let notFinite = PageCurlPanStateMachine.grabOrigin(
+            touchDown: CGPoint(x: CGFloat.nan, y: 0),
+            location: CGPoint(x: 10, y: 10),
+            translation: .zero
+        )
+        XCTAssertEqual(notFinite, CGPoint(x: 10, y: 10))
+    }
+
     func testCancelledReleaseNeverCommits() {
         XCTAssertEqual(
             PageCurlPanStateMachine.release(progress: 0.9, turnVelocity: 2000, width: 390, cancelled: true),

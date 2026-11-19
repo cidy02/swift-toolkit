@@ -222,6 +222,17 @@ enum PageCurlPanStateMachine {
         return liveValue
     }
 
+    /// Where the drag started. The pan begins late (it waits for the text
+    /// long-press to fail), and `location - translation` at `.began` was about
+    /// 50 pt inside the real touch-down on a slow drag, so the leaf trailed the
+    /// finger by that much. The touch-down, when it was seen, is the origin.
+    static func grabOrigin(touchDown: CGPoint?, location: CGPoint, translation: CGPoint) -> CGPoint {
+        if let touchDown, touchDown.x.isFinite, touchDown.y.isFinite {
+            return touchDown
+        }
+        return CGPoint(x: location.x - translation.x, y: location.y - translation.y)
+    }
+
     /// Once the gesture has reset to `.possible`, its location is the origin.
     /// The arm uses the touch stored while the finger was down.
     static func touchYForArm(gestureSettled: Bool, liveTouchY: CGFloat, storedTouchY: CGFloat) -> CGFloat {
