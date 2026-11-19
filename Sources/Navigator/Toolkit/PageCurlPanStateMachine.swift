@@ -57,7 +57,7 @@ enum PageCurlPanRelease: Equatable {
 enum PageCurlPanStateMachine {
     /// Distance alone commits strictly above this. 0.35 does not.
     static let distanceCommit: CGFloat = 0.35
-    /// Seconds of velocity mixed into the release, per the addendum.
+    /// Seconds of velocity mixed into the release.
     static let velocityHorizon: CGFloat = 0.18
     /// `progress + (turnVelocity / width) * velocityHorizon` commits above this.
     static let projectedCommit: CGFloat = 0.50
@@ -190,7 +190,7 @@ enum PageCurlPanStateMachine {
         return total / CGFloat(recent.count)
     }
 
-    /// Addendum §1.3. A system cancel never commits, including on the last page.
+    /// A system cancel never commits, including on the last page.
     static func release(
         progress: CGFloat,
         turnVelocity: CGFloat,
@@ -208,6 +208,27 @@ enum PageCurlPanStateMachine {
             return .commit
         }
         return .cancel
+    }
+
+    /// Progress the release decision should see. A flick's `.ended` sample can
+    /// report a zero translation; use the last `.changed` progress. A drag that
+    /// came back near the start must not be replaced by an earlier high-water mark.
+    static func progressAtRelease(live: CGFloat, lastProgress: CGFloat) -> CGFloat {
+        let liveValue = live.isFinite ? live : 0
+        let last = lastProgress.isFinite ? lastProgress : 0
+        if liveValue == 0, last > 0.02 {
+            return last
+        }
+        return liveValue
+    }
+
+    /// Once the gesture has reset to `.possible`, its location is the origin.
+    /// The arm uses the touch stored while the finger was down.
+    static func touchYForArm(gestureSettled: Bool, liveTouchY: CGFloat, storedTouchY: CGFloat) -> CGFloat {
+        if gestureSettled {
+            return storedTouchY
+        }
+        return liveTouchY.isFinite ? liveTouchY : storedTouchY
     }
 
     static func projectedProgress(progress: CGFloat, turnVelocity: CGFloat, width: CGFloat) -> CGFloat {

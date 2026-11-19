@@ -513,8 +513,10 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     override open func viewWillTransition(to size: CGSize, with coordinator: UIViewControllerTransitionCoordinator) {
         super.viewWillTransition(to: size, with: coordinator)
 
-        let dragging = curlPan?.dragInFlight == true
-        if dragging {
+        // A spring is still this turn. Resizing under it would commit the old
+        // page width onto the new spread.
+        let turning = curlPan?.turnInFlight == true
+        if turning {
             Task { @MainActor in
                 await self.curlPan?.abortDrag()
                 self.reflowPosition.scheduleRestore()
@@ -527,7 +529,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         }
 
         coordinator.animate(alongsideTransition: nil) { [weak self] _ in
-            guard let self, !dragging else {
+            guard let self, !turning else {
                 return
             }
             self.reflowPosition.scheduleRestore()
@@ -542,8 +544,8 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         else {
             return
         }
-        let dragging = curlPan?.dragInFlight == true
-        if dragging {
+        let turning = curlPan?.turnInFlight == true
+        if turning {
             reflowPosition.hold(
                 on: spread,
                 locator: reflowPosition.settledVisibleLocator ?? currentLocation
@@ -679,6 +681,10 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
     private var paginationView: PaginationView?
     private var curlPan: PageCurlPanController?
+    /// Spread and reload generation captured when the finger curl began.
+    /// Commit and cancel no-op once a reload has replaced that spread.
+    private var curlSessionGeneration: UInt = 0
+    private weak var curlSessionSpread: EPUBSpreadView?
     private let reflowPosition = ReflowPositionKeeper()
 
     private func makePaginationView(hasPositions: Bool) -> PaginationView {
@@ -786,8 +792,17 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
     // MARK: - Navigator
 
+    private var interactiveCurlEnabled: Bool {
+        PageCurlPanStateMachine.allowsInteractiveCurl(
+            preference: settings.pageTransition,
+            scrolls: settings.scroll,
+            reduceMotion: UIAccessibility.isReduceMotionEnabled,
+            voiceOverRunning: UIAccessibility.isVoiceOverRunning
+        )
+    }
+
     private var isPaginationViewScrollingEnabled: Bool {
-        !(config.disablePageTurnsWhileScrolling && settings.scroll)
+        !(config.disablePageTurnsWhileScrolling && settings.scroll) && !interactiveCurlEnabled
     }
 
     public var presentation: VisualNavigatorPresentation {
@@ -1060,13 +1075,8 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         }
 
         view.backgroundColor = settings.effectiveBackgroundColor.uiColor
-        let curl = PageCurlPanStateMachine.allowsInteractiveCurl(
-            preference: settings.pageTransition,
-            scrolls: settings.scroll,
-            reduceMotion: UIAccessibility.isReduceMotionEnabled,
-            voiceOverRunning: UIAccessibility.isVoiceOverRunning
-        )
-        paginationView?.isScrollEnabled = isPaginationViewScrollingEnabled && !curl
+        let curl = interactiveCurlEnabled
+        paginationView?.isScrollEnabled = isPaginationViewScrollingEnabled
         paginationView?.pageTransition = settings.pageTransition
         paginationView?.scrolls = settings.scroll
         paginationView?.transitionBackgroundColor = settings.effectiveBackgroundColor.uiColor
@@ -1085,21 +1095,23 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             return
         }
         for (_, view) in loaded {
-            guard let spread = view as? EPUBSpreadView else {
-                continue
-            }
-            let blockPan = interactiveCurl && !(spread is EPUBFixedSpreadView)
-            spread.scrollView.panGestureRecognizer.isEnabled = !blockPan
+            applySpreadPanPolicy(interactiveCurl: interactiveCurl, to: view)
         }
     }
 
+    /// A spread's own pan is on from the moment the web view exists. Curl has
+    /// to turn it off here, not after `spreadViewDidLoad`, or the first drag
+    /// slides the column instead of lifting the page.
+    private func applySpreadPanPolicy(interactiveCurl: Bool, to view: UIView) {
+        guard let spread = view as? EPUBSpreadView else {
+            return
+        }
+        let blockPan = interactiveCurl && !(spread is EPUBFixedSpreadView)
+        spread.scrollView.panGestureRecognizer.isEnabled = !blockPan
+    }
+
     @objc private func curlAccessibilityChanged() {
-        if !PageCurlPanStateMachine.allowsInteractiveCurl(
-            preference: settings.pageTransition,
-            scrolls: settings.scroll,
-            reduceMotion: UIAccessibility.isReduceMotionEnabled,
-            voiceOverRunning: UIAccessibility.isVoiceOverRunning
-        ) {
+        if !interactiveCurlEnabled {
             curlPan?.abort()
         }
         applySettings()
@@ -1289,10 +1301,15 @@ extension EPUBNavigatorViewController: EPUBSpreadViewDelegate {
         }
 
         await spreadView.evaluateScript("(function() {\n\(script)\n})();")
-        applySettings()
+        // Settings already applied the pan policy when this spread was created.
+        // Applying them again re-enables the pagination scroll under a slide.
+        applySpreadPanPolicy(interactiveCurl: interactiveCurlEnabled, to: spreadView)
     }
 
     func spreadView(_ spreadView: EPUBSpreadView, didReceive event: PointerEvent) {
+        guard state == .idle else {
+            return
+        }
         Task {
             var event = event
             event.location = view.convert(event.location, from: spreadView)
@@ -1316,6 +1333,9 @@ extension EPUBNavigatorViewController: EPUBSpreadViewDelegate {
     }
 
     func spreadView(_ spreadView: EPUBSpreadView, didTapOnInternalLink href: String, clickEvent: ClickEvent?) {
+        guard state == .idle else {
+            return
+        }
         guard
             let url = AnyURL(string: href),
             var link = publication.linkWithHREF(url)
@@ -1406,6 +1426,9 @@ extension EPUBNavigatorViewController: EPUBSpreadViewDelegate {
     }
 
     func spreadView(_ spreadView: EPUBSpreadView, didActivateDecoration id: Decoration.Id, inGroup group: DecorationGroup, frame: CGRect?, point: CGPoint?) {
+        guard state == .idle else {
+            return
+        }
         guard
             let callbacks = decorationCallbacks[group].takeIf({ !$0.isEmpty }),
             let decoration: Decoration = decorations[group]?
@@ -1474,11 +1497,16 @@ extension EPUBNavigatorViewController: PaginationViewDelegate {
             animatedLoad: false
         )
         spreadView.delegate = self
+        applySpreadPanPolicy(interactiveCurl: interactiveCurlEnabled, to: spreadView)
 
         let userContentController = spreadView.webView.configuration.userContentController
         delegate?.navigator(self, setupUserScripts: userContentController)
 
         return spreadView
+    }
+
+    func paginationViewWillDiscardPages(_ paginationView: PaginationView) {
+        curlPan?.abort()
     }
 
     func paginationViewDidUpdateViews(_ paginationView: PaginationView) {
@@ -1501,7 +1529,7 @@ extension EPUBNavigatorViewController: PaginationViewDelegate {
         )
         let x = sample.normalizedX.map { String(format: "%.3f", $0) } ?? "nil"
         log(.info, "fold-posture x=\(x) width=\(String(format: "%.1f", sample.width)) gap=\(String(format: "%.1f", gap)) bounds=\(paginationView.bounds.size)")
-        NSLog("%@", "T561e fold-posture x=\(x) width=\(String(format: "%.1f", sample.width)) gap=\(String(format: "%.1f", gap)) bounds=\(String(format: "%.0fx%.0f", paginationView.bounds.width, paginationView.bounds.height))" as NSString)
+        PageCurlDebug.log("T561e fold-posture x=\(x) width=\(String(format: "%.1f", sample.width)) gap=\(String(format: "%.1f", gap)) bounds=\(String(format: "%.0fx%.0f", paginationView.bounds.width, paginationView.bounds.height))")
         Task { @MainActor in
             await self.applyFoldColumnGap(gap)
         }
@@ -1536,6 +1564,14 @@ extension EPUBNavigatorViewController: PaginationViewDelegate {
 }
 
 extension EPUBNavigatorViewController: PageCurlPanDelegate {
+    private var curlSessionCurrent: Bool {
+        guard let paginationView, let curlSessionSpread else {
+            return false
+        }
+        return paginationView.turnGeneration == curlSessionGeneration
+            && paginationView.currentView === curlSessionSpread
+    }
+
     func curlPanContext(in view: UIView) -> PageCurlPanContext {
         let rtl = viewModel.readingProgression == .rtl
         let spread = paginationView?.currentView as? EPUBSpreadView
@@ -1564,7 +1600,12 @@ extension EPUBNavigatorViewController: PageCurlPanDelegate {
     }
 
     func curlPanDidBegin(direction: PageCurlTurnDirection) -> Bool {
-        on(.interactiveMove(spreadDirection(for: direction)))
+        let accepted = on(.interactiveMove(spreadDirection(for: direction)))
+        if accepted {
+            curlSessionGeneration = paginationView?.turnGeneration ?? 0
+            curlSessionSpread = paginationView?.currentView as? EPUBSpreadView
+        }
+        return accepted
     }
 
     func curlPanCaptureOutgoing() async -> (image: UIImage, background: UIColor)? {
@@ -1601,7 +1642,7 @@ extension EPUBNavigatorViewController: PageCurlPanDelegate {
         )
         let divisionText = divisionX.map { String(format: "%.3f", $0) } ?? "nil"
         log(.info, "curl-spine columns=\(columns) division=\(divisionText) spine=\(spine) forward=\(forward)")
-        NSLog("%@", "T561e curl-spine columns=\(columns) division=\(divisionText) spine=\(spine) forward=\(forward)" as NSString)
+        PageCurlDebug.log("T561e curl-spine columns=\(columns) division=\(divisionText) spine=\(spine) forward=\(forward)")
         let peel = PageCurlGeometry.peelSign(spine: spine, rtl: rtl, forward: forward)
         let spreadDirection = spreadDirection(for: direction)
 
@@ -1637,20 +1678,26 @@ extension EPUBNavigatorViewController: PageCurlPanDelegate {
     }
 
     func curlPanCommit(direction: PageCurlTurnDirection, withinResource: Bool) async {
+        guard curlSessionCurrent else {
+            return
+        }
         if withinResource {
-            await (paginationView?.currentView as? EPUBReflowableSpreadView)?.commitCurlIncoming()
+            await (curlSessionSpread as? EPUBReflowableSpreadView)?.commitCurlIncoming()
             return
         }
         await paginationView?.commitCurlNeighbor(forward: direction == .forward)
     }
 
     func curlPanCancel(direction: PageCurlTurnDirection, withinResource: Bool) async {
+        guard curlSessionCurrent else {
+            return
+        }
         guard withinResource else {
             // The neighbour index was never changed. `direction` only matters on commit.
             _ = direction
             return
         }
-        await (paginationView?.currentView as? EPUBReflowableSpreadView)?.revertCurlIncoming()
+        await (curlSessionSpread as? EPUBReflowableSpreadView)?.revertCurlIncoming()
     }
 
     func curlPanDidFinish() {

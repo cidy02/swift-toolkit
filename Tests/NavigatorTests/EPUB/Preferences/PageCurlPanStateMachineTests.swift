@@ -89,7 +89,7 @@ class PageCurlPanStateMachineTests: XCTestCase {
             .cancel
         )
 
-        // Addendum: progress + (v / width) * 0.18 > 0.50.
+        // Progress + (v / width) * 0.18 > 0.50.
         // 500 pt/s on a 390 pt page from 0.30 crosses the line. From 0.10 it does not.
         // The older "any velocity over 500 commits" rule does not.
         XCTAssertEqual(
@@ -338,6 +338,50 @@ class PageCurlPanStateMachineTests: XCTestCase {
         XCTAssertEqual(PageCurlPanStateMachine.smoothedVelocity([10, 100, 200, 300]), 200, accuracy: 0.001)
         XCTAssertEqual(PageCurlPanStateMachine.smoothedVelocity([40]), 40, accuracy: 0.001)
         XCTAssertEqual(PageCurlPanStateMachine.smoothedVelocity([]), 0, accuracy: 0.001)
+    }
+
+    func testReleaseUsesTheLastProgressNotTheHighWaterMark() {
+        // A flick's `.ended` sample can report a zero translation.
+        XCTAssertEqual(
+            PageCurlPanStateMachine.progressAtRelease(live: 0, lastProgress: 0.42),
+            0.42,
+            accuracy: 0.0001
+        )
+        XCTAssertEqual(
+            PageCurlPanStateMachine.release(
+                progress: PageCurlPanStateMachine.progressAtRelease(live: 0, lastProgress: 0.42),
+                turnVelocity: 2,
+                width: 390,
+                cancelled: false
+            ),
+            .commit
+        )
+        // Dragged past the line, then back. The zero sample must not restore 0.50.
+        XCTAssertEqual(
+            PageCurlPanStateMachine.progressAtRelease(live: 0, lastProgress: 0.01),
+            0,
+            accuracy: 0.0001
+        )
+        XCTAssertEqual(
+            PageCurlPanStateMachine.release(
+                progress: PageCurlPanStateMachine.progressAtRelease(live: 0.01, lastProgress: 0.50),
+                turnVelocity: 2,
+                width: 390,
+                cancelled: false
+            ),
+            .cancel
+        )
+        // The gesture has reset. A live reading of 0 is the origin, not the finger.
+        XCTAssertEqual(
+            PageCurlPanStateMachine.touchYForArm(gestureSettled: true, liveTouchY: 0, storedTouchY: 0.85),
+            0.85,
+            accuracy: 0.0001
+        )
+        XCTAssertEqual(
+            PageCurlPanStateMachine.touchYForArm(gestureSettled: false, liveTouchY: 0.85, storedTouchY: 0.2),
+            0.85,
+            accuracy: 0.0001
+        )
     }
 
     func testSpringDoesNotOvershootAndAFlickIsFaster() {

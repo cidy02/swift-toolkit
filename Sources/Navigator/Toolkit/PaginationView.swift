@@ -66,6 +66,10 @@ protocol PaginationViewDelegate: AnyObject {
     /// Called when the page views were updated.
     func paginationViewDidUpdateViews(_ paginationView: PaginationView)
 
+    /// The pages are about to be reloaded or the view is leaving the window.
+    /// An interactive curl must drop its cover and must not commit afterwards.
+    func paginationViewWillDiscardPages(_ paginationView: PaginationView)
+
     /// Returns the number of positions (as in `Publication.positionList`) in the page view at given index.
     func paginationView(_ paginationView: PaginationView, positionCountAtIndex index: Int) -> Int
 
@@ -153,9 +157,15 @@ final class PaginationView: UIView, Loggable {
     /// its location. Preloads continue afterwards and do not block a turn.
     private var firstPageLoad: Task<Void, Never>?
 
-    /// Allows the scroll view to scroll.
+    /// Allows the scroll view to scroll. A slide or fade sets
+    /// `isAnimatingContentOffset` and drives the scroll view itself; writing
+    /// the flag through here mid-animation would turn scrolling back on.
     var isScrollEnabled: Bool {
-        didSet { scrollView.isScrollEnabled = isScrollEnabled }
+        didSet {
+            if !isAnimatingContentOffset {
+                scrollView.isScrollEnabled = isScrollEnabled
+            }
+        }
     }
 
     init(
@@ -219,6 +229,7 @@ final class PaginationView: UIView, Loggable {
         super.willMove(toSuperview: newSuperview)
 
         if newSuperview == nil {
+            delegate?.paginationViewWillDiscardPages(self)
             cancelActiveCurl()
             // Remove all spread views to break retain cycles
             for (_, view) in loadedViews {
@@ -235,6 +246,7 @@ final class PaginationView: UIView, Loggable {
         }
 
         if window == nil {
+            delegate?.paginationViewWillDiscardPages(self)
             cancelActiveCurl()
             loadPagesTask.cancel()
             firstPageLoad?.cancel()
@@ -269,6 +281,10 @@ final class PaginationView: UIView, Loggable {
     /// Bumped by every reload. A curl that is awaiting across a reload must not
     /// write `currentIndex` or the animation flags afterwards.
     private var reloadGeneration: UInt = 0
+
+    /// The generation a finger curl captured when it began. Commit and cancel
+    /// compare against it so a reload cannot receive the stale turn.
+    var turnGeneration: UInt { reloadGeneration }
     private weak var activeCurlView: PageCurlView?
 
     /// Reloads the pagination with the given total number of pages and current index.
@@ -283,6 +299,7 @@ final class PaginationView: UIView, Loggable {
         precondition(0 ..< pageCount ~= index)
 
         reloadGeneration &+= 1
+        delegate?.paginationViewWillDiscardPages(self)
         cancelActiveCurl()
         // A curl in flight set these. The reload owns them now; the curl's
         // defer must not put the new spread back into a transition.
@@ -499,6 +516,7 @@ final class PaginationView: UIView, Loggable {
     /// Bitmap of the neighbour, taken on screen under the caller's opaque cover,
     /// without changing `currentIndex`. The offset is restored before returning.
     func captureNeighborForCurl(forward: Bool, background: UIColor) async -> UIImage? {
+        let generation = reloadGeneration
         let index = neighborIndex(forward: forward)
         guard (0 ..< pageCount).contains(index) else {
             return nil
@@ -507,10 +525,18 @@ final class PaginationView: UIView, Loggable {
         guard let neighbor = await ensureLoadedForCurl(at: index, location: location) else {
             return nil
         }
+        guard generation == reloadGeneration else {
+            return nil
+        }
         let saved = scrollView.contentOffset
         isAnimatingContentOffset = true
         neighbor.setSuppressingProgressionUpdates(true)
         defer {
+            // A reload already owns the new spread. Restoring this offset
+            // would move that spread, or write flags it just cleared.
+            guard generation == reloadGeneration else {
+                return
+            }
             neighbor.setSuppressingProgressionUpdates(false)
             scrollView.contentOffset = CGPoint(x: xOffsetForIndex(currentIndex), y: saved.y)
             isAnimatingContentOffset = false
@@ -518,11 +544,18 @@ final class PaginationView: UIView, Loggable {
         scrollView.contentOffset = CGPoint(x: xOffsetForIndex(index), y: saved.y)
         layoutIfNeeded()
         await neighbor.awaitNextPaint()
+        guard generation == reloadGeneration else {
+            return nil
+        }
         return await PageCurlSnapshotter.capture(of: neighbor, backgroundColor: background)
     }
 
     /// Lands on the neighbour under a curl that has already finished. No second animation.
     func commitCurlNeighbor(forward: Bool) async {
+        let generation = reloadGeneration
+        guard pageTurnAttached(generation) else {
+            return
+        }
         let index = neighborIndex(forward: forward)
         guard (0 ..< pageCount).contains(index) else {
             return
@@ -534,6 +567,9 @@ final class PaginationView: UIView, Loggable {
         let from = scrollView.contentOffset
         setCurrentIndex(index, location: location)
         await preparePageInViewport(at: index, fromOffset: from)
+        guard generation == reloadGeneration else {
+            return
+        }
         suppressProgressionDuringLoad = false
         loadedViews[index]?.setSuppressingProgressionUpdates(false)
         isAnimatingContentOffset = false
@@ -609,8 +645,7 @@ final class PaginationView: UIView, Loggable {
         )
         let divisionText = divisionNormalizedX.map { String(format: "%.3f", $0) } ?? "nil"
         log(.info, "curl-spine columns=\(columns) division=\(divisionText) spine=\(spine) forward=\(forward)")
-        // Readium's logger is a no-op until the host enables it. The pose check reads this line.
-        NSLog("%@", "T561e curl-spine columns=\(columns) division=\(divisionText) spine=\(spine) forward=\(forward)" as NSString)
+        PageCurlDebug.log("T561e curl-spine columns=\(columns) division=\(divisionText) spine=\(spine) forward=\(forward)")
         let curl = PageCurlView(frame: bounds)
         curl.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         curl.showCover(outgoing, background: background)

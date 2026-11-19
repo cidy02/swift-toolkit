@@ -147,7 +147,7 @@ class PageCurlGeometryTests: XCTestCase {
             .center(normalizedX: 0.5)
         )
         // Tabletop. The fold is ignored, so two columns stay centred and one
-        // column stays an edge. Kudos forces the one-column case.
+        // column stays an edge.
         XCTAssertEqual(
             PageCurlSpine.resolve(renderedColumns: 2, rtl: false, regions: [horizontal], viewport: viewport),
             .center(normalizedX: 0.5)
@@ -447,6 +447,120 @@ class PageCurlGeometryTests: XCTestCase {
         )
         XCTAssertLessThan(end, -0.4)
         XCTAssertEqual(PageCurlGeometry.farSpan(twoPage: false, span: 1), 0)
+    }
+
+    func testTwoPageRollSamplesTheTurningLeaf() {
+        let spine: CGFloat = 0.5
+        let span: CGFloat = 0.5
+
+        // Still on the near half. The front is the outgoing right page.
+        // The back is the incoming left page, not the incoming right page.
+        let nearFront = rollSample(progress: 0.25, t: 0.25, spine: spine, span: span)
+        XCTAssertEqual(nearFront.region, .rollFront)
+        XCTAssertEqual(nearFront.sheet, .outgoing)
+        XCTAssertGreaterThan(nearFront.x, spine)
+
+        let nearBack = rollSample(progress: 0.25, t: 0.75, spine: spine, span: span)
+        XCTAssertEqual(nearBack.region, .rollBack)
+        XCTAssertEqual(nearBack.sheet, .incoming)
+        XCTAssertLessThan(nearBack.x, spine)
+
+        // The fold has crossed the spine. Both faces of the roll lay the
+        // verso (incoming left) down. They do not peel the static left page
+        // or paint the incoming right page on the back.
+        let farFront = rollSample(progress: 0.75, t: 0.25, spine: spine, span: span)
+        XCTAssertEqual(farFront.region, .rollFront)
+        XCTAssertEqual(farFront.sheet, .incoming)
+        XCTAssertLessThan(farFront.x, spine)
+        XCTAssertGreaterThanOrEqual(farFront.x, 0)
+
+        let farBack = rollSample(progress: 0.75, t: 0.75, spine: spine, span: span)
+        XCTAssertEqual(farBack.region, .rollBack)
+        XCTAssertEqual(farBack.sheet, .incoming)
+        XCTAssertLessThan(farBack.x, spine)
+        XCTAssertGreaterThanOrEqual(farBack.x, 0)
+
+        let staticLeft = PageCurlGeometry.spreadSample(
+            uvX: 0, uvY: 0.5, progress: 0.75,
+            spineX: spine, peelSign: 1, span: span,
+            twoPage: true, realVerso: true, tilt: 0, aspect: 1
+        )
+        XCTAssertEqual(staticLeft.region, .flatOutgoing)
+        XCTAssertEqual(staticLeft.sheet, .outgoing)
+
+        let revealedRight = PageCurlGeometry.spreadSample(
+            uvX: 0.9, uvY: 0.5, progress: 0.75,
+            spineX: spine, peelSign: 1, span: span,
+            twoPage: true, realVerso: true, tilt: 0, aspect: 1
+        )
+        XCTAssertEqual(revealedRight.region, .flatIncoming)
+        XCTAssertEqual(revealedRight.sheet, .incoming)
+        XCTAssertGreaterThan(revealedRight.x, spine)
+    }
+
+    func testAsymmetricVersoStaysInsideTheFarHalf() {
+        let span: CGFloat = 0.53
+        let spine: CGFloat = 0.47
+        let along = PageCurlGeometry.versoAlong(orig: 0.50, span: span, twoPage: true)
+        let x = spine + along
+        XCTAssertGreaterThanOrEqual(x, 0)
+        XCTAssertLessThan(x, spine)
+        // Unscaled `-orig` would land past the left edge.
+        XCTAssertLessThan(spine - 0.50, 0)
+    }
+
+    func testReversedTiltFlipsTheCorner() {
+        let bottom = PageCurlGeometry.tiltRadians(touchY: 0.9)
+        XCTAssertGreaterThan(bottom, 0)
+        XCTAssertEqual(PageCurlGeometry.displayedTilt(touchY: 0.9, reversed: false), bottom, accuracy: 0.0001)
+        XCTAssertEqual(PageCurlGeometry.displayedTilt(touchY: 0.9, reversed: true), -bottom, accuracy: 0.0001)
+        XCTAssertEqual(PageCurlGeometry.displayedTilt(touchY: 0.5, reversed: true), 0, accuracy: 0.0001)
+    }
+
+    func testColumnCorrectionScrollsToTheAbsoluteTarget() {
+        // Three points short of the column. Another page-width would skip one.
+        XCTAssertEqual(PageCurlGeometry.curlColumnCorrection(offset: 780, target: 783), 3, accuracy: 0.001)
+        XCTAssertEqual(PageCurlGeometry.curlColumnCorrection(offset: 781.5, target: 783), 0, accuracy: 0.001)
+        // Snapped all the way back to the start. One page, toward the target.
+        XCTAssertEqual(PageCurlGeometry.curlColumnCorrection(offset: 393, target: 783), 390, accuracy: 0.001)
+        // Already past the target. Come back, do not add another page.
+        XCTAssertEqual(PageCurlGeometry.curlColumnCorrection(offset: 1170, target: 783), -387, accuracy: 0.001)
+    }
+
+    func testShaderLaysTheVersoOnceTheFoldCrosses() {
+        let source = PageCurlShader.source
+        XCTAssertTrue(source.contains("u.twoPage > 0.5 && orig < 0.0"))
+        XCTAssertTrue(source.contains("versoAlong"))
+        XCTAssertTrue(source.contains("PageCurlGeometry.spreadSample"))
+    }
+
+    private func rollSample(
+        progress: CGFloat,
+        t: CGFloat,
+        spine: CGFloat,
+        span: CGFloat
+    ) -> PageCurlGeometry.SpreadSample {
+        let radius = PageCurlGeometry.cylinderRadius(progress: progress, span: span)
+        let fold = PageCurlGeometry.foldCenter(
+            progress: progress,
+            span: span,
+            overhang: 0,
+            curlWidth: radius * 2,
+            far: PageCurlGeometry.farSpan(twoPage: true, span: span)
+        )
+        let along = fold + t * radius * 2
+        return PageCurlGeometry.spreadSample(
+            uvX: spine + along,
+            uvY: 0.5,
+            progress: progress,
+            spineX: spine,
+            peelSign: 1,
+            span: span,
+            twoPage: true,
+            realVerso: true,
+            tilt: 0,
+            aspect: 1
+        )
     }
 
     func testUsedColumnCountFollowsTheWidthsThatFit() {

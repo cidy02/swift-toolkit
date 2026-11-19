@@ -61,13 +61,20 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
     private var metalArmed = false
     private var revealed = false
     private var velocities: [CGFloat] = []
-    /// Highest progress while the finger was down. `.ended` sometimes reports
-    /// a zero translation, which would cancel a flick that had already crossed.
-    private var trackedProgress: CGFloat = 0
+    /// Latest `.changed` progress. A release that reports a zero translation
+    /// uses this. It is not the high-water mark: dragging back under the line
+    /// and then lifting must cancel.
+    private var lastProgress: CGFloat = 0
+    /// Latest touch while the gesture was still `.began` or `.changed`.
+    /// `.possible` reports the origin, which peels a flick from the top corner.
+    private var lastTouchY: CGFloat = PageCurlGeometry.tapTouchY
+    /// Reading direction for this drag. Sampled once so a move does not rebuild
+    /// the pan context on every touch.
+    private var rtl = false
     private var endConsumed = false
     private var prepareTask: Task<Void, Never>?
     /// Set when the finger lifts before the incoming page is ready.
-    private var pendingRelease: (commit: Bool, velocity: CGFloat)?
+    private var pendingRelease: (commit: Bool, velocity: CGFloat, touchY: CGFloat)?
     private var aborted = false
 
     override init() {
@@ -86,50 +93,60 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
     }
 
     /// True while a finger curl is preparing or tracking. A commit spring that
-    /// has already started is not a drag: its release decision stands.
+    /// has already started is not a drag: a posture change leaves that release.
     var dragInFlight: Bool {
         phase == .preparing || phase == .armed
     }
 
-    /// Rotation or Reduce Motion landed in the middle of a drag. The page goes back.
-    /// A prepare still in flight reverts itself when it sees `aborted`: finishing
-    /// here as well would drop the cover before the hidden scroll had been undone.
-    func abort() {
-        aborted = true
-        prepareTask?.cancel()
-        guard phase == .armed else { return }
-        Task { @MainActor in
-            await self.finish(commit: false, velocity: 0)
-        }
+    /// True from the first touch until the cover is gone, including the spring.
+    var turnInFlight: Bool {
+        phase != .idle
     }
 
-    /// Posture changed under the finger. Revert the peek and wait until the
-    /// cover is gone, so the reflow anchor is the page the reader was on.
+    /// Detach, reload, rotation, Reduce Motion, VoiceOver, background, or a
+    /// posture change. The cover comes off immediately. A spring already
+    /// running is cut, and `finish` will not commit onto a navigator that
+    /// has since reloaded.
+    func abort() {
+        beginTeardown()
+    }
+
+    /// Posture changed under the finger. Same teardown as `abort`, then wait
+    /// until the cover is gone so the reflow anchor is the page the reader was on.
     private var abortContinuation: CheckedContinuation<Void, Never>?
 
     func abortDrag() async {
-        switch phase {
-        case .idle:
+        guard phase != .idle else {
             return
-        case .preparing, .armed:
-            aborted = true
-            prepareTask?.cancel()
-            await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+        }
+        beginTeardown()
+        if phase == .idle {
+            return
+        }
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            if phase == .idle {
+                cont.resume()
+            } else {
                 abortContinuation = cont
-                if phase == .armed {
-                    Task { @MainActor in
-                        await self.finish(commit: false, velocity: 0)
-                    }
-                }
             }
-        case .finishing:
-            await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
-                if phase == .idle {
-                    cont.resume()
-                } else {
-                    abortContinuation = cont
-                }
-            }
+        }
+    }
+
+    private func beginTeardown() {
+        guard phase != .idle else {
+            return
+        }
+        aborted = true
+        prepareTask?.cancel()
+        // Unblock `finishInteractive` and `drawAndWait`, and take the cover
+        // down before a reload installs a new spread under it.
+        curlView?.releaseResources()
+        curlView?.removeFromSuperview()
+        guard phase == .armed else {
+            return
+        }
+        Task { @MainActor in
+            await self.finish(commit: false, velocity: 0)
         }
     }
 
@@ -188,9 +205,16 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
         metalArmed = false
         withinResource = false
         velocities = []
-        trackedProgress = 0
+        lastProgress = 0
+        lastTouchY = PageCurlGeometry.tapTouchY
         endConsumed = false
         pendingRelease = nil
+        if let host = gesture.view {
+            rtl = delegate.curlPanContext(in: host).rtl
+            let finger = fingerState(of: gesture, in: host)
+            lastProgress = finger.progress
+            lastTouchY = finger.touchY
+        }
         let direction = direction
         prepareTask = Task { @MainActor [weak self] in
             await self?.prepare(direction: direction, gesture: gesture)
@@ -198,7 +222,11 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
     }
 
     private func prepare(direction: PageCurlTurnDirection, gesture: UIPanGestureRecognizer) async {
-        guard let delegate, let host = delegate.curlPanHostView() else {
+        guard !aborted, !Task.isCancelled else {
+            await failBeforeReveal()
+            return
+        }
+        guard let delegate, let host = delegate.curlPanHostView(), host.window != nil else {
             await failBeforeReveal()
             return
         }
@@ -206,7 +234,7 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
             await failBeforeReveal()
             return
         }
-        if aborted || Task.isCancelled {
+        if aborted || Task.isCancelled || host.window == nil {
             await failBeforeReveal()
             return
         }
@@ -228,12 +256,26 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
         }
         withinResource = frame.withinResource
         revealed = true
-        if aborted || Task.isCancelled {
+        // A cancel that arrived while the snapshot was in flight must not
+        // upload textures just to spring back to zero.
+        if aborted || Task.isCancelled || host.window == nil || pendingRelease?.commit == false {
+            pendingRelease = nil
             await finish(commit: false, velocity: 0)
             return
         }
 
-        let finger = fingerState(of: gesture, in: host)
+        let gestureLive = gesture.state == .began || gesture.state == .changed
+        let sampled = gestureLive ? fingerState(of: gesture, in: host) : nil
+        if let sampled {
+            lastProgress = sampled.progress
+            lastTouchY = sampled.touchY
+        }
+        let touchY = PageCurlPanStateMachine.touchYForArm(
+            gestureSettled: sampled == nil,
+            liveTouchY: sampled?.touchY ?? 0,
+            storedTouchY: pendingRelease?.touchY ?? lastTouchY
+        )
+        let progress = sampled?.progress ?? lastProgress
         let armed = await curl.beginInteractive(
             outgoing: frame.outgoing,
             incoming: frame.incoming,
@@ -241,17 +283,24 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
             peelSign: frame.peelSign,
             realVerso: frame.realVerso,
             reversed: frame.reversed,
-            progress: finger.progress,
-            touchY: finger.touchY
+            progress: progress,
+            touchY: touchY
         )
         metalArmed = armed
+        // Detach during the upload leaves `beginInteractive` false. Staying
+        // `.armed` would pin the reader behind a cover that never finishes.
+        if aborted || Task.isCancelled || !armed || host.window == nil {
+            await finish(commit: false, velocity: 0)
+            return
+        }
         phase = .armed
-        // The snapshot await is long enough for the finger to move. The
-        // progress passed above is from before that wait. Sample again before
-        // the first frame, while the gesture is still down.
-        if armed, gesture.state == .began || gesture.state == .changed {
+        if gesture.state == .began || gesture.state == .changed {
             let now = fingerState(of: gesture, in: host)
+            lastProgress = now.progress
+            lastTouchY = now.touchY
             curl.track(progress: now.progress, touchY: now.touchY)
+        } else {
+            curl.track(progress: lastProgress, touchY: touchY)
         }
         if let pending = pendingRelease {
             pendingRelease = nil
@@ -268,36 +317,44 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
         let turn = PageCurlPanStateMachine.turnVelocity(
             velocityX: gesture.velocity(in: host).x,
             forward: direction == .forward,
-            rtl: delegate?.curlPanContext(in: host).rtl ?? false
+            rtl: rtl
         )
         velocities.append(turn)
         if velocities.count > 3 {
             velocities.removeFirst(velocities.count - 3)
         }
         let finger = fingerState(of: gesture, in: host)
-        trackedProgress = max(trackedProgress, finger.progress)
+        lastProgress = finger.progress
+        lastTouchY = finger.touchY
         guard phase == .armed, metalArmed, let curlView else { return }
         curlView.track(progress: finger.progress, touchY: finger.touchY)
     }
 
     private func end(_ gesture: UIPanGestureRecognizer, cancelled: Bool) {
         // A flick can jump from .began to .ended without a .changed sample.
+        // The location is still valid here. After this returns, UIKit resets
+        // the gesture to `.possible` and a later sample reads the origin.
+        var live: CGFloat = 0
         if let host = gesture.view {
             velocities.append(PageCurlPanStateMachine.turnVelocity(
                 velocityX: gesture.velocity(in: host).x,
                 forward: direction == .forward,
-                rtl: delegate?.curlPanContext(in: host).rtl ?? false
+                rtl: rtl
             ))
+            if gesture.state != .possible {
+                let finger = fingerState(of: gesture, in: host)
+                live = finger.progress
+                if finger.progress > 0 {
+                    lastProgress = finger.progress
+                }
+                lastTouchY = finger.touchY
+            }
         }
         let velocity = PageCurlPanStateMachine.smoothedVelocity(velocities)
         let width = gesture.view?.bounds.width ?? 1
-        let live = gesture.view.map { fingerState(of: gesture, in: $0).progress } ?? 0
-        let progress = releaseProgress(
-            live: live,
-            cancelled: cancelled,
-            turnVelocity: velocity,
-            width: width
-        )
+        let progress = cancelled
+            ? live
+            : PageCurlPanStateMachine.progressAtRelease(live: live, lastProgress: lastProgress)
         let decision = PageCurlPanStateMachine.release(
             progress: progress,
             turnVelocity: velocity,
@@ -307,7 +364,7 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
         let commit = decision == .commit
         switch phase {
         case .preparing:
-            pendingRelease = (commit, velocity)
+            pendingRelease = (commit, velocity, lastTouchY)
         case .armed:
             // `.ended` then `.cancelled` must not start a second finish that
             // reverts a turn the first one is about to commit.
@@ -321,45 +378,29 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
         }
     }
 
-    /// A flick's `.ended` sample can report a zero translation after the leaf
-    /// has already crossed. A drag that came back to the start has no forward
-    /// velocity, so that release still cancels.
-    private func releaseProgress(
-        live: CGFloat,
-        cancelled: Bool,
-        turnVelocity: CGFloat,
-        width: CGFloat
-    ) -> CGFloat {
-        if cancelled {
-            return live
-        }
-        let crossed = trackedProgress > PageCurlPanStateMachine.distanceCommit
-        if live < 0.02, crossed, turnVelocity > 0, width > 1 {
-            return trackedProgress
-        }
-        return live
-    }
-
     private func finish(commit: Bool, velocity: CGFloat) async {
         guard phase != .idle, phase != .finishing else { return }
         phase = .finishing
         let width = delegate?.curlPanHostView()?.bounds.width ?? 1
         let progressVelocity = width > 1 ? velocity / width : 0
-        // A load during the spring sets `aborted`. The release already chose.
-        // Re-reading the flag after the spring turned a finished curl into a
-        // cancel, and the page under the cover was the one the finger left.
         let willCommit = commit && !aborted
-        if metalArmed, let curlView {
+        // Teardown releases the textures, which resumes this wait immediately.
+        // Skip the spring: Reduce Motion and a reload must not keep animating.
+        if !aborted, metalArmed, let curlView {
             // A cancel does not carry a forward flick: that velocity already lost
             // the commit test, and keeping it would drag the page the wrong way.
             await curlView.finishInteractive(
                 target: willCommit ? 1 : 0,
                 progressVelocity: willCommit ? progressVelocity : min(0, progressVelocity)
             )
-        } else if willCommit, let curlView {
+        } else if !aborted, willCommit, let curlView {
             await fadeOut(curlView)
         }
-        if willCommit {
+        // `aborted` may flip during the spring. A stale finish must not commit
+        // onto a navigator that reloaded while the leaf was moving. The delegate
+        // also drops the call when the spread it prepared is gone.
+        let landed = willCommit && !aborted
+        if landed {
             await delegate?.curlPanCommit(direction: direction, withinResource: withinResource)
         } else if revealed {
             await delegate?.curlPanCancel(direction: direction, withinResource: withinResource)
@@ -420,7 +461,6 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
     }
 
     private func fingerState(of pan: UIPanGestureRecognizer, in view: UIView) -> (progress: CGFloat, touchY: CGFloat) {
-        let rtl = delegate?.curlPanContext(in: view).rtl ?? false
         let translation = pan.translation(in: view)
         let location = pan.location(in: view)
         return (

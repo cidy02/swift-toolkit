@@ -219,8 +219,8 @@ enum PageCurlGeometry {
         return min(divisionRange.upperBound, max(divisionRange.lowerBound, x))
     }
 
-    /// The active vertical fold, or nil. Height >= width matches the pane
-    /// split Kudos already uses. A wider-than-tall region is tabletop.
+    /// The active vertical fold, or nil. Height >= width is a vertical split.
+    /// A wider-than-tall region is tabletop.
     /// A zero-width crease still counts: its midX is the hinge.
     static func activeVerticalDivision(
         regions: [PageCurlDivisionSample],
@@ -395,40 +395,6 @@ enum PageCurlGeometry {
                 innerWidth: CGFloat(inner)
             )
         }
-        if let values = result as? [NSNumber], values.count >= 4 {
-            return usedColumnCount(
-                cssColumnCount: values[0].intValue,
-                columnWidth: CGFloat(values[1].doubleValue),
-                columnGap: CGFloat(values[2].doubleValue),
-                innerWidth: CGFloat(values[3].doubleValue)
-            )
-        }
-        if let values = result as? [Any], values.count >= 4 {
-            func number(_ value: Any) -> Double? {
-                switch value {
-                case let number as NSNumber:
-                    return number.doubleValue
-                case let text as String:
-                    return Double(text)
-                default:
-                    return nil
-                }
-            }
-            guard
-                let css = number(values[0]),
-                let width = number(values[1]),
-                let gap = number(values[2]),
-                let inner = number(values[3])
-            else {
-                return 1
-            }
-            return usedColumnCount(
-                cssColumnCount: Int(css),
-                columnWidth: CGFloat(width),
-                columnGap: CGFloat(gap),
-                innerWidth: CGFloat(inner)
-            )
-        }
         if let number = result as? NSNumber {
             return max(1, number.intValue)
         }
@@ -460,6 +426,138 @@ enum PageCurlGeometry {
 
     static func incomingReveal(snapshotSucceeded: Bool) -> IncomingReveal {
         snapshotSucceeded ? .cylinder : .crossfade
+    }
+
+    /// Points to scroll so `offset` lands on `target`. Zero when the column is
+    /// already there. A second relative page step skips a column when the
+    /// offset is only a few points off the target.
+    static func curlColumnCorrection(offset: CGFloat, target: CGFloat, slop: CGFloat = 2) -> CGFloat {
+        guard offset.isFinite, target.isFinite else {
+            return 0
+        }
+        let drift = target - offset
+        let band = slop.isFinite ? max(0, slop) : 2
+        if abs(drift) <= band {
+            return 0
+        }
+        return drift
+    }
+
+    /// Tilt the shader should use. A reversed one-page uncurl runs progress
+    /// backwards, so the same tilt sign would lift the opposite corner.
+    static func displayedTilt(touchY: CGFloat, reversed: Bool) -> CGFloat {
+        let raw = tiltRadians(touchY: touchY)
+        return reversed ? -raw : raw
+    }
+
+    /// Verso position in `along` units. Two pages scale the leaf onto the far
+    /// half so an off-centre spine does not sample past that half.
+    static func versoAlong(orig: CGFloat, span: CGFloat, twoPage: Bool) -> CGFloat {
+        let leaf = max(span.isFinite ? span : 0.05, 0.05)
+        guard twoPage else {
+            return -orig
+        }
+        let far = max(1 - leaf, 0)
+        return -orig * (far / leaf)
+    }
+
+    /// Which bitmap a pixel samples. The shader's roll branch matches this.
+    /// `x` is unclamped: a value outside 0...1 is a hole, not a clamped edge.
+    struct SpreadSample: Equatable {
+        enum Sheet: Equatable {
+            case outgoing
+            case incoming
+        }
+
+        enum Region: Equatable {
+            case flatOutgoing
+            case flatIncoming
+            case rollFront
+            case rollBack
+            case offLeaf
+        }
+
+        var sheet: Sheet
+        var x: CGFloat
+        var region: Region
+    }
+
+    static func spreadSample(
+        uvX: CGFloat,
+        uvY: CGFloat,
+        progress: CGFloat,
+        spineX: CGFloat,
+        peelSign: CGFloat,
+        span: CGFloat,
+        twoPage: Bool,
+        realVerso: Bool,
+        tilt: CGFloat,
+        aspect: CGFloat
+    ) -> SpreadSample {
+        let u = min(1, max(0, uvX.isFinite ? uvX : 0))
+        let v = min(1, max(0, uvY.isFinite ? uvY : 0.5))
+        let shown = clampProgress(progress)
+        func sample(
+            _ sheet: SpreadSample.Sheet,
+            _ x: CGFloat,
+            _ region: SpreadSample.Region
+        ) -> SpreadSample {
+            SpreadSample(sheet: sheet, x: x, region: region)
+        }
+        if shown <= 0.001 {
+            return sample(.outgoing, u, .flatOutgoing)
+        }
+        if shown >= 0.999 {
+            return sample(.incoming, u, .flatIncoming)
+        }
+        let leafSpan = max(span.isFinite ? span : 0.05, 0.05)
+        let radius = cylinderRadius(progress: shown, span: leafSpan)
+        if radius < 0.0001 {
+            return shown > 0.5
+                ? sample(.incoming, u, .flatIncoming)
+                : sample(.outgoing, u, .flatOutgoing)
+        }
+        let sign: CGFloat = peelSign >= 0 ? 1 : -1
+        let along = (u - spineX) * sign
+        let centre = foldCenter(
+            progress: shown,
+            span: leafSpan,
+            overhang: tiltOverhang(tilt: tilt, aspect: aspect),
+            curlWidth: radius * 2,
+            far: farSpan(twoPage: twoPage, span: leafSpan)
+        )
+        let line = foldLine(fold: centre, tilt: tilt, normalizedY: v, aspect: aspect)
+        let dist = along - line
+        if dist <= 0 {
+            return sample(.outgoing, u, .flatOutgoing)
+        }
+        let curlWidth = 2 * radius
+        if dist >= curlWidth {
+            return sample(.incoming, u, .flatIncoming)
+        }
+        let t = dist / curlWidth
+        let orig = line + t * .pi * radius
+        if orig > leafSpan {
+            return sample(.incoming, u, .offLeaf)
+        }
+        func leafX(_ leaf: CGFloat) -> CGFloat {
+            spineX + sign * leaf
+        }
+        // The leaf has crossed the spine. Lay the verso down on the far half.
+        // The static half stays flat behind it, and the near incoming half is
+        // not wrapped onto the back of the roll.
+        if twoPage, orig < 0 {
+            let region: SpreadSample.Region = t < 0.5 ? .rollFront : .rollBack
+            return sample(.incoming, leafX(orig), region)
+        }
+        if t < 0.5 {
+            return sample(.outgoing, leafX(orig), .rollFront)
+        }
+        let backLeaf = realVerso
+            ? versoAlong(orig: orig, span: leafSpan, twoPage: twoPage)
+            : (leafSpan - orig)
+        let sheet: SpreadSample.Sheet = realVerso ? .incoming : .outgoing
+        return sample(sheet, leafX(backLeaf), .rollBack)
     }
 
     /// What actually plays. The policy is the gate: Reduce Motion, VoiceOver,

@@ -198,6 +198,9 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
     }
 
     override func go(to direction: EPUBSpreadView.Direction, options: NavigatorGoOptions) async -> Bool {
+        // A cancelled curl ignores progression for a short window. A real turn
+        // in that window is not the peek, so the window ends here.
+        ignoreProgressionUntil = 0
         guard !viewModel.scroll else {
             return await super.go(to: direction, options: options)
         }
@@ -282,7 +285,7 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         )
         let divisionText = divisionX.map { String(format: "%.3f", $0) } ?? "nil"
         log(.info, "curl-spine columns=\(columns) division=\(divisionText) spine=\(spine) forward=\(forward)")
-        NSLog("%@", "T561e curl-spine columns=\(columns) division=\(divisionText) spine=\(spine) forward=\(forward)" as NSString)
+        PageCurlDebug.log("T561e curl-spine columns=\(columns) division=\(divisionText) spine=\(spine) forward=\(forward)")
         let curlView = PageCurlView(frame: bounds)
         curlView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         curlView.showCover(outgoing, background: background)
@@ -355,19 +358,31 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         }
         // `takeSnapshot(afterScreenUpdates:)` drains the run loop. A flick's
         // touch-end lands in that drain and WebKit puts the column back, so
-        // the bitmap is the page already showing. `scrollBy` again — not
-        // `setContentOffset`, which snaps this web view back (toolkit #737).
-        if let target = curlTargetOffset, abs(scrollView.contentOffset.x - target) > 2 {
-            await scrollByAwaitingPaint(delta)
-            if abs(scrollView.contentOffset.x - target) <= 2,
-               let again = await PageCurlSnapshotter.capture(
-                   of: self,
-                   backgroundColor: background,
-                   afterScreenUpdates: false
-               )
-            {
-                image = again
+        // the bitmap is the page already showing. Scroll the remaining distance
+        // to the absolute column — not another `delta`, which skips a page when
+        // the offset is only a few points off. `setContentOffset` snaps this
+        // web view back (toolkit #737).
+        var corrected = false
+        if let target = curlTargetOffset {
+            let correction = PageCurlGeometry.curlColumnCorrection(
+                offset: scrollView.contentOffset.x,
+                target: target
+            )
+            if correction != 0 {
+                await scrollByAwaitingPaint(correction)
+                corrected = true
             }
+        }
+        if corrected,
+           let target = curlTargetOffset,
+           abs(scrollView.contentOffset.x - target) <= 2,
+           let again = await PageCurlSnapshotter.capture(
+               of: self,
+               backgroundColor: background,
+               afterScreenUpdates: false
+           )
+        {
+            image = again
         }
         return image
     }
@@ -378,8 +393,14 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         let target = curlTargetOffset
         curlDelta = 0
         curlTargetOffset = nil
-        if delta != 0, let target, abs(scrollView.contentOffset.x - (target - delta)) > 2 {
-            await scrollByAwaitingPaint(-delta)
+        if delta != 0, let target {
+            let correction = PageCurlGeometry.curlColumnCorrection(
+                offset: scrollView.contentOffset.x,
+                target: target - delta
+            )
+            if correction != 0 {
+                await scrollByAwaitingPaint(correction)
+            }
         }
         discardSuppressedProgression()
     }
@@ -388,8 +409,14 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
     /// undo the scroll that was made for the snapshot; do that scroll again
     /// now that the finger is up. Emit the location once.
     func commitCurlIncoming() async {
-        if let target = curlTargetOffset, abs(scrollView.contentOffset.x - target) > 2, curlDelta != 0 {
-            await scrollByAwaitingPaint(curlDelta)
+        if let target = curlTargetOffset {
+            let correction = PageCurlGeometry.curlColumnCorrection(
+                offset: scrollView.contentOffset.x,
+                target: target
+            )
+            if correction != 0 {
+                await scrollByAwaitingPaint(correction)
+            }
         }
         curlTargetOffset = nil
         curlDelta = 0
@@ -546,6 +573,7 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
     private var pendingLocation: PendingLocation = .init(location: .start, animated: false)
 
     override func go(to location: PageLocation, animated: Bool) async {
+        ignoreProgressionUntil = 0
         guard isSpreadLoaded else {
             // Delays moving to the location until the document is loaded.
             pendingLocation = PendingLocation(location: location, animated: animated)
@@ -814,9 +842,8 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         }
     }
 
-    /// Tells the host page (Kudos's page digit) that a hidden scroll is not a
-    /// user drag. The flag is a dataset attribute so it does not need a new
-    /// script bundle.
+    /// Tells the host page's indicator that a hidden scroll is not a user drag.
+    /// The flag is a dataset attribute so it does not need a new script bundle.
     private func setTransitioningDataset(_ on: Bool) {
         let script = on
             ? "document.documentElement.dataset.readiumTransitioning = '1';"

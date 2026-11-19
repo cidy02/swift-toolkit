@@ -149,6 +149,18 @@ enum PageCurlShader {
             return float4(inC, 1.0);
         }
 
+        // Far half of a two-page spread: the leaf has crossed the spine and is
+        // laying its verso down over the static half. Keep this in lockstep
+        // with PageCurlGeometry.spreadSample. Do not sample the static outgoing
+        // half, or the near incoming half (`-orig` unscaled) on the back.
+        if (u.twoPage > 0.5 && orig < 0.0) {
+            float3 laid = sampleTex(incoming, leafUV(orig, uv.y, u));
+            float shade = (t < 0.5)
+                ? mix(1.0, 0.90, smoothstep(0.0, 0.5, t))
+                : mix(0.90, 0.98, smoothstep(0.0, 1.0, clamp((t - 0.5) / 0.5, 0.0, 1.0)));
+            return float4(clamp(laid * shade + specColor, 0.0, 1.0), 1.0);
+        }
+
         // Front of the roll. Shade starts at 1 so it meets the flat page.
         if (t < 0.5) {
             float frontX = u.spineX + u.peelSign * orig;
@@ -161,8 +173,17 @@ enum PageCurlShader {
         }
 
         // Back of the roll. Opaque: it covers the next page, it is not mixed with it.
-        // One page is a paper ghost. Two pages are the real verso.
-        float backLeaf = (u.realVerso > 0.5) ? -orig : (span - orig);
+        // One page is a paper ghost. Two pages are the real verso, scaled onto
+        // the far half so an off-centre spine does not sample past it.
+        float backLeaf;
+        if (u.realVerso > 0.5) {
+            float far = max(1.0 - span, 0.0);
+            float scale = (u.twoPage > 0.5) ? (far / span) : 1.0;
+            float versoAlong = -orig * scale;
+            backLeaf = versoAlong;
+        } else {
+            backLeaf = span - orig;
+        }
         float backX = u.spineX + u.peelSign * backLeaf;
         if (backX < 0.0 || backX > 1.0) {
             return float4(inC, 1.0);
@@ -170,7 +191,7 @@ enum PageCurlShader {
         float3 back;
         float specScale;
         if (u.realVerso > 0.5) {
-            back = sampleTex(incoming, leafUV(-orig, uv.y, u));
+            back = sampleTex(incoming, leafUV(backLeaf, uv.y, u));
             specScale = 1.0;
         } else {
             back = paperBack(sampleTex(outgoing, leafUV(backLeaf, uv.y, u)), u);

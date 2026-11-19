@@ -64,7 +64,9 @@ final class PageCurlView: UIView {
     override init(frame: CGRect) {
         super.init(frame: frame)
         isOpaque = true
-        isUserInteractionEnabled = false
+        // The cover sits above the scrolled web view. Eating touches stops a
+        // second finger, and a tap during the spring, from hitting the hidden page.
+        isUserInteractionEnabled = true
         isAccessibilityElement = false
         accessibilityElementsHidden = true
         backgroundColor = .black
@@ -373,7 +375,7 @@ final class PageCurlView: UIView {
             if case .center = spine { return true }
             return false
         }()
-        let tilt = PageCurlGeometry.tiltRadians(touchY: touchY)
+        let tilt = PageCurlGeometry.displayedTilt(touchY: touchY, reversed: reversed)
         let overhang = PageCurlGeometry.tiltOverhang(tilt: tilt, aspect: CGFloat(aspect))
         let fold = PageCurlGeometry.foldCenter(
             progress: shown,
