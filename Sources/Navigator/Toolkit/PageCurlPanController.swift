@@ -259,6 +259,15 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
             cancelled: cancelled || aborted
         )
         let commit = decision == .commit
+        NSLog(
+            "T561d end cancelled=%d live=%.3f used=%.3f tracked=%.3f vel=%.0f commit=%d",
+            cancelled ? 1 : 0,
+            live,
+            progress,
+            trackedProgress,
+            velocity,
+            commit ? 1 : 0
+        )
         switch phase {
         case .preparing:
             pendingRelease = (commit, velocity)
@@ -303,6 +312,13 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
         // Re-reading the flag after the spring turned a finished curl into a
         // cancel, and the page under the cover was the one the finger left.
         let willCommit = commit && !aborted
+        NSLog(
+            "T561d finish commit=%d aborted=%d will=%d within=%d",
+            commit ? 1 : 0,
+            aborted ? 1 : 0,
+            willCommit ? 1 : 0,
+            withinResource ? 1 : 0
+        )
         if metalArmed, let curlView {
             // A cancel does not carry a forward flick: that velocity already lost
             // the commit test, and keeping it would drag the page the wrong way.
