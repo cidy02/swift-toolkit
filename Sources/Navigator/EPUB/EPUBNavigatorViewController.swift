@@ -1330,6 +1330,9 @@ extension EPUBNavigatorViewController: EPUBSpreadViewDelegate {
     }
 
     func spreadView(_ spreadView: EPUBSpreadView, didReceive event: PointerEvent) {
+        if PageCurlDebug.enabled, event.phase != .move || state != .idle {
+            PageCurlDebug.log("pointer \(event.phase) id=\(event.pointer.id) state=\(state) \(state == .idle ? "delivered" : "dropped")")
+        }
         guard state == .idle else {
             return
         }
