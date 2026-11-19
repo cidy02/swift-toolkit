@@ -607,7 +607,10 @@ final class PaginationView: UIView, Loggable {
             rtl: rtl,
             divisionNormalizedX: divisionNormalizedX
         )
-        log(.info, "curl-spine columns=\(columns) division=\(divisionNormalizedX.map { String(format: "%.3f", $0) } ?? "nil") spine=\(spine) forward=\(forward)")
+        let divisionText = divisionNormalizedX.map { String(format: "%.3f", $0) } ?? "nil"
+        log(.info, "curl-spine columns=\(columns) division=\(divisionText) spine=\(spine) forward=\(forward)")
+        // Readium's logger is a no-op until the host enables it. The pose check reads this line.
+        NSLog("%@", "T561e curl-spine columns=\(columns) division=\(divisionText) spine=\(spine) forward=\(forward)" as NSString)
         let curl = PageCurlView(frame: bounds)
         curl.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         curl.showCover(outgoing, background: background)

@@ -1501,6 +1501,7 @@ extension EPUBNavigatorViewController: PaginationViewDelegate {
         )
         let x = sample.normalizedX.map { String(format: "%.3f", $0) } ?? "nil"
         log(.info, "fold-posture x=\(x) width=\(String(format: "%.1f", sample.width)) gap=\(String(format: "%.1f", gap)) bounds=\(paginationView.bounds.size)")
+        NSLog("%@", "T561e fold-posture x=\(x) width=\(String(format: "%.1f", sample.width)) gap=\(String(format: "%.1f", gap)) bounds=\(String(format: "%.0fx%.0f", paginationView.bounds.width, paginationView.bounds.height))" as NSString)
         Task { @MainActor in
             await self.applyFoldColumnGap(gap)
         }
@@ -1598,7 +1599,9 @@ extension EPUBNavigatorViewController: PageCurlPanDelegate {
             rtl: rtl,
             divisionNormalizedX: divisionX
         )
-        log(.info, "curl-spine columns=\(columns) division=\(divisionX.map { String(format: "%.3f", $0) } ?? "nil") spine=\(spine) forward=\(forward)")
+        let divisionText = divisionX.map { String(format: "%.3f", $0) } ?? "nil"
+        log(.info, "curl-spine columns=\(columns) division=\(divisionText) spine=\(spine) forward=\(forward)")
+        NSLog("%@", "T561e curl-spine columns=\(columns) division=\(divisionText) spine=\(spine) forward=\(forward)" as NSString)
         let peel = PageCurlGeometry.peelSign(spine: spine, rtl: rtl, forward: forward)
         let spreadDirection = spreadDirection(for: direction)
 

@@ -280,7 +280,9 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
             rtl: rtl,
             divisionNormalizedX: divisionX
         )
-        log(.info, "curl-spine columns=\(columns) division=\(divisionX.map { String(format: "%.3f", $0) } ?? "nil") spine=\(spine) forward=\(forward)")
+        let divisionText = divisionX.map { String(format: "%.3f", $0) } ?? "nil"
+        log(.info, "curl-spine columns=\(columns) division=\(divisionText) spine=\(spine) forward=\(forward)")
+        NSLog("%@", "T561e curl-spine columns=\(columns) division=\(divisionText) spine=\(spine) forward=\(forward)" as NSString)
         let curlView = PageCurlView(frame: bounds)
         curlView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         curlView.showCover(outgoing, background: background)
