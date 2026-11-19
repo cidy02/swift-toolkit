@@ -25,10 +25,8 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
     private var progressionChangedWhileSuppressed = false
     /// Column step applied for a finger curl. Cancel scrolls it back.
     private var curlDelta: CGFloat = 0
-    /// JS `scrollX` the commit must land on. A flick can scroll under the
-    /// cover and have WebKit put the column back when the touch ends.
-    private var curlTargetX: CGFloat?
-    /// Same column in `contentOffset.x`, which stays non-negative in RTL.
+    /// `contentOffset.x` the commit must land on. A flick's touch-end can
+    /// undo the `scrollBy` that was made for the snapshot.
     private var curlTargetOffset: CGFloat?
     /// A cancel restores the previous column, then a late scroll message can
     /// still arrive. Drop progression events until this time so the peek does
@@ -295,21 +293,18 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         curlDelta = delta
         let startOffset = scrollView.contentOffset.x
         curlTargetOffset = startOffset + delta
-        // Nil when the column position cannot be read. The curl still runs;
-        // a bad read must not veto a turn that `scrollBy` already made.
-        curlTargetX = await columnScrollX().map { $0 + delta }
         setSuppressingProgressionUpdates(true)
         await scrollByAwaitingPaint(delta)
-        await pinCurlColumn()
         guard var image = await PageCurlSnapshotter.capture(of: self, backgroundColor: background) else {
             await revertCurlIncoming()
             return nil
         }
         // `takeSnapshot(afterScreenUpdates:)` drains the run loop. A flick's
         // touch-end lands in that drain and WebKit puts the column back, so
-        // the bitmap is the page already showing. Pin again and re-shoot.
+        // the bitmap is the page already showing. `scrollBy` again — not
+        // `setContentOffset`, which snaps this web view back (toolkit #737).
         if let target = curlTargetOffset, abs(scrollView.contentOffset.x - target) > 2 {
-            await pinCurlColumn()
+            await scrollByAwaitingPaint(delta)
             if abs(scrollView.contentOffset.x - target) <= 2,
                let again = await PageCurlSnapshotter.capture(
                    of: self,
@@ -326,51 +321,25 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
     /// Puts the column back and drops the peeked progression. No location event.
     func revertCurlIncoming() async {
         let delta = curlDelta
-        let js = curlTargetX
-        let offset = curlTargetOffset
+        let target = curlTargetOffset
         curlDelta = 0
-        curlTargetX = nil
         curlTargetOffset = nil
-        if let js {
-            await scrollToAwaitingPaint(js - delta)
-        } else if delta != 0, offset == nil {
+        if delta != 0, let target, abs(scrollView.contentOffset.x - (target - delta)) > 2 {
             await scrollByAwaitingPaint(-delta)
-        }
-        if let offset {
-            pinOffset(offset - delta)
         }
         discardSuppressedProgression()
     }
 
-    /// The column is the one the finger committed to. Put it there again in
-    /// case the touch-end restored the old scroll, then emit that once.
+    /// The column is the one the finger committed to. A flick's touch-end can
+    /// undo the scroll that was made for the snapshot; do that scroll again
+    /// now that the finger is up. Emit the location once.
     func commitCurlIncoming() async {
-        await pinCurlColumn()
-        curlTargetX = nil
+        if let target = curlTargetOffset, abs(scrollView.contentOffset.x - target) > 2, curlDelta != 0 {
+            await scrollByAwaitingPaint(curlDelta)
+        }
         curlTargetOffset = nil
         curlDelta = 0
         setSuppressingProgressionUpdates(false)
-    }
-
-    /// JS first, then the scroll view. Setting the offset before the script
-    /// and scrolling again would skip a page when the two stay in step.
-    private func pinCurlColumn() async {
-        if let js = curlTargetX {
-            let now = await columnScrollX()
-            if now == nil || abs((now ?? 0) - js) > 2 {
-                await scrollToAwaitingPaint(js)
-            }
-        }
-        if let target = curlTargetOffset {
-            pinOffset(target)
-        }
-    }
-
-    private func pinOffset(_ x: CGFloat) {
-        guard abs(scrollView.contentOffset.x - x) > 2 else { return }
-        var offset = scrollView.contentOffset
-        offset.x = x
-        scrollView.setContentOffset(offset, animated: false)
     }
 
     private func pageDelta(for direction: Direction) -> CGFloat? {
@@ -452,29 +421,6 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         case failed
         /// The paint wait gave up. The script may still scroll; do not scroll again.
         case timedOut
-    }
-
-    /// `window.scrollX`. RTL is negative; `pageDelta` is in that same space.
-    /// Nil when the page did not answer, so the caller can leave the column alone.
-    private func columnScrollX() async -> CGFloat? {
-        let result = await evaluateScript(
-            "(function(){ var s = document.scrollingElement || document.documentElement; var x = window.scrollX; if (typeof x !== 'number' || !isFinite(x)) return null; if (x === 0 && s && typeof s.scrollLeft === 'number' && isFinite(s.scrollLeft)) x = s.scrollLeft; return x; })()"
-        )
-        guard case let .success(value) = result else {
-            return nil
-        }
-        if let number = value as? NSNumber {
-            let x = CGFloat(number.doubleValue)
-            return x.isFinite ? x : nil
-        }
-        if let text = value as? String, let parsed = Double(text), parsed.isFinite {
-            return CGFloat(parsed)
-        }
-        return nil
-    }
-
-    private func scrollToAwaitingPaint(_ x: CGFloat) async {
-        await scrollAwaitingPaint("window.scrollTo({ left: x, behavior: 'instant' });", x: x)
     }
 
     private func scrollByAwaitingPaint(_ offsetX: CGFloat) async {
