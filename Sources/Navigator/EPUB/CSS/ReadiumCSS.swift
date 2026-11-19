@@ -12,6 +12,9 @@ struct ReadiumCSS {
     var layout: CSSLayout = .init()
     var rsProperties: CSSRSProperties = .init()
     var userProperties: CSSUserProperties = .init()
+    /// Set when this struct forced `--RS__colCount: 2`. Cleared with the
+    /// override, so a host-supplied count is left alone.
+    var explicitTwoColumns = false
 
     /// Base URL of the Readium CSS assets.
     var baseURL: any AbsoluteURL
@@ -71,6 +74,29 @@ extension ReadiumCSS {
                     ?? "",
             ]
         )
+        applyExplicitColumnCount(settings.columnCount)
+    }
+
+    /// `--USER__colCount: 2` is applied by the stylesheet only inside
+    /// `@media (min-width: 60em)` (960px at the 16px root) or a narrow
+    /// landscape `device-width` band. A pane such as 669×951 matches neither,
+    /// so an explicit two-column preference stays one column. Setting the RS
+    /// count and an `auto` width floor applies outside that gate. `auto` and
+    /// `one` do not, so the stylesheet's own breakpoint still decides those.
+    mutating func applyExplicitColumnCount(_ count: ColumnCount) {
+        switch count {
+        case .two:
+            rsProperties.colCount = .two
+            rsProperties.overrides["--RS__colWidth"] = "auto"
+            explicitTwoColumns = true
+        default:
+            guard explicitTwoColumns else {
+                return
+            }
+            rsProperties.colCount = nil
+            rsProperties.overrides.removeValue(forKey: "--RS__colWidth")
+            explicitTwoColumns = false
+        }
     }
 
     func resolveFontStack(of fontFamily: FontFamily) -> [String] {

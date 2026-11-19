@@ -631,6 +631,13 @@ class EPUBSpreadView: UIView, Loggable, PageView {
         }
     }
 
+    /// A tap curl in flight. Reflowable spreads remove the cover. Fixed layout
+    /// has none here; the pagination view owns the cross-resource curl.
+    func cancelActiveCurl() {}
+
+    /// See `EPUBReflowableSpreadView`. The fixed-layout spread has no curl cover.
+    func releaseCurlCancelSuppression() {}
+
     func go(to direction: Direction, options: NavigatorGoOptions) async -> Bool {
         // The default implementation of a spread view considers that its content is entirely visible on screen.
         false

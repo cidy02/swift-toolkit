@@ -231,6 +231,19 @@ class PageCurlGeometryTests: XCTestCase {
             ),
             8
         )
+        // A fold that runs to the window edge used to ask for a clearance as
+        // wide as the viewport. Cap it so cloned column padding still leaves text.
+        let narrow = CGRect(x: 0, y: 0, width: 450, height: 600)
+        let edgeFold = CGRect(x: 360, y: 0, width: 80, height: 600)
+        XCTAssertEqual(
+            PageCurlGeometry.columnGapClearingFold(defaultGap: 0, foldFrame: edgeFold, viewport: narrow),
+            450 * PageCurlGeometry.maxFoldClearanceFraction
+        )
+        XCTAssertEqual(PageCurlGeometry.foldInsetLength(clearance: 114), "57.00000px")
+        XCTAssertNil(PageCurlGeometry.foldInsetLength(clearance: 0))
+        XCTAssertTrue(PageCurlGeometry.foldInsetRules.contains("box-decoration-break: clone"))
+        XCTAssertTrue(PageCurlGeometry.foldInsetRules.contains("column-gap: 0px"))
+        XCTAssertTrue(PageCurlGeometry.foldInsetRules.contains("var(--RS__foldInset)"))
     }
 
     func testActiveVerticalDivisionDropsTabletopInactiveAndTheLoser() {
@@ -259,6 +272,10 @@ class PageCurlGeometryTests: XCTestCase {
             ),
             wide
         )
+        let onTheEdge = PageCurlDivisionSample(
+            frame: CGRect(x: 860, y: 0, width: 80, height: 600), isActive: true
+        )
+        XCTAssertNil(PageCurlGeometry.activeVerticalDivision(regions: [onTheEdge], viewport: viewport))
         XCTAssertNil(PageCurlGeometry.normalizedDivisionX(
             of: CGRect(x: 10, y: 0, width: 10, height: 10),
             in: CGRect(x: 0, y: 0, width: 1, height: 600)

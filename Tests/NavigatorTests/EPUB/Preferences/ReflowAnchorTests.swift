@@ -34,7 +34,7 @@ class ReflowAnchorTests: XCTestCase {
         XCTAssertFalse(machine.layoutDidQuiet(token: token))
     }
 
-    /// T-450. The curl's own `.moved` must not cancel the restore that a
+    /// The curl's own `.moved` must not cancel the restore that a
     /// posture change is waiting to run. A move or a jump does.
     func testOnlyAMoveOrAJumpCancelsThePendingRestore() {
         XCTAssertTrue(ReflowAnchorNavigation.jump.cancelsPendingRestore)
@@ -44,5 +44,18 @@ class ReflowAnchorTests: XCTestCase {
         XCTAssertFalse(ReflowAnchorNavigation.loaded.cancelsPendingRestore)
         XCTAssertFalse(ReflowAnchorNavigation.jumped.cancelsPendingRestore)
         XCTAssertFalse(ReflowAnchorNavigation.moved.cancelsPendingRestore)
+    }
+
+    func testSettledAnchorIsDroppedWhenItBelongsToAnotherSpread() {
+        XCTAssertEqual(
+            ReflowSettledAnchor.choose(settled: "chap1", fallback: "chap2") { $0 == "chap2" },
+            "chap2"
+        )
+        XCTAssertEqual(
+            ReflowSettledAnchor.choose(settled: "chap2", fallback: "chap1") { $0 == "chap2" },
+            "chap2"
+        )
+        XCTAssertNil(ReflowSettledAnchor.choose(settled: "chap1", fallback: "chap3") { $0 == "chap2" })
+        XCTAssertNil(ReflowSettledAnchor.choose(settled: nil, fallback: nil) { _ in true })
     }
 }

@@ -46,6 +46,7 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
             spread: spread,
             scripts: [
                 WKUserScript(source: Self.reflowableScript, injectionTime: .atDocumentStart, forMainFrameOnly: false),
+                WKUserScript(source: Self.foldInsetScript, injectionTime: .atDocumentEnd, forMainFrameOnly: false),
             ],
             animatedLoad: animatedLoad
         )
@@ -54,6 +55,48 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
     /// The curl overlay, if a turn is in flight. Cleared with the spread so a
     /// reload or a close cannot leave the display link running.
     private weak var activeCurlView: PageCurlView?
+    /// A posture cancel removed the cover. The turn's defer must not clear
+    /// progression suppression a reflow hold just took.
+    private var curlCancelKeepsSuppression = false
+
+    /// After the Readium stylesheets. Their body padding is `!important`, so an
+    /// earlier style element loses. Newlines are spaces: the CSS sits inside one
+    /// JavaScript string.
+    private static let foldInsetScript: String = {
+        let css = PageCurlGeometry.foldInsetRules
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "'", with: "\\'")
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\r", with: " ")
+        return """
+        (function() {
+          if (document.getElementById('readium-fold-inset')) { return; }
+          var node = document.createElement('style');
+          node.id = 'readium-fold-inset';
+          node.textContent = '\(css)';
+          (document.head || document.documentElement).appendChild(node);
+        })();
+        """
+    }()
+
+    override func cancelActiveCurl() {
+        guard activeCurlView != nil else {
+            return
+        }
+        curlCancelKeepsSuppression = true
+        activeCurlView?.releaseResources()
+        activeCurlView?.removeFromSuperview()
+        activeCurlView = nil
+    }
+
+    /// The cancel kept progression suppression so a reflow hold could take it.
+    /// A caller that does not hold has to drop it, or the page position sticks.
+    override func releaseCurlCancelSuppression() {
+        curlCancelKeepsSuppression = false
+        if isSuppressingProgressionUpdates {
+            setSuppressingProgressionUpdates(false)
+        }
+    }
 
     override func clear() {
         activeCurlView?.releaseResources()
@@ -285,7 +328,7 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         )
         let divisionText = divisionX.map { String(format: "%.3f", $0) } ?? "nil"
         log(.info, "curl-spine columns=\(columns) division=\(divisionText) spine=\(spine) forward=\(forward)")
-        PageCurlDebug.log("T561e curl-spine columns=\(columns) division=\(divisionText) spine=\(spine) forward=\(forward)")
+        PageCurlDebug.log("curl-spine columns=\(columns) division=\(divisionText) spine=\(spine) forward=\(forward)")
         let curlView = PageCurlView(frame: bounds)
         curlView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         curlView.showCover(outgoing, background: background)
@@ -297,7 +340,9 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
             }
             curlView.releaseResources()
             curlView.removeFromSuperview()
-            if superview != nil {
+            let keepSuppression = curlCancelKeepsSuppression
+            curlCancelKeepsSuppression = false
+            if superview != nil, !keepSuppression {
                 setSuppressingProgressionUpdates(false)
             }
         }
@@ -769,6 +814,50 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
 
         scrollDidEnd()
         delegate?.spreadViewPagesDidChange(self)
+        logStrideIfDebugging()
+    }
+
+    /// One line per settled page. `scrollX` is the paging offset (n × viewport
+    /// when the stride holds). `starts` are column origins in document space:
+    /// a column-gap between pages makes those origins drift from n × viewport.
+    private func logStrideIfDebugging() {
+        guard PageCurlDebug.enabled else {
+            return
+        }
+        let offset = scrollView.contentOffset.x
+        let viewport = scrollView.bounds.width
+        Task { @MainActor in
+            let measured = try? await self.webView.evaluateJavaScript(
+                """
+                (function() {
+                  var w = window.innerWidth || 0;
+                  var nodes = document.querySelectorAll('p, h1, h2, h3');
+                  var starts = [];
+                  for (var i = 0; i < nodes.length && starts.length < 8; i++) {
+                    var rects = nodes[i].getClientRects();
+                    for (var j = 0; j < rects.length && starts.length < 8; j++) {
+                      var x = Math.round(rects[j].left + window.scrollX);
+                      if (!starts.length || Math.abs(x - starts[starts.length - 1]) > 30) starts.push(x);
+                    }
+                  }
+                  return { scrollX: window.scrollX, inner: w, starts: starts.join(',') };
+                })()
+                """
+            )
+            let record = measured as? [String: Any]
+            func number(_ value: Any?) -> Double? {
+                (value as? NSNumber)?.doubleValue
+            }
+            let scrollX = number(record?["scrollX"]) ?? Double(offset)
+            let inner = number(record?["inner"]) ?? Double(viewport)
+            let starts = record?["starts"] as? String ?? ""
+            let width = inner > 1 ? inner : Double(viewport)
+            let n = width > 1 ? Int((scrollX / width).rounded()) : 0
+            let expected = Double(n) * width
+            PageCurlDebug.log(
+                "stride scrollX=\(String(format: "%.1f", scrollX)) viewport=\(String(format: "%.1f", width)) n=\(n) expected=\(String(format: "%.1f", expected)) delta=\(String(format: "%.1f", scrollX - expected)) starts=\(starts)"
+            )
+        }
     }
 
     // MARK: - Scripts

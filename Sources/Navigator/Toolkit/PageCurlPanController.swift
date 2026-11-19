@@ -113,7 +113,9 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
 
     /// Posture changed under the finger. Same teardown as `abort`, then wait
     /// until the cover is gone so the reflow anchor is the page the reader was on.
-    private var abortContinuation: CheckedContinuation<Void, Never>?
+    /// Every caller gets a continuation. One slot was overwritten by a second
+    /// abort, and the first waiter never resumed.
+    private var abortContinuations: [CheckedContinuation<Void, Never>] = []
 
     func abortDrag() async {
         guard phase != .idle else {
@@ -127,7 +129,7 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
             if phase == .idle {
                 cont.resume()
             } else {
-                abortContinuation = cont
+                abortContinuations.append(cont)
             }
         }
     }
@@ -151,9 +153,11 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
     }
 
     private func resumeAbortWaiter() {
-        let continuation = abortContinuation
-        abortContinuation = nil
-        continuation?.resume()
+        let continuations = abortContinuations
+        abortContinuations.removeAll()
+        for continuation in continuations {
+            continuation.resume()
+        }
     }
 
     func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
@@ -393,8 +397,6 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
                 target: willCommit ? 1 : 0,
                 progressVelocity: willCommit ? progressVelocity : min(0, progressVelocity)
             )
-        } else if !aborted, willCommit, let curlView {
-            await fadeOut(curlView)
         }
         // `aborted` may flip during the spring. A stale finish must not commit
         // onto a navigator that reloaded while the leaf was moving. The delegate
@@ -427,16 +429,6 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
         aborted = false
         pendingRelease = nil
         resumeAbortWaiter()
-    }
-
-    private func fadeOut(_ view: UIView) async {
-        await withCheckedContinuation { continuation in
-            UIView.animate(withDuration: 0.18, delay: 0, options: [.curveEaseInOut]) {
-                view.alpha = 0
-            } completion: { _ in
-                continuation.resume()
-            }
-        }
     }
 
     private func tearDown() {

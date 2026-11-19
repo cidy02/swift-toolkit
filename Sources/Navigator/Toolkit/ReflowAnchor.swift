@@ -66,7 +66,7 @@ enum ReflowAnchorNavigation: Equatable {
     case interactiveMove
     case moved
 
-    /// T-450: a real navigation cancels the pending restore. The matching
+    /// A real navigation cancels the pending restore. The matching
     /// "finished" events do not, or the curl's own `.moved` would drop the
     /// anchor the posture change just took.
     var cancelsPendingRestore: Bool {
@@ -76,5 +76,20 @@ enum ReflowAnchorNavigation: Equatable {
         case .load, .loaded, .jumped, .moved:
             return false
         }
+    }
+}
+
+/// Which saved element still belongs on the spread about to reflow.
+enum ReflowSettledAnchor {
+    /// The idle element, when it is still in this spread. Otherwise the
+    /// fallback, when that is. A href from another chapter is not used.
+    static func choose<T>(settled: T?, fallback: T?, belongs: (T) -> Bool) -> T? {
+        if let settled, belongs(settled) {
+            return settled
+        }
+        if let fallback, belongs(fallback) {
+            return fallback
+        }
+        return nil
     }
 }

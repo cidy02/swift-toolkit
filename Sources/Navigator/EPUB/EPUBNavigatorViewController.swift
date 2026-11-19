@@ -514,25 +514,24 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         super.viewWillTransition(to: size, with: coordinator)
 
         // A spring is still this turn. Resizing under it would commit the old
-        // page width onto the new spread.
-        let turning = curlPan?.turnInFlight == true
-        if turning {
+        // page width onto the new spread. The restore waits until the
+        // transition's completion, which is after the cover is down: scheduling
+        // it from the abort would fire while the bounds are still moving.
+        cancelInFlightPageCurls()
+        if curlPan?.turnInFlight == true {
             Task { @MainActor in
                 await self.curlPan?.abortDrag()
-                self.reflowPosition.scheduleRestore()
             }
         }
         holdReadingPositionForSizeChange()
+        releaseCurlSuppressionIfIdle()
 
         if isActive {
             viewModel.viewSizeWillChange(size)
         }
 
         coordinator.animate(alongsideTransition: nil) { [weak self] _ in
-            guard let self, !turning else {
-                return
-            }
-            self.reflowPosition.scheduleRestore()
+            self?.reflowPosition.scheduleRestore()
         }
     }
 
@@ -548,7 +547,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         if turning {
             reflowPosition.hold(
                 on: spread,
-                locator: reflowPosition.settledVisibleLocator ?? currentLocation
+                locator: reflowPosition.resolvedAnchor(on: spread, fallback: currentLocation)
             )
             return
         }
@@ -566,10 +565,11 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         if reflowPosition.isHolding {
             return
         }
-        if curlPan?.dragInFlight == true {
+        cancelInFlightPageCurls()
+        if curlPan?.turnInFlight == true {
             reflowPosition.hold(
                 on: view,
-                locator: reflowPosition.settledVisibleLocator ?? currentLocation
+                locator: reflowPosition.resolvedAnchor(on: view, fallback: currentLocation)
             )
             await curlPan?.abortDrag()
             return
@@ -578,7 +578,8 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         guard view === paginationView?.currentView, !reflowPosition.isHolding else {
             return
         }
-        reflowPosition.hold(on: view, locator: visible ?? currentLocation)
+        let locator = visible ?? reflowPosition.resolvedAnchor(on: view, fallback: currentLocation)
+        reflowPosition.hold(on: view, locator: locator)
     }
 
     @discardableResult
@@ -590,8 +591,18 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         }
 
         let accepted = state.transition(event)
-        if accepted, anchorNavigation(for: event).cancelsPendingRestore {
-            reflowPosition.cancelForNavigation()
+        if accepted {
+            switch anchorNavigation(for: event) {
+            case .load, .jump:
+                reflowPosition.discardSettledAnchor()
+            case .move, .interactiveMove:
+                reflowPosition.dropInFlightSettledProbe()
+            default:
+                break
+            }
+            if anchorNavigation(for: event).cancelsPendingRestore {
+                reflowPosition.cancelForNavigation()
+            }
         }
         return accepted
     }
@@ -652,10 +663,16 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             return false
         }
 
+        let generation = paginationView.turnGeneration
         if
             let spreadView = paginationView.currentView as? EPUBSpreadView,
             await spreadView.go(to: direction, options: options)
         {
+            // A reload during the await already moved the state machine on.
+            // `.moved` here would close a turn that started after that reload.
+            guard paginationView.turnGeneration == generation else {
+                return false
+            }
             on(.moved)
             return true
         }
@@ -673,6 +690,9 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             }
         }()
 
+        guard paginationView.turnGeneration == generation else {
+            return false
+        }
         on(.moved)
         return moved
     }
@@ -738,6 +758,9 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     }
 
     private func _reloadSpreads() {
+        // The held spread is about to be destroyed. Leaving the hold set
+        // blocks a later hold on the new spread, and the restore never runs.
+        reflowPosition.cancelForNavigation()
         let locator = currentLocation
 
         guard
@@ -1529,37 +1552,62 @@ extension EPUBNavigatorViewController: PaginationViewDelegate {
         )
         let x = sample.normalizedX.map { String(format: "%.3f", $0) } ?? "nil"
         log(.info, "fold-posture x=\(x) width=\(String(format: "%.1f", sample.width)) gap=\(String(format: "%.1f", gap)) bounds=\(paginationView.bounds.size)")
-        PageCurlDebug.log("T561e fold-posture x=\(x) width=\(String(format: "%.1f", sample.width)) gap=\(String(format: "%.1f", gap)) bounds=\(String(format: "%.0fx%.0f", paginationView.bounds.width, paginationView.bounds.height))")
+        PageCurlDebug.log("fold-posture x=\(x) width=\(String(format: "%.1f", sample.width)) gap=\(String(format: "%.1f", gap)) bounds=\(String(format: "%.0fx%.0f", paginationView.bounds.width, paginationView.bounds.height))")
         Task { @MainActor in
             await self.applyFoldColumnGap(gap)
         }
     }
 
-    /// Applies the crease gap, and keeps the visible element when the gap
+    /// Applies the crease clearance, and keeps the visible element when it
     /// actually changes. A spine-only move (the fold slides, the width does
     /// not) updates `divisionNormalizedX` and leaves the columns alone.
     private func applyFoldColumnGap(_ gap: CGFloat) async {
-        let dragging = curlPan?.dragInFlight == true
-        if dragging {
+        let points: CGFloat? = gap > 0.5 ? gap : nil
+        cancelInFlightPageCurls()
+        if curlPan?.turnInFlight == true {
             await curlPan?.abortDrag()
         }
-        let points: CGFloat? = gap > 0.5 ? gap : nil
         guard viewModel.foldColumnGapWouldChange(points) else {
+            releaseCurlSuppressionIfIdle()
             return
         }
         if let spread = paginationView?.currentView as? EPUBSpreadView,
            spread.isSpreadReadyForPresentation,
            !reflowPosition.isHolding
         {
-            let visible = dragging
-                ? (reflowPosition.settledVisibleLocator ?? currentLocation)
-                : (await spread.findFirstVisibleElementLocator() ?? currentLocation)
-            reflowPosition.hold(on: spread, locator: visible)
+            let visible = await spread.findFirstVisibleElementLocator()
+            guard spread === paginationView?.currentView,
+                  viewModel.foldColumnGapWouldChange(points),
+                  !reflowPosition.isHolding
+            else {
+                releaseCurlSuppressionIfIdle()
+                return
+            }
+            let locator = visible ?? reflowPosition.resolvedAnchor(on: spread, fallback: currentLocation)
+            reflowPosition.hold(on: spread, locator: locator)
         }
         guard viewModel.applyFoldColumnGap(points) else {
+            reflowPosition.scheduleRestore()
             return
         }
         reflowPosition.scheduleRestore()
+    }
+
+    /// Tap curls and the pagination's neighbour curl. A posture change used
+    /// to leave those springs running across the new column count.
+    private func cancelInFlightPageCurls() {
+        (paginationView?.currentView as? EPUBSpreadView)?.cancelActiveCurl()
+        paginationView?.cancelActiveCurl()
+    }
+
+    /// A curl cancel keeps progression suppression so the hold can own it.
+    /// With no hold, that suppression would freeze the page position.
+    private func releaseCurlSuppressionIfIdle() {
+        guard !reflowPosition.isHolding else {
+            return
+        }
+        paginationView?.releaseCurlCancelSuppression()
+        (paginationView?.currentView as? EPUBSpreadView)?.releaseCurlCancelSuppression()
     }
 }
 
@@ -1642,7 +1690,7 @@ extension EPUBNavigatorViewController: PageCurlPanDelegate {
         )
         let divisionText = divisionX.map { String(format: "%.3f", $0) } ?? "nil"
         log(.info, "curl-spine columns=\(columns) division=\(divisionText) spine=\(spine) forward=\(forward)")
-        PageCurlDebug.log("T561e curl-spine columns=\(columns) division=\(divisionText) spine=\(spine) forward=\(forward)")
+        PageCurlDebug.log("curl-spine columns=\(columns) division=\(divisionText) spine=\(spine) forward=\(forward)")
         let peel = PageCurlGeometry.peelSign(spine: spine, rtl: rtl, forward: forward)
         let spreadDirection = spreadDirection(for: direction)
 

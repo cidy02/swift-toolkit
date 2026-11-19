@@ -286,6 +286,9 @@ final class PaginationView: UIView, Loggable {
     /// compare against it so a reload cannot receive the stale turn.
     var turnGeneration: UInt { reloadGeneration }
     private weak var activeCurlView: PageCurlView?
+    /// A posture cancel removed the cover. The turn's defer must not clear
+    /// progression suppression a reflow hold just took.
+    private var curlCancelKeepsSuppression = false
 
     /// Reloads the pagination with the given total number of pages and current index.
     ///
@@ -319,10 +322,24 @@ final class PaginationView: UIView, Loggable {
         setCurrentIndex(index, location: location)
     }
 
-    private func cancelActiveCurl() {
+    func cancelActiveCurl() {
+        guard activeCurlView != nil else {
+            return
+        }
+        curlCancelKeepsSuppression = true
         activeCurlView?.releaseResources()
         activeCurlView?.removeFromSuperview()
         activeCurlView = nil
+    }
+
+    /// Drops the suppression a curl cancel kept, when no reflow hold took it.
+    func releaseCurlCancelSuppression() {
+        curlCancelKeepsSuppression = false
+        guard suppressProgressionDuringLoad else {
+            return
+        }
+        suppressProgressionDuringLoad = false
+        loadedViews[currentIndex]?.setSuppressingProgressionUpdates(false)
     }
 
     /// Updates the current and pre-loaded views.
@@ -644,7 +661,7 @@ final class PaginationView: UIView, Loggable {
         )
         let divisionText = divisionNormalizedX.map { String(format: "%.3f", $0) } ?? "nil"
         log(.info, "curl-spine columns=\(columns) division=\(divisionText) spine=\(spine) forward=\(forward)")
-        PageCurlDebug.log("T561e curl-spine columns=\(columns) division=\(divisionText) spine=\(spine) forward=\(forward)")
+        PageCurlDebug.log("curl-spine columns=\(columns) division=\(divisionText) spine=\(spine) forward=\(forward)")
         let curl = PageCurlView(frame: bounds)
         curl.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         curl.showCover(outgoing, background: background)
@@ -653,6 +670,8 @@ final class PaginationView: UIView, Loggable {
 
         var ownsFlags = false
         defer {
+            let keepSuppression = curlCancelKeepsSuppression
+            curlCancelKeepsSuppression = false
             if activeCurlView === curl {
                 activeCurlView = nil
             }
@@ -661,10 +680,12 @@ final class PaginationView: UIView, Loggable {
             // A reload already reset these for the new spread. Writing them
             // again would unpin that spread or re-enable a scroll it disabled.
             if ownsFlags, generation == reloadGeneration {
-                suppressProgressionDuringLoad = false
-                loadedViews[index]?.setSuppressingProgressionUpdates(false)
                 isAnimatingContentOffset = false
                 scrollView.isScrollEnabled = isScrollEnabled
+                if !keepSuppression {
+                    suppressProgressionDuringLoad = false
+                    loadedViews[index]?.setSuppressingProgressionUpdates(false)
+                }
             }
         }
 

@@ -7,7 +7,7 @@
 import Foundation
 import os
 
-/// Pose lines for a Duo check. Off unless the process was launched with
+/// Page-curl geometry lines. Off unless the process was launched with
 /// `-ReadiumCurlDebug YES`. The navigator and the host app share a process,
 /// so the host does not forward the flag.
 enum PageCurlDebug {
@@ -17,6 +17,22 @@ enum PageCurlDebug {
             return false
         }
         return args[index + 1] == "YES"
+    }()
+
+    /// Full centred crease clearance, in points. Ignored unless curl debug is
+    /// on. The navigator applies half of it as `--RS__foldInset` and forces two
+    /// columns, so a simulator can page through the fold clearance.
+    static let foldClearanceOverride: CGFloat? = {
+        guard enabled else {
+            return nil
+        }
+        let args = ProcessInfo.processInfo.arguments
+        guard let index = args.firstIndex(of: "-ReadiumFoldClearance"), index + 1 < args.count,
+              let value = Double(args[index + 1]), value.isFinite, value > 0
+        else {
+            return nil
+        }
+        return CGFloat(value)
     }()
 
     private static let logger = Logger(subsystem: "org.readium.navigator", category: "curl")

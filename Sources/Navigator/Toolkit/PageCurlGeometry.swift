@@ -239,7 +239,10 @@ enum PageCurlGeometry {
             guard frame.maxY > viewport.minY, frame.minY < viewport.maxY else {
                 continue
             }
-            guard frame.midX >= viewport.minX, frame.midX <= viewport.maxX else {
+            // A hinge exactly on the window edge is the other screen, not a
+            // crease through this page. Inclusive edges treated that as a fold
+            // and asked for a clearance as wide as the viewport.
+            guard frame.midX > viewport.minX, frame.midX < viewport.maxX else {
                 continue
             }
             let overlapHeight = min(frame.maxY, viewport.maxY) - max(frame.minY, viewport.minY)
@@ -261,9 +264,15 @@ enum PageCurlGeometry {
         return (frame.midX - viewport.minX) / viewport.width
     }
 
-    /// Column gap that keeps text out of the crease. CSS centres the gap, so
-    /// an off-centre fold needs a wider gap than the fold itself or the inner
-    /// edge of a column still sits under the hinge. No fold keeps `defaultGap`.
+    /// Centred clearance that keeps text out of the crease. The value is the
+    /// empty band around the middle of the page, applied as cloned column
+    /// padding (`foldInsetLength`), not as `column-gap`. A column gap is also
+    /// inserted after the last column, and the paginator strides by the
+    /// viewport width, so every later page drifts by one gap. No fold keeps
+    /// `defaultGap`. Wider than `maxFoldClearanceFraction` of the viewport is
+    /// clamped: cloned padding of that size would leave no text.
+    static let maxFoldClearanceFraction: CGFloat = 0.30
+
     static func columnGapClearingFold(
         defaultGap: CGFloat,
         foldFrame: CGRect?,
@@ -287,8 +296,27 @@ enum PageCurlGeometry {
         }
         let coverLeft = viewport.width - 2 * left
         let coverRight = 2 * right - viewport.width
-        return max(base, fold.width, coverLeft, coverRight)
+        let raw = max(base, fold.width, coverLeft, coverRight)
+        let cap = max(base, viewport.width * maxFoldClearanceFraction)
+        return min(raw, cap)
     }
+
+    /// Padding on each side of a column. Two of these meet at the centre and
+    /// clear `clearance`. `nil` when there is nothing to inset.
+    static func foldInsetLength(clearance: CGFloat) -> String? {
+        guard clearance.isFinite, clearance > 0.5 else {
+            return nil
+        }
+        return String(format: "%.5fpx", clearance / 2)
+    }
+
+    /// Installed in every reflowable resource. Inert until `--RS__foldInset`
+    /// is set on the root. The gap is forced to 0 for the same reason
+    /// `columnGapClearingFold` is not written into `--RS__colGap`.
+    static let foldInsetRules = """
+    :root[style*="--RS__foldInset"] { -webkit-column-gap: 0px !important; column-gap: 0px !important; }
+    :root[style*="--RS__foldInset"] body { -webkit-box-decoration-break: clone !important; box-decoration-break: clone !important; padding-left: max(var(--RS__pageGutter, 0px) * var(--USER__pageMargins, 1), var(--RS__foldInset)) !important; padding-right: max(var(--RS__pageGutter, 0px) * var(--USER__pageMargins, 1), var(--RS__foldInset)) !important; }
+    """
 
     /// How far a tilted fold leads the page edge, in `along` units (view widths).
     /// `aspect` is view width / height, the same value the shader stores.

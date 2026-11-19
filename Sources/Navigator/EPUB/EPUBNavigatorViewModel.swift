@@ -137,6 +137,8 @@ enum EPUBScriptScope {
         )
 
         css.update(with: settings)
+        applyDebugFoldColumns()
+        writeFoldInsetOverride()
 
         NotificationCenter.default.addObserver(
             self,
@@ -299,7 +301,10 @@ enum EPUBScriptScope {
             spreadEnabled = isLandscape
         }
 
-        if oldEnabled != spreadEnabled {
+        // `spreadEnabled` only pairs fixed-layout resources. A reflowable
+        // chapter is one spread either way, and reloading it throws away the
+        // element anchor taken for the rotation.
+        if oldEnabled != spreadEnabled, publication.metadata.layout == .fixed {
             setNeedsInvalidatePagination()
         }
     }
@@ -350,6 +355,8 @@ enum EPUBScriptScope {
     private func updateCSS(with settings: EPUBSettings, commitNow: Bool) {
         let previous = css
         css.update(with: settings)
+        applyDebugFoldColumns()
+        writeFoldInsetOverride()
 
         // HTML resources in the cache have the CSS already injected at the time
         // they were first served. Evict them so that any future resource load
@@ -363,18 +370,36 @@ enum EPUBScriptScope {
         }
     }
 
+    /// Keys this navigator adds and must remove again. Omitting a key from
+    /// `setCSSProperties` leaves the previous inline value in place.
+    private static let removableRSKeys = ["--RS__colCount", "--RS__colWidth", "--RS__foldInset"]
+
     private func commitCSSChange(from previous: ReadiumCSS, to new: ReadiumCSS) {
-        var properties: [String: String?] = [:]
+        var properties: [String: Any] = [:]
         let rsProperties = new.rsProperties.cssProperties()
-        if previous.rsProperties.cssProperties() != rsProperties {
+        let previousRS = previous.rsProperties.cssProperties()
+        if previousRS != rsProperties {
             for (k, v) in rsProperties {
-                properties[k] = v
+                if let v {
+                    properties[k] = v
+                }
+            }
+            // `putCSS` stores a nil value, so the key is still present. A
+            // missing entry does not remove an inline property; JSON null does.
+            for key in Self.removableRSKeys {
+                let had = previousRS[key].flatMap { $0 } != nil
+                let has = rsProperties[key].flatMap { $0 } != nil
+                if had, !has {
+                    properties[key] = NSNull()
+                }
             }
         }
         let userProperties = new.userProperties.cssProperties()
         if previous.userProperties.cssProperties() != userProperties {
             for (k, v) in userProperties {
-                properties[k] = v
+                if let v {
+                    properties[k] = v
+                }
             }
         }
         if !properties.isEmpty {
@@ -394,45 +419,75 @@ enum EPUBScriptScope {
         }
     }
 
-    /// `nil` clears a gap this observer applied. The stylesheet default is 0,
-    /// and omitting the variable would leave the previous inline width in place.
-    private var appliedFoldGap: String?
+    /// Full centred clearance last reported by the fold. Half of it is the
+    /// per-column padding. One column does not use it: padding both sides of
+    /// a single column does not open a gap at the hinge.
+    private var requestedFoldClearance: CGFloat = 0
 
     func foldColumnGapWouldChange(_ points: CGFloat?) -> Bool {
-        foldGapToken(points) != appliedFoldGap
+        foldInsetToken(normalizedClearance(points)) != currentFoldInset()
     }
 
-    /// Sends `--RS__colGap` when the crease changes. Returns false when the
-    /// value is the one already applied, including the never-applied flat case.
+    /// Writes `--RS__foldInset` when the crease changes. Returns false when
+    /// the value is the one already applied. `--RS__colGap` stays unset:
+    /// a column gap is inserted between every pair of columns, including the
+    /// pair that starts the next page, and paging strides by the viewport.
     @discardableResult
     func applyFoldColumnGap(_ points: CGFloat?) -> Bool {
-        guard let token = foldGapToken(points), token != appliedFoldGap else {
+        requestedFoldClearance = normalizedClearance(points)
+        return commitFoldInset()
+    }
+
+    private func commitFoldInset() -> Bool {
+        let token = foldInsetToken(requestedFoldClearance)
+        guard token != currentFoldInset() else {
             return false
         }
-        appliedFoldGap = token
-        if let points, points.isFinite, points > 0.5 {
-            css.rsProperties.colGap = CSSPxLength(Double(points))
-        } else {
-            css.rsProperties.colGap = CSSPxLength(0)
-        }
-        let payload = "{\"--RS__colGap\":\"\(token)\"}"
-        delegate?.epubNavigatorViewModel(
-            self,
-            runScript: "readium.setCSSProperties(\(payload));",
-            in: .loadedResources
-        )
+        let previous = css
+        writeFoldInsetOverride()
+        server.clearResourceCache { _, mediaType in mediaType.isHTML }
+        commitCSSChange(from: previous, to: css)
         return true
     }
 
-    /// Empty when there is nothing to send: no fold, and none was applied.
-    private func foldGapToken(_ points: CGFloat?) -> String? {
-        if let points, points.isFinite, points > 0.5 {
-            return String(format: "%.5fpx", points)
+    private func writeFoldInsetOverride() {
+        if let token = foldInsetToken(requestedFoldClearance) {
+            css.rsProperties.overrides["--RS__foldInset"] = token
+        } else {
+            css.rsProperties.overrides.removeValue(forKey: "--RS__foldInset")
         }
-        guard appliedFoldGap != nil else {
+    }
+
+    private func normalizedClearance(_ points: CGFloat?) -> CGFloat {
+        guard let points, points.isFinite, points > 0.5 else {
+            return 0
+        }
+        return points
+    }
+
+    /// Half the clearance, and only while two columns are actually requested.
+    /// `-ReadiumFoldClearance` (with curl debug) forces the two-column path so
+    /// a simulator with no hinge can still measure the stride.
+    private func foldInsetToken(_ clearance: CGFloat) -> String? {
+        let forced = PageCurlDebug.foldClearanceOverride
+        guard settings.columnCount == .two || forced != nil else {
             return nil
         }
-        return "0.00000px"
+        return PageCurlGeometry.foldInsetLength(clearance: forced ?? clearance)
+    }
+
+    /// Launch arg only. Forces the RS column count the Book pose asks for, so
+    /// the inset is measured against two columns rather than the 60em gate.
+    private func applyDebugFoldColumns() {
+        guard let points = PageCurlDebug.foldClearanceOverride else {
+            return
+        }
+        requestedFoldClearance = points
+        css.applyExplicitColumnCount(.two)
+    }
+
+    private func currentFoldInset() -> String? {
+        css.rsProperties.overrides["--RS__foldInset"].flatMap { $0 }
     }
 
     // MARK: - Accessibility

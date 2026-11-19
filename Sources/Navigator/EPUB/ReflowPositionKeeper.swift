@@ -42,8 +42,43 @@ final class ReflowPositionKeeper {
             guard generation == self.refreshGeneration, !self.machine.isHolding, let found else {
                 return
             }
+            guard self.contains(found, spread: spread) else {
+                return
+            }
             self.settledVisibleLocator = found
         }
+    }
+
+    /// A drag or a turn started. The probe already in flight must not write
+    /// the page it peeks. The locator saved before the gesture stays.
+    func dropInFlightSettledProbe() {
+        refreshGeneration &+= 1
+    }
+
+    /// The spread this locator was taken on is gone.
+    func discardSettledAnchor() {
+        refreshGeneration &+= 1
+        settledVisibleLocator = nil
+    }
+
+    /// Idle locator if it is still in `spread`, otherwise `fallback` if that is.
+    /// A foreign idle locator is dropped so the next spread cannot restore it.
+    func resolvedAnchor(on spread: EPUBSpreadView, fallback: Locator?) -> Locator? {
+        if let settled = settledVisibleLocator, !contains(settled, spread: spread) {
+            settledVisibleLocator = nil
+            refreshGeneration &+= 1
+        }
+        return ReflowSettledAnchor.choose(
+            settled: settledVisibleLocator,
+            fallback: fallback
+        ) { self.contains($0, spread: spread) }
+    }
+
+    private func contains(_ locator: Locator, spread: EPUBSpreadView) -> Bool {
+        guard let index = spread.viewModel.readingOrder.firstIndexWithHREF(locator.href) else {
+            return false
+        }
+        return spread.spread.contains(index: index)
     }
 
     /// The element to restore is known already (a probe that finished, or the
@@ -53,16 +88,18 @@ final class ReflowPositionKeeper {
         guard let spread else {
             return
         }
+        let locator = locator.flatMap { contains($0, spread: spread) ? $0 : nil }
+            ?? resolvedAnchor(on: spread, fallback: nil)
         if machine.isHolding {
             self.spread = spread
             if anchor == nil {
-                anchor = locator ?? settledVisibleLocator
+                anchor = locator
             }
             return
         }
         _ = machine.beginReflow()
         self.spread = spread
-        anchor = locator ?? settledVisibleLocator
+        anchor = locator
         spread.setSuppressingProgressionUpdates(true)
     }
 
@@ -78,19 +115,21 @@ final class ReflowPositionKeeper {
         guard let spread else {
             return
         }
+        let resolved = resolvedAnchor(on: spread, fallback: fallback)
         if machine.isHolding {
             self.spread = spread
             if anchor == nil {
-                anchor = settledVisibleLocator ?? fallback
+                anchor = resolved
             }
             return
         }
         let token = machine.beginReflow()
         self.spread = spread
-        anchor = settledVisibleLocator ?? fallback
+        anchor = resolved
         spread.setSuppressingProgressionUpdates(true)
         startProbe { [weak self] locator in
-            guard let self, self.machine.holds(token), let locator else {
+            guard let self, let spread = self.spread, self.machine.holds(token), let locator,
+                  self.contains(locator, spread: spread) else {
                 return
             }
             self.anchor = locator
