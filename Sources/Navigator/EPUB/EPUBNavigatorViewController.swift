@@ -435,6 +435,9 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
     @objc private func willResignActive() {
         isActive = false
+        // A drag in flight must revert. Leaving it resumes in the background
+        // and submits Metal work the GPU will abort.
+        curlPan?.abort()
     }
 
     @objc private func didBecomeActive() {
@@ -979,6 +982,9 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         paginationView?.transitionBackgroundColor = settings.effectiveBackgroundColor.uiColor
         curlPan?.isEnabled = curl
         applySpreadPanPolicy(interactiveCurl: curl)
+        if settings.pageTransition == .curl {
+            PageCurlView.prewarm()
+        }
     }
 
     /// Reflowable paging pans are off while the curl recognizer owns the drag.
@@ -1429,7 +1435,11 @@ extension EPUBNavigatorViewController: PageCurlPanDelegate {
             return nil
         }
         let background = viewModel.settings.effectiveBackgroundColor.uiColor
-        guard let image = await PageCurlSnapshotter.capture(of: spread, backgroundColor: background) else {
+        guard let image = await PageCurlSnapshotter.capture(
+            of: spread,
+            backgroundColor: background,
+            afterScreenUpdates: false
+        ) else {
             return nil
         }
         return (image, background)
@@ -1466,7 +1476,8 @@ extension EPUBNavigatorViewController: PageCurlPanDelegate {
                 spine: spine,
                 peelSign: peel,
                 realVerso: columns >= 2,
-                withinResource: true
+                withinResource: true,
+                reversed: PageCurlGeometry.playsReversed(renderedColumns: columns, forward: forward)
             )
         }
 
@@ -1480,7 +1491,8 @@ extension EPUBNavigatorViewController: PageCurlPanDelegate {
             spine: spine,
             peelSign: peel,
             realVerso: columns >= 2,
-            withinResource: false
+            withinResource: false,
+            reversed: PageCurlGeometry.playsReversed(renderedColumns: columns, forward: forward)
         )
     }
 

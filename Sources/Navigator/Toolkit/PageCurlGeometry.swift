@@ -10,8 +10,8 @@ import Foundation
 /// Where the leaf is bound, in the view. `normalizedX` is 0 at the left edge
 /// and 1 at the right, for both reading directions.
 ///
-/// Task 4 drives `progress` from the finger. Task 5 passes the fold into
-/// `divisionNormalizedX`. Neither owns a second renderer.
+/// A finger drag drives `progress`. A reported fold is `divisionNormalizedX`.
+/// Neither owns a second renderer.
 enum PageCurlSpine: Equatable {
     case leading
     case trailing
@@ -30,7 +30,7 @@ enum PageCurlSpine: Equatable {
 }
 
 /// Paper colour mixed into a one-page underside. `mix` is how far the mirrored
-/// front is pulled toward `color` (the spec's ~78%).
+/// front is pulled toward `color` (`PageCurlGeometry.backsideMix`).
 struct PageCurlPaper: Equatable {
     var r: CGFloat
     var g: CGFloat
@@ -49,11 +49,11 @@ struct PageCurlRGB: Equatable {
 /// Pure curl decisions. The shader reads the numbers; it does not decide them
 /// and it has no clock.
 enum PageCurlGeometry {
-    /// Tap-curl length. Finger tracking (Task 4) does not use this.
+    /// Tap-curl length. A finger drag does not use this.
     static let tapDuration: TimeInterval = 0.38
     /// Bottom corner on a tap. 0.84 is about 16° from vertical
     /// (`tiltRadians` at `maxTilt` is the finger's extreme, about ±24°).
-    /// Task 4 replaces this with the finger's `touchY`. Mid-page 0.5 stays vertical.
+    /// A drag replaces this with the finger's `touchY`. Mid-page 0.5 stays vertical.
     static let tapTouchY: CGFloat = 0.84
     /// The axis stays attached to the spine. About ±24°.
     static let maxTilt: CGFloat = 0.42
@@ -61,9 +61,8 @@ enum PageCurlGeometry {
     /// The roll on screen is `2 * radius` wide, so 0.10 is a fifth of the page
     /// at mid-turn. 0.07 read as a thin band rather than a paper roll.
     static let peakRadius: CGFloat = 0.10
-    /// How far the mirrored front is pulled into the paper. The design note
-    /// said ~78%. Filmed frames still read the reversed type, including at
-    /// 0.90, so the ghost is a light stain.
+    /// How far the mirrored front is pulled into the paper. 0.78 still read as
+    /// reversed type, including at 0.90, so the ghost is a light stain.
     static let backsideMix: CGFloat = 0.96
     /// A vertical fold reported outside this band is clamped, not trusted.
     static let divisionRange: ClosedRange<CGFloat> = 0.35 ... 0.65
@@ -117,30 +116,28 @@ enum PageCurlGeometry {
         return rtl ? .trailing : .leading
     }
 
-    /// Spine for this turn. Two pages keep the centre. One page peels from the
-    /// opposite edge on the way back, which is the same flip RTL applies.
+    /// Spine for this turn. The binding does not move. A backward one-page turn
+    /// uncurls the previous page from this same spine (`playsReversed`); it does
+    /// not peel the current page off the opposite edge.
     static func animationSpine(
         renderedColumns: Int,
         rtl: Bool,
         forward: Bool,
         divisionNormalizedX: CGFloat?
     ) -> PageCurlSpine {
-        let binding = resolveSpine(
+        _ = forward
+        return resolveSpine(
             renderedColumns: renderedColumns,
             rtl: rtl,
             divisionNormalizedX: divisionNormalizedX
         )
-        guard renderedColumns < 2, !forward else {
-            return binding
-        }
-        switch binding {
-        case .leading:
-            return .trailing
-        case .trailing:
-            return .leading
-        case let .center(normalizedX):
-            return .center(normalizedX: normalizedX)
-        }
+    }
+
+    /// One page, going back: play the forward curl from 1 to 0 with the
+    /// bitmaps swapped, so the previous page unrolls from the binding spine.
+    /// Two pages peel the other leaf instead; that is a forward curl of that leaf.
+    static func playsReversed(renderedColumns: Int, forward: Bool) -> Bool {
+        renderedColumns < 2 && !forward
     }
 
     /// +1: the leaf occupies +x from the spine. -1: it occupies -x.
@@ -173,6 +170,178 @@ enum PageCurlGeometry {
             return 0.5
         }
         return min(divisionRange.upperBound, max(divisionRange.lowerBound, x))
+    }
+
+    /// How far a tilted fold leads the page edge, in `along` units (view widths).
+    /// `aspect` is view width / height, the same value the shader stores.
+    /// The leading corner is one `overhang` ahead of the centre fold line.
+    static func tiltOverhang(tilt: CGFloat, aspect: CGFloat) -> CGFloat {
+        guard tilt.isFinite else {
+            return 0
+        }
+        let safeAspect = max(aspect.isFinite ? aspect : 1, 0.05)
+        return abs(tan(tilt)) * (0.5 / safeAspect)
+    }
+
+    /// Width past the spine that a two-page turn still has to cross.
+    /// A one-page leaf has none: its far edge is the spine.
+    static func farSpan(twoPage: Bool, span: CGFloat) -> CGFloat {
+        guard twoPage, span.isFinite else {
+            return 0
+        }
+        return max(0, 1 - span)
+    }
+
+    /// Centre of the fold in `along` units. Starts at `span + overhang`, past
+    /// the leading corner, and ends at `-far - overhang - curlWidth`, past the
+    /// trailing corner, so neither corner pops on or off in one frame.
+    /// `curlWidth` is `2 * cylinderRadius` (the roll's width on screen).
+    static func foldCenter(
+        progress: CGFloat,
+        span: CGFloat,
+        overhang: CGFloat,
+        curlWidth: CGFloat,
+        far: CGFloat
+    ) -> CGFloat {
+        let p = clampProgress(progress)
+        let leaf = max(span.isFinite ? span : 1, 0.05)
+        let lead = max(overhang.isFinite ? overhang : 0, 0)
+        let roll = max(curlWidth.isFinite ? curlWidth : 0, 0)
+        let beyond = max(far.isFinite ? far : 0, 0)
+        let travel = leaf + beyond + 2 * lead + roll
+        return (leaf + lead) - p * travel
+    }
+
+    /// Fold line at one row. `normalizedY` is 0 at the top and 1 at the bottom.
+    /// Positive tilt drops the line toward the spine at the bottom.
+    static func foldLine(
+        fold: CGFloat,
+        tilt: CGFloat,
+        normalizedY: CGFloat,
+        aspect: CGFloat
+    ) -> CGFloat {
+        guard fold.isFinite else {
+            return 0
+        }
+        let safeAspect = max(aspect.isFinite ? aspect : 1, 0.05)
+        let y = min(1, max(0, normalizedY.isFinite ? normalizedY : 0.5))
+        let yOff = (y - 0.5) / safeAspect
+        let angle = tilt.isFinite ? tilt : 0
+        return fold - tan(angle) * yOff
+    }
+
+    /// Columns actually used. CSS `column-count` stays at the requested count
+    /// when the widths do not fit; `column-width` is what WebKit honoured.
+    /// A non-positive `columnWidth` means `auto` (trust the CSS count).
+    static func usedColumnCount(
+        cssColumnCount: Int,
+        columnWidth: CGFloat,
+        columnGap: CGFloat,
+        innerWidth: CGFloat
+    ) -> Int {
+        let css = max(1, cssColumnCount)
+        guard columnWidth.isFinite, columnWidth > 0, innerWidth.isFinite, innerWidth > 0 else {
+            return css
+        }
+        let gap = (columnGap.isFinite && columnGap > 0) ? columnGap : 0
+        let used = max(1, Int(floor((innerWidth + gap) / (columnWidth + gap))))
+        return min(css, used)
+    }
+
+    /// Parses the column probe (`[count, width, gap, innerWidth]`) or a bare
+    /// count from an older script. Anything else is one column.
+    static func usedColumnCount(parsing result: Any?) -> Int {
+        if let values = result as? NSArray, values.count >= 4 {
+            func number(at index: Int) -> Double? {
+                let value = values[index]
+                if let number = value as? NSNumber {
+                    return number.doubleValue
+                }
+                if let text = value as? String {
+                    return Double(text)
+                }
+                return nil
+            }
+            guard
+                let css = number(at: 0),
+                let width = number(at: 1),
+                let gap = number(at: 2),
+                let inner = number(at: 3)
+            else {
+                return 1
+            }
+            return usedColumnCount(
+                cssColumnCount: Int(css),
+                columnWidth: CGFloat(width),
+                columnGap: CGFloat(gap),
+                innerWidth: CGFloat(inner)
+            )
+        }
+        if let values = result as? [NSNumber], values.count >= 4 {
+            return usedColumnCount(
+                cssColumnCount: values[0].intValue,
+                columnWidth: CGFloat(values[1].doubleValue),
+                columnGap: CGFloat(values[2].doubleValue),
+                innerWidth: CGFloat(values[3].doubleValue)
+            )
+        }
+        if let values = result as? [Any], values.count >= 4 {
+            func number(_ value: Any) -> Double? {
+                switch value {
+                case let number as NSNumber:
+                    return number.doubleValue
+                case let text as String:
+                    return Double(text)
+                default:
+                    return nil
+                }
+            }
+            guard
+                let css = number(values[0]),
+                let width = number(values[1]),
+                let gap = number(values[2]),
+                let inner = number(values[3])
+            else {
+                return 1
+            }
+            return usedColumnCount(
+                cssColumnCount: Int(css),
+                columnWidth: CGFloat(width),
+                columnGap: CGFloat(gap),
+                innerWidth: CGFloat(inner)
+            )
+        }
+        if let number = result as? NSNumber {
+            return max(1, number.intValue)
+        }
+        return 1
+    }
+
+    /// One web view is snapshotted on its own. A failed snapshot is a failure,
+    /// not a hierarchy grab: the curl cover is already a subview and would
+    /// photograph the outgoing page. Anything else is drawn as a hierarchy.
+    enum CaptureRoute: Equatable {
+        case webSnapshot
+        case failed
+        case hierarchy
+    }
+
+    static func captureRoute(webViewCount: Int, snapshotSucceeded: Bool) -> CaptureRoute {
+        guard webViewCount == 1 else {
+            return .hierarchy
+        }
+        return snapshotSucceeded ? .webSnapshot : .failed
+    }
+
+    /// A missing incoming bitmap cross-fades onto the live page. Substituting
+    /// the outgoing bitmap peels the page off a copy of itself.
+    enum IncomingReveal: Equatable {
+        case cylinder
+        case crossfade
+    }
+
+    static func incomingReveal(snapshotSucceeded: Bool) -> IncomingReveal {
+        snapshotSucceeded ? .cylinder : .crossfade
     }
 
     /// What actually plays. The policy is the gate: Reduce Motion, VoiceOver,
@@ -224,6 +393,7 @@ struct PageCurlUniforms {
     var paperMix: Float = 0.96
     var aspect: Float = 1
     var twoPage: Float = 0
-    var pad0: Float = 0
+    /// Centre fold in `along` units. See `PageCurlGeometry.foldCenter`.
+    var fold: Float = 0
     var pad1: Float = 0
 }

@@ -61,7 +61,7 @@ public enum Fit: String, Codable, Hashable {
 
 /// Animation used when turning pages in a paginated publication.
 ///
-/// `curl` is the Metal cylinder curl (a tap, or a finger in a later revision).
+/// `curl` is the Metal cylinder curl, driven by a tap or by a finger drag.
 /// A jump of more than one resource resolves to a fade before the renderer
 /// runs. Changing the value never reloads the publication.
 public enum PageTransition: String, Codable, Hashable {

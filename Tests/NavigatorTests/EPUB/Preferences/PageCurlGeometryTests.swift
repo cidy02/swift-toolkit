@@ -110,14 +110,16 @@ class PageCurlGeometryTests: XCTestCase {
         )
     }
 
-    func testAnimationSpineFlipsTheEdgeOnTheWayBackAndKeepsTheCentre() {
+    func testAnimationSpineKeepsTheBindingOnTheWayBack() {
         XCTAssertEqual(
             PageCurlGeometry.animationSpine(renderedColumns: 1, rtl: false, forward: true, divisionNormalizedX: nil),
             .leading
         )
+        // A backward one-page turn uncurls from the same spine. It does not
+        // peel the current page off the opposite edge.
         XCTAssertEqual(
             PageCurlGeometry.animationSpine(renderedColumns: 1, rtl: false, forward: false, divisionNormalizedX: nil),
-            .trailing
+            .leading
         )
         XCTAssertEqual(
             PageCurlGeometry.animationSpine(renderedColumns: 1, rtl: true, forward: true, divisionNormalizedX: nil),
@@ -125,8 +127,13 @@ class PageCurlGeometryTests: XCTestCase {
         )
         XCTAssertEqual(
             PageCurlGeometry.animationSpine(renderedColumns: 1, rtl: true, forward: false, divisionNormalizedX: nil),
-            .leading
+            .trailing
         )
+        XCTAssertTrue(PageCurlGeometry.playsReversed(renderedColumns: 1, forward: false))
+        XCTAssertFalse(PageCurlGeometry.playsReversed(renderedColumns: 1, forward: true))
+        XCTAssertFalse(PageCurlGeometry.playsReversed(renderedColumns: 2, forward: false))
+        XCTAssertFalse(PageCurlGeometry.playsReversed(renderedColumns: 0, forward: true))
+        XCTAssertTrue(PageCurlGeometry.playsReversed(renderedColumns: 0, forward: false))
         XCTAssertEqual(
             PageCurlGeometry.animationSpine(renderedColumns: 2, rtl: false, forward: false, divisionNormalizedX: 0.47),
             .center(normalizedX: 0.47)
@@ -202,6 +209,116 @@ class PageCurlGeometryTests: XCTestCase {
         XCTAssertEqual(dark.r, 0.20, accuracy: 0.001)
         XCTAssertEqual(dark.g, 0.20, accuracy: 0.001)
         XCTAssertEqual(dark.b, 0.22, accuracy: 0.001)
+
+        // The dark branch is 0.06 <= luminance < 0.28. Just inside both ends.
+        let darkFloor = PageCurlGeometry.backsidePaper(background: PageCurlRGB(r: 0.07, g: 0.07, b: 0.07))
+        XCTAssertEqual(darkFloor.r, 0.20, accuracy: 0.001)
+        XCTAssertEqual(darkFloor.b, 0.22, accuracy: 0.001)
+        let darkCeil = PageCurlGeometry.backsidePaper(background: PageCurlRGB(r: 0.27, g: 0.27, b: 0.27))
+        XCTAssertEqual(darkCeil.r, 0.20, accuracy: 0.001)
+        let aboveDark = PageCurlGeometry.backsidePaper(background: PageCurlRGB(r: 0.30, g: 0.30, b: 0.30))
+        XCTAssertEqual(aboveDark.r, 0.30 * 0.96, accuracy: 0.001)
+    }
+
+    func testTiltedFoldDoesNotPopACorner() {
+        // Portrait phone, tap at the bottom corner. The old fold (`span * (1 - progress)`)
+        // put ~32% of the bottom edge on the incoming page at progress 0.002.
+        let aspect = 390.0 / 844.0
+        let tilt = PageCurlGeometry.tiltRadians(touchY: PageCurlGeometry.tapTouchY)
+        let span: CGFloat = 1
+        let overhang = PageCurlGeometry.tiltOverhang(tilt: tilt, aspect: aspect)
+        XCTAssertGreaterThan(overhang, 0.25)
+
+        func popped(progress: CGFloat, atBottom: Bool) -> CGFloat {
+            let radius = PageCurlGeometry.cylinderRadius(progress: progress, span: span)
+            let fold = PageCurlGeometry.foldCenter(
+                progress: progress,
+                span: span,
+                overhang: overhang,
+                curlWidth: radius * 2,
+                far: 0
+            )
+            let line = PageCurlGeometry.foldLine(
+                fold: fold,
+                tilt: tilt,
+                normalizedY: atBottom ? 1 : 0,
+                aspect: aspect
+            )
+            if atBottom {
+                return max(0, span - line)
+            }
+            return max(0, line)
+        }
+
+        XCTAssertEqual(popped(progress: 0, atBottom: true), 0, accuracy: 0.0001)
+        XCTAssertLessThan(popped(progress: 0.002, atBottom: true), 0.02)
+        XCTAssertEqual(popped(progress: 1, atBottom: false), 0, accuracy: 0.0001)
+        XCTAssertLessThan(popped(progress: 0.998, atBottom: false), 0.02)
+    }
+
+    func testTwoPageFoldCrossesTheFarHalf() {
+        let span: CGFloat = 0.5
+        let midRadius = PageCurlGeometry.cylinderRadius(progress: 0.5, span: span)
+        let mid = PageCurlGeometry.foldCenter(
+            progress: 0.5,
+            span: span,
+            overhang: 0,
+            curlWidth: midRadius * 2,
+            far: PageCurlGeometry.farSpan(twoPage: true, span: span)
+        )
+        // Halfway, the fold has crossed the spine. The far half is not frozen.
+        XCTAssertLessThan(mid, 0)
+
+        let endRadius = PageCurlGeometry.cylinderRadius(progress: 0.998, span: span)
+        let end = PageCurlGeometry.foldCenter(
+            progress: 0.998,
+            span: span,
+            overhang: 0,
+            curlWidth: endRadius * 2,
+            far: 0.5
+        )
+        XCTAssertLessThan(end, -0.4)
+        XCTAssertEqual(PageCurlGeometry.farSpan(twoPage: false, span: 1), 0)
+    }
+
+    func testUsedColumnCountFollowsTheWidthsThatFit() {
+        // 2 × 400pt columns do not fit in 800pt with a gap. CSS still says 2.
+        XCTAssertEqual(
+            PageCurlGeometry.usedColumnCount(cssColumnCount: 2, columnWidth: 400, columnGap: 20, innerWidth: 800),
+            1
+        )
+        XCTAssertEqual(
+            PageCurlGeometry.usedColumnCount(cssColumnCount: 2, columnWidth: 300, columnGap: 20, innerWidth: 800),
+            2
+        )
+        // `column-width: auto` does not parse. Trust the CSS count.
+        XCTAssertEqual(
+            PageCurlGeometry.usedColumnCount(cssColumnCount: 2, columnWidth: 0, columnGap: 0, innerWidth: 800),
+            2
+        )
+        XCTAssertEqual(
+            PageCurlGeometry.usedColumnCount(cssColumnCount: 1, columnWidth: 100, columnGap: 0, innerWidth: 800),
+            1
+        )
+        XCTAssertEqual(
+            PageCurlGeometry.usedColumnCount(cssColumnCount: 2, columnWidth: .nan, columnGap: 10, innerWidth: 800),
+            2
+        )
+
+        let probe: [NSNumber] = [2, 400, 20, 800]
+        XCTAssertEqual(PageCurlGeometry.usedColumnCount(parsing: probe), 1)
+        XCTAssertEqual(PageCurlGeometry.usedColumnCount(parsing: NSNumber(value: 2)), 2)
+        XCTAssertEqual(PageCurlGeometry.usedColumnCount(parsing: nil), 1)
+        XCTAssertEqual(PageCurlGeometry.usedColumnCount(parsing: "nope"), 1)
+    }
+
+    func testSnapshotFailureDoesNotCurlTheOutgoingPage() {
+        XCTAssertEqual(PageCurlGeometry.captureRoute(webViewCount: 1, snapshotSucceeded: true), .webSnapshot)
+        XCTAssertEqual(PageCurlGeometry.captureRoute(webViewCount: 1, snapshotSucceeded: false), .failed)
+        XCTAssertEqual(PageCurlGeometry.captureRoute(webViewCount: 0, snapshotSucceeded: false), .hierarchy)
+        XCTAssertEqual(PageCurlGeometry.captureRoute(webViewCount: 2, snapshotSucceeded: true), .hierarchy)
+        XCTAssertEqual(PageCurlGeometry.incomingReveal(snapshotSucceeded: true), .cylinder)
+        XCTAssertEqual(PageCurlGeometry.incomingReveal(snapshotSucceeded: false), .crossfade)
     }
 
     func testUniformStrideMatchesTheShaderStruct() {

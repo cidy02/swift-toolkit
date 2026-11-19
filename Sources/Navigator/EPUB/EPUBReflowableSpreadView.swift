@@ -51,7 +51,14 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         )
     }
 
+    /// The curl overlay, if a turn is in flight. Cleared with the spread so a
+    /// reload or a close cannot leave the display link running.
+    private weak var activeCurlView: PageCurlView?
+
     override func clear() {
+        activeCurlView?.releaseResources()
+        activeCurlView?.removeFromSuperview()
+        activeCurlView = nil
         super.clear()
 
         // Clean up go to continuations.
@@ -241,13 +248,30 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
     private func curl(by offsetX: CGFloat, direction: Direction) async {
         setSuppressingProgressionUpdates(true)
         let background = viewModel.settings.effectiveBackgroundColor.uiColor
-        guard let outgoing = await PageCurlSnapshotter.capture(of: self, backgroundColor: background) else {
+        // The page is already on screen. `afterScreenUpdates: true` is for the
+        // incoming column, after the scroll.
+        guard let outgoing = await PageCurlSnapshotter.capture(
+            of: self,
+            backgroundColor: background,
+            afterScreenUpdates: false
+        ) else {
             setSuppressingProgressionUpdates(false)
+            guard curlHostAttached else {
+                return
+            }
             await slide(by: offsetX)
+            return
+        }
+        guard curlHostAttached else {
+            setSuppressingProgressionUpdates(false)
             return
         }
 
         let columns = await renderedColumnCount()
+        guard curlHostAttached else {
+            setSuppressingProgressionUpdates(false)
+            return
+        }
         let rtl = viewModel.readingProgression == .rtl
         let forward = isForward(direction)
         let spine = PageCurlGeometry.animationSpine(
@@ -260,21 +284,48 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         curlView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         curlView.showCover(outgoing, background: background)
         addSubview(curlView)
+        activeCurlView = curlView
         defer {
+            if activeCurlView === curlView {
+                activeCurlView = nil
+            }
             curlView.releaseResources()
             curlView.removeFromSuperview()
-            setSuppressingProgressionUpdates(false)
+            if superview != nil {
+                setSuppressingProgressionUpdates(false)
+            }
         }
 
         await scrollByAwaitingPaint(offsetX)
-        let incoming = await PageCurlSnapshotter.capture(of: self, backgroundColor: background) ?? outgoing
-        await curlView.runTap(
-            outgoing: outgoing,
-            incoming: incoming,
-            spine: spine,
-            peelSign: PageCurlGeometry.peelSign(spine: spine, rtl: rtl, forward: forward),
-            realVerso: columns >= 2
-        )
+        guard curlHostAttached, curlView.superview != nil else {
+            return
+        }
+        let shot = await PageCurlSnapshotter.capture(of: self, backgroundColor: background)
+        guard curlHostAttached, curlView.superview != nil else {
+            return
+        }
+        switch PageCurlGeometry.incomingReveal(snapshotSucceeded: shot != nil) {
+        case .crossfade:
+            await PageTransitionAnimator.fade(curlView, to: 0, duration: PageTransitionAnimator.fadeDuration)
+        case .cylinder:
+            guard let shot else {
+                return
+            }
+            await curlView.runTap(
+                outgoing: outgoing,
+                incoming: shot,
+                spine: spine,
+                peelSign: PageCurlGeometry.peelSign(spine: spine, rtl: rtl, forward: forward),
+                realVerso: columns >= 2,
+                reversed: PageCurlGeometry.playsReversed(renderedColumns: columns, forward: forward)
+            )
+        }
+    }
+
+    /// False once the spread has left the window or the app is in the background.
+    /// A curl that continues from there submits GPU work to a detached layer.
+    private var curlHostAttached: Bool {
+        window != nil && superview != nil && UIApplication.shared.applicationState != .background
     }
 
     /// Same column step `go(to:)` scrolls. Nil on the first or last column,
@@ -372,22 +423,24 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         }
     }
 
-    /// CSS `column-count` on the root, which is what Readium actually painted.
-    /// A fixed double spread is already 2. One column stays an edge curl.
+    /// Columns WebKit actually laid out. CSS `column-count` stays at the
+    /// requested count when `column-width` does not fit, which would slice a
+    /// one-column page down the middle. A fixed double spread is already 2.
     override func renderedColumnCount() async -> Int {
         if case .double = spread {
             return 2
         }
         let result = await evaluateScript(
-            "(function(){ var n = parseInt(getComputedStyle(document.documentElement).columnCount, 10); return (isNaN(n) || n < 1) ? 1 : n; })()"
+            "(function(){ var cs = getComputedStyle(document.documentElement);"
+                + " var cc = parseInt(cs.columnCount, 10); if (isNaN(cc) || cc < 1) { cc = 1; }"
+                + " var cw = parseFloat(cs.columnWidth); if (isNaN(cw) || cw < 0) { cw = 0; }"
+                + " var gap = parseFloat(cs.columnGap); if (isNaN(gap) || gap < 0) { gap = 0; }"
+                + " return [cc, cw, gap, window.innerWidth || 0]; })()"
         )
         guard case let .success(value) = result else {
             return 1
         }
-        if let number = value as? NSNumber {
-            return max(1, number.intValue)
-        }
-        return 1
+        return PageCurlGeometry.usedColumnCount(parsing: value)
     }
 
     /// WebKit smooth scroll. Progression is held until the scroll settles so
@@ -752,6 +805,9 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         isReduceMotionEnabled = UIAccessibility.isReduceMotionEnabled
         if isReduceMotionEnabled {
             scrollDidEnd()
+            activeCurlView?.releaseResources()
+            activeCurlView?.removeFromSuperview()
+            activeCurlView = nil
         }
     }
 

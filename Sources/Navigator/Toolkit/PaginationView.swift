@@ -204,6 +204,7 @@ final class PaginationView: UIView, Loggable {
         super.willMove(toSuperview: newSuperview)
 
         if newSuperview == nil {
+            cancelActiveCurl()
             // Remove all spread views to break retain cycles
             for (_, view) in loadedViews {
                 view.removeFromSuperview()
@@ -216,6 +217,7 @@ final class PaginationView: UIView, Loggable {
         super.didMoveToWindow()
 
         if window == nil {
+            cancelActiveCurl()
             loadPagesTask.cancel()
             firstPageLoad?.cancel()
         } else {
@@ -230,6 +232,11 @@ final class PaginationView: UIView, Loggable {
             : scrollView.bounds.width * CGFloat(index)
     }
 
+    /// Bumped by every reload. A curl that is awaiting across a reload must not
+    /// write `currentIndex` or the animation flags afterwards.
+    private var reloadGeneration: UInt = 0
+    private weak var activeCurlView: PageCurlView?
+
     /// Reloads the pagination with the given total number of pages and current index.
     ///
     /// - Parameters:
@@ -241,6 +248,14 @@ final class PaginationView: UIView, Loggable {
         precondition(pageCount >= 1)
         precondition(0 ..< pageCount ~= index)
 
+        reloadGeneration &+= 1
+        cancelActiveCurl()
+        // A curl in flight set these. The reload owns them now; the curl's
+        // defer must not put the new spread back into a transition.
+        isAnimatingContentOffset = false
+        suppressProgressionDuringLoad = false
+        scrollView.isScrollEnabled = isScrollEnabled
+
         self.pageCount = pageCount
         self.readingProgression = readingProgression
 
@@ -251,6 +266,12 @@ final class PaginationView: UIView, Loggable {
         loadingIndexQueue.removeAll()
 
         setCurrentIndex(index, location: location)
+    }
+
+    private func cancelActiveCurl() {
+        activeCurlView?.releaseResources()
+        activeCurlView?.removeFromSuperview()
+        activeCurlView = nil
     }
 
     /// Updates the current and pre-loaded views.
@@ -518,9 +539,20 @@ final class PaginationView: UIView, Loggable {
     /// Neighbour resource. The outgoing leaf stays up, opaque, until the
     /// incoming spread has loaded and painted, then the cylinder runs.
     private func curlToView(at index: Int, location: PageLocation) async {
+        let generation = reloadGeneration
         let source = loadedViews[currentIndex] ?? self
         let background = transitionBackgroundColor
-        guard let outgoing = await PageCurlSnapshotter.capture(of: source, backgroundColor: background) else {
+        guard pageTurnAttached(generation) else {
+            return
+        }
+        guard let outgoing = await PageCurlSnapshotter.capture(
+            of: source,
+            backgroundColor: background,
+            afterScreenUpdates: false
+        ) else {
+            guard pageTurnAttached(generation) else {
+                return
+            }
             await slideToView(at: index, location: location, animated: true)
             return
         }
@@ -530,6 +562,9 @@ final class PaginationView: UIView, Loggable {
             columns = await page.renderedColumnCount()
         } else {
             columns = 1
+        }
+        guard pageTurnAttached(generation) else {
+            return
         }
         let rtl = readingProgression == .rtl
         let forward = index > currentIndex
@@ -543,34 +578,71 @@ final class PaginationView: UIView, Loggable {
         curl.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         curl.showCover(outgoing, background: background)
         addSubview(curl)
+        activeCurlView = curl
 
-        isAnimatingContentOffset = true
-        scrollView.isScrollEnabled = false
-        suppressProgressionDuringLoad = true
-
+        var ownsFlags = false
         defer {
-            suppressProgressionDuringLoad = false
-            loadedViews[index]?.setSuppressingProgressionUpdates(false)
+            if activeCurlView === curl {
+                activeCurlView = nil
+            }
             curl.releaseResources()
             curl.removeFromSuperview()
+            // A reload already reset these for the new spread. Writing them
+            // again would unpin that spread or re-enable a scroll it disabled.
+            guard ownsFlags, generation == reloadGeneration else {
+                return
+            }
+            suppressProgressionDuringLoad = false
+            loadedViews[index]?.setSuppressingProgressionUpdates(false)
             isAnimatingContentOffset = false
             scrollView.isScrollEnabled = isScrollEnabled
         }
 
+        guard pageTurnAttached(generation) else {
+            return
+        }
+
+        ownsFlags = true
+        isAnimatingContentOffset = true
+        scrollView.isScrollEnabled = false
+        suppressProgressionDuringLoad = true
+
         let fromOffset = scrollView.contentOffset
         setCurrentIndex(index, location: location)
         await preparePageInViewport(at: index, fromOffset: fromOffset)
-        let incoming = await PageCurlSnapshotter.capture(
+        guard pageTurnAttached(generation) else {
+            return
+        }
+        let shot = await PageCurlSnapshotter.capture(
             of: loadedViews[index] ?? self,
             backgroundColor: background
-        ) ?? outgoing
-        await curl.runTap(
-            outgoing: outgoing,
-            incoming: incoming,
-            spine: spine,
-            peelSign: PageCurlGeometry.peelSign(spine: spine, rtl: rtl, forward: forward),
-            realVerso: columns >= 2
         )
+        guard pageTurnAttached(generation) else {
+            return
+        }
+        switch PageCurlGeometry.incomingReveal(snapshotSucceeded: shot != nil) {
+        case .crossfade:
+            await PageTransitionAnimator.fade(curl, to: 0, duration: PageTransitionAnimator.fadeDuration)
+        case .cylinder:
+            guard let shot else {
+                return
+            }
+            await curl.runTap(
+                outgoing: outgoing,
+                incoming: shot,
+                spine: spine,
+                peelSign: PageCurlGeometry.peelSign(spine: spine, rtl: rtl, forward: forward),
+                realVerso: columns >= 2,
+                reversed: PageCurlGeometry.playsReversed(renderedColumns: columns, forward: forward)
+            )
+        }
+    }
+
+    private func pageTurnAttached(_ generation: UInt) -> Bool {
+        generation == reloadGeneration
+            && window != nil
+            && superview != nil
+            && UIApplication.shared.applicationState != .background
     }
 
     /// Moves to the neighbour resource. The outgoing page stays on screen,

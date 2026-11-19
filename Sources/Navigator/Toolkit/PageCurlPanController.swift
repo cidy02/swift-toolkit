@@ -14,6 +14,9 @@ struct PageCurlPanFrame {
     var peelSign: CGFloat
     var realVerso: Bool
     var withinResource: Bool
+    /// One-page turn back to the previous page. The cylinder runs backwards
+    /// from the binding spine instead of peeling off the opposite edge.
+    var reversed: Bool
 }
 
 /// The navigator owns location and the web view. The controller owns the finger.
@@ -195,6 +198,7 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
             spine: frame.spine,
             peelSign: frame.peelSign,
             realVerso: frame.realVerso,
+            reversed: frame.reversed,
             progress: finger.progress,
             touchY: finger.touchY
         )

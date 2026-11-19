@@ -11,8 +11,9 @@ import Foundation
 ///
 /// The shader has no duration and no easing. `progress` is already the visual
 /// position, 0 = outgoing flat, 1 = incoming flat. `radius` is zero at both
-/// ends. `tilt` is radians from vertical; a tap passes the bottom-corner value,
-/// and Task 4 passes the finger's `touchY`.
+/// ends. `tilt` is radians from vertical; a tap passes the bottom-corner value
+/// and a finger drag passes `touchY`. `fold` is the centre of the fold in
+/// `along` units, from `PageCurlGeometry.foldCenter`.
 enum PageCurlShader {
     static let source = #"""
     #include <metal_stdlib>
@@ -33,7 +34,7 @@ enum PageCurlShader {
         float paperMix;
         float aspect;
         float twoPage;
-        float pad0;
+        float fold;
         float pad1;
     };
 
@@ -108,23 +109,21 @@ enum PageCurlShader {
 
         // Distance along the peel, then a fold line tilted in the same units.
         // Positive tilt drops the fold toward the spine at the bottom, so that
-        // corner leads. The page image itself is not rotated.
+        // corner leads. The page image itself is not rotated. `u.fold` already
+        // starts past the leading corner and, on two pages, crosses the far half.
         float aspect = max(u.aspect, 0.05);
         float along = (uv.x - u.spineX) * u.peelSign;
         float yOff = (uv.y - 0.5) / aspect;
         float tilt = clamp(u.tilt, -0.5, 0.5);
-        float fold = span * (1.0 - u.progress);
-        float foldLine = fold - tan(tilt) * yOff;
+        float foldLine = u.fold - tan(tilt) * yOff;
         float dist = along - foldLine;
 
-        // The half that is not this leaf (centre spine). It stays the outgoing page.
-        if (along < 0.0) {
-            return float4(flatOutgoing(outC, along, envelope, u), 1.0);
-        }
-
-        // Unturned remainder. Full contrast until the roll starts.
+        // Unturned remainder, including the far half of a two-page spread that
+        // the fold has not reached. A short shadow sits just ahead of the fold.
         if (dist <= 0.0) {
-            return float4(flatOutgoing(outC, along, envelope, u), 1.0);
+            float3 color = flatOutgoing(outC, along, envelope, u);
+            float ahead = exp(dist / 0.028) * 0.16 * envelope;
+            return float4(clamp(color * (1.0 - ahead), 0.0, 1.0), 1.0);
         }
 
         // Screen width of the roll. Arc length across it is pi*R, so the page is
@@ -144,8 +143,18 @@ enum PageCurlShader {
         float spec = pow(max(crest, 0.0), 2.5) * u.specular * 0.35 * envelope;
         float3 specColor = spec * float3(1.0, 0.98, 0.94);
 
+        // The roll has run off the outer edge. Clamping that sample streaks
+        // the margin pixel across the cylinder; the page underneath is inC.
+        if (orig > span) {
+            return float4(inC, 1.0);
+        }
+
         // Front of the roll. Shade starts at 1 so it meets the flat page.
         if (t < 0.5) {
+            float frontX = u.spineX + u.peelSign * orig;
+            if (frontX < 0.0 || frontX > 1.0) {
+                return float4(inC, 1.0);
+            }
             float3 front = sampleTex(outgoing, leafUV(orig, uv.y, u));
             float shade = mix(1.0, 0.90, smoothstep(0.0, 0.5, t));
             return float4(clamp(front * shade + specColor, 0.0, 1.0), 1.0);
@@ -153,14 +162,18 @@ enum PageCurlShader {
 
         // Back of the roll. Opaque: it covers the next page, it is not mixed with it.
         // One page is a paper ghost. Two pages are the real verso.
+        float backLeaf = (u.realVerso > 0.5) ? -orig : (span - orig);
+        float backX = u.spineX + u.peelSign * backLeaf;
+        if (backX < 0.0 || backX > 1.0) {
+            return float4(inC, 1.0);
+        }
         float3 back;
         float specScale;
         if (u.realVerso > 0.5) {
             back = sampleTex(incoming, leafUV(-orig, uv.y, u));
             specScale = 1.0;
         } else {
-            float mirrored = span - orig;
-            back = paperBack(sampleTex(outgoing, leafUV(mirrored, uv.y, u)), u);
+            back = paperBack(sampleTex(outgoing, leafUV(backLeaf, uv.y, u)), u);
             specScale = 0.40;
         }
         float backT = clamp((t - 0.5) / 0.5, 0.0, 1.0);

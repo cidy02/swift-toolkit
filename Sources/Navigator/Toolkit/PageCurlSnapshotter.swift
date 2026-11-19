@@ -26,44 +26,54 @@ enum PageCurlSnapshotter {
         let format = UIGraphicsImageRendererFormat()
         format.opaque = true
         format.scale = scale
+        // WebKit can hand back a wide-gamut image. `.automatic` promotes that
+        // to 16-bit pixels and doubles the texture. The curl samples 8-bit.
+        format.preferredRange = .standard
         let renderer = UIGraphicsImageRenderer(bounds: bounds, format: format)
 
         let webs = webViews(in: view)
-        if webs.count == 1, let web = webs.first, web.bounds.width > 1, web.bounds.height > 1,
-           let shot = await takeSnapshot(of: web, scale: scale, afterScreenUpdates: afterScreenUpdates)
-        {
+        // `snapshotWidth` is in points. Leaving it nil captures `rect` at the
+        // screen scale. Multiplying by scale here makes WebKit multiply again.
+        let shot: UIImage?
+        if webs.count == 1, let web = webs.first, web.bounds.width > 1, web.bounds.height > 1 {
+            shot = await takeSnapshot(of: web, afterScreenUpdates: afterScreenUpdates)
+        } else {
+            shot = nil
+        }
+        switch PageCurlGeometry.captureRoute(webViewCount: webs.count, snapshotSucceeded: shot != nil) {
+        case .failed:
+            return nil
+        case .webSnapshot:
+            guard let shot, let web = webs.first else {
+                return nil
+            }
             let frame = web.convert(web.bounds, to: view)
             return renderer.image { context in
                 backgroundColor.setFill()
                 context.fill(bounds)
                 shot.draw(in: frame)
             }
+        case .hierarchy:
+            // No single web view to snapshot (a container, or none yet).
+            // `afterScreenUpdates: true` deadlocks against WebKit while this
+            // task is already on the main actor. A fixed spread is one web
+            // view with two iframes, so it takes the snapshot path above.
+            return renderer.image { context in
+                backgroundColor.setFill()
+                context.fill(bounds)
+                view.drawHierarchy(in: bounds, afterScreenUpdates: false)
+            }
         }
-
-        // A fixed double spread has two web views. One snapshot would drop a
-        // page. `afterScreenUpdates: false` — true deadlocks against WebKit
-        // while this task is already on the main actor.
-        let image = renderer.image { context in
-            backgroundColor.setFill()
-            context.fill(bounds)
-            view.drawHierarchy(in: bounds, afterScreenUpdates: false)
-        }
-        return image
     }
 
     private static func takeSnapshot(
         of web: WKWebView,
-        scale: CGFloat,
         afterScreenUpdates: Bool
     ) async -> UIImage? {
         await withCheckedContinuation { continuation in
             let config = WKSnapshotConfiguration()
             config.rect = web.bounds
             config.afterScreenUpdates = afterScreenUpdates
-            let width = web.bounds.width * scale
-            if width > 1 {
-                config.snapshotWidth = NSNumber(value: Double(width))
-            }
             web.takeSnapshot(with: config) { image, _ in
                 continuation.resume(returning: image)
             }

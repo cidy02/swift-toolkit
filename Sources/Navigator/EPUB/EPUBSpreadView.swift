@@ -643,7 +643,7 @@ class EPUBSpreadView: UIView, Loggable, PageView {
     }
 
     /// Fixed layout: a double spread is two pages. Reflowable overrides this
-    /// with the CSS column count, which is what actually painted.
+    /// with the columns that fit, not the requested CSS count.
     func renderedColumnCount() async -> Int {
         if case .double = spread {
             return 2
