@@ -362,11 +362,36 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         )
         if (jsNeeds || offNeeds), curlDelta != 0 {
             await scrollByAwaitingPaint(curlDelta)
-            NSLog(
-                "T561d commit after off %.1f js %@",
-                scrollView.contentOffset.x,
-                (await columnScrollX()).map { String(format: "%.1f", $0) } ?? "nil"
-            )
+        }
+        // The flick's touch-end restoration lands after this function used to
+        // return: the column was on the next page here and on the old page
+        // by the time the cover lifted. Stay suppressed and put it back.
+        // 2026-11-19 log: commit off 804 target 804, screenshot unchanged.
+        if let target = curlTargetOffset, curlDelta != 0 {
+            let delta = curlDelta
+            let deadline = Date().addingTimeInterval(0.6)
+            while Date() < deadline {
+                try? await Task.sleep(seconds: 0.05)
+                let off = scrollView.contentOffset.x
+                let js = await columnScrollX()
+                let jsTarget = curlJSStart.map { $0 + delta }
+                let drifted = abs(off - target) > 2
+                    || (jsTarget != nil && js != nil && abs((js ?? 0) - (jsTarget ?? 0)) > 2)
+                if drifted {
+                    NSLog(
+                        "T561d restore off %.1f target %.1f js %@",
+                        off,
+                        target,
+                        js.map { String(format: "%.1f", $0) } ?? "nil"
+                    )
+                    // Only a full snap back to the start. A partial drift must
+                    // not `scrollBy` a whole column on top of where we are.
+                    let start = target - delta
+                    if abs(off - start) + 2 < abs(off - target) {
+                        await scrollByAwaitingPaint(delta)
+                    }
+                }
+            }
         }
         curlTargetOffset = nil
         curlJSStart = nil
