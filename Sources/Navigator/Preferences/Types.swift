@@ -59,6 +59,23 @@ public enum Fit: String, Codable, Hashable {
     case width
 }
 
+/// Animation used when turning pages in a paginated publication.
+///
+/// `curl` is part of the preference so a reader can store it. This revision
+/// does not render a curl; `PageTransitionPolicy.rendered` falls back until
+/// the renderer is wired. Changing the value never reloads the publication.
+public enum PageTransition: String, Codable, Hashable {
+    /// No animation. The page swaps instantly.
+    case none
+    /// Horizontal slide. This is the historical behaviour of
+    /// `NavigatorGoOptions.animated`.
+    case slide
+    /// Fast cross-dissolve between the outgoing page and the incoming page.
+    case fade
+    /// Tap and finger-tracked page curl.
+    case curl
+}
+
 /// Reader theme for reflowable documents.
 public enum Theme: String, Codable, Hashable {
     case light

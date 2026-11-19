@@ -15,6 +15,15 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
     private var topConstraint: NSLayoutConstraint!
     private var bottomConstraint: NSLayoutConstraint!
 
+    /// Read at each turn. The notification updates it and cuts short a smooth
+    /// scroll that was already running.
+    private var isReduceMotionEnabled = UIAccessibility.isReduceMotionEnabled
+
+    private var isSuppressingProgressionUpdates = false
+    /// Set when a hidden scroll changed the progression, so lifting the
+    /// suppression emits that one change and no earlier one.
+    private var progressionChangedWhileSuppressed = false
+
     private static let reflowableScript = loadScript(named: "readium-reflowable")
 
     required init(
@@ -47,6 +56,13 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
 
     override func setupWebView() {
         super.setupWebView()
+
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(reduceMotionStatusDidChange),
+            name: UIAccessibility.reduceMotionStatusDidChangeNotification,
+            object: nil
+        )
 
         scrollView.bounces = false
         // Since iOS 16, the default value of alwaysBounceX seems to be true
@@ -195,27 +211,112 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         // `contentOffset.x` is always non-negative. A relative displacement
         // (`offsetX`) is coordinate-system agnostic and works for both LTR and
         // RTL.
-        let behavior = options.animated ? "smooth" : "instant"
-        await evaluateScript("window.scrollBy({ left: \(offsetX), behavior: '\(behavior)' });")
+        let transition = PageTransitionPolicy.rendered(PageTransitionPolicy.resolve(
+            PageTransitionPolicy.Request(
+                preference: viewModel.settings.pageTransition,
+                animated: options.animated,
+                reduceMotion: isReduceMotionEnabled,
+                scrolls: false,
+                voiceOverRunning: UIAccessibility.isVoiceOverRunning,
+                resourceDistance: nil,
+                overrideRaw: options.pageTransitionOverride
+            )
+        ))
 
-        if options.animated {
-            // Waits for the scroll animation to finish.
-            await withCheckedContinuation { continuation in
-                let request = ScrollAnimationRequest(continuation)
-                pendingScrollAnimation?.resume()
-                pendingScrollAnimation = request
-
-                // Safety net in case `scrollDidEnd` never fires. The identity
-                // check on `request` ensures a stale timeout from a previous
-                // request does not resume a newer one.
-                Task { @MainActor in
-                    try? await Task.sleep(seconds: 0.8)
-                    scrollDidEnd(for: request)
-                }
-            }
+        switch transition {
+        case .fade:
+            await fade(by: offsetX)
+        case .slide, .curl:
+            await slide(by: offsetX)
+        case .none:
+            await evaluateScript("window.scrollBy({ left: \(offsetX), behavior: 'instant' });")
         }
 
         return true
+    }
+
+    /// WebKit smooth scroll. Progression is held until the scroll settles so
+    /// the turn reports one location.
+    private func slide(by offsetX: CGFloat) async {
+        setSuppressingProgressionUpdates(true)
+        await evaluateScript("window.scrollBy({ left: \(offsetX), behavior: 'smooth' });")
+        await waitForScrollAnimation()
+        setSuppressingProgressionUpdates(false)
+    }
+
+    /// Cross-dissolve. The outgoing page stays up, opaque, until the incoming
+    /// column has been scrolled to and painted. Not a fade through blank.
+    private func fade(by offsetX: CGFloat) async {
+        setSuppressingProgressionUpdates(true)
+        let cover = PageTransitionAnimator.makeCover(
+            of: self,
+            backgroundColor: viewModel.settings.effectiveBackgroundColor.uiColor
+        )
+        addSubview(cover)
+        await scrollByAwaitingPaint(offsetX)
+        await PageTransitionAnimator.fade(cover, to: 0, duration: PageTransitionAnimator.fadeDuration)
+        cover.removeFromSuperview()
+        setSuppressingProgressionUpdates(false)
+    }
+
+    private enum PaintScroll: Equatable {
+        /// `scrollBy` ran inside the script.
+        case painted
+        /// The script failed before it could be trusted to have scrolled.
+        case failed
+        /// The paint wait gave up. The script may still scroll; do not scroll again.
+        case timedOut
+    }
+
+    private func scrollByAwaitingPaint(_ offsetX: CGFloat) async {
+        let result: PaintScroll = await withCheckedContinuation { continuation in
+            let box = ReadyResumeBox(continuation)
+            Task { @MainActor [weak box] in
+                try? await Task.sleep(seconds: PageTransitionAnimator.paintTimeout)
+                box?.resume(returning: .timedOut)
+            }
+            Task { @MainActor [weak box] in
+                do {
+                    _ = try await webView.callAsyncJavaScript(
+                        """
+                        window.scrollBy({ left: offsetX, behavior: 'instant' });
+                        return await new Promise((resolve) => {
+                          requestAnimationFrame(() => {
+                            requestAnimationFrame(() => resolve(true));
+                          });
+                        });
+                        """,
+                        arguments: ["offsetX": offsetX],
+                        in: nil,
+                        contentWorld: .page
+                    )
+                    box?.resume(returning: .painted)
+                } catch {
+                    box?.resume(returning: .failed)
+                }
+            }
+        }
+        // A timeout must not scroll a second time: the script may already have
+        // moved by one page, and a fallback `scrollBy` would skip the next one.
+        if result == .failed {
+            await evaluateScript("window.scrollBy({ left: \(offsetX), behavior: 'instant' });")
+        }
+    }
+
+    private func waitForScrollAnimation() async {
+        await withCheckedContinuation { continuation in
+            let request = ScrollAnimationRequest(continuation)
+            pendingScrollAnimation?.resume()
+            pendingScrollAnimation = request
+
+            // Safety net in case `scrollDidEnd` never fires. The identity
+            // check on `request` ensures a stale timeout from a previous
+            // request does not resume a newer one.
+            Task { @MainActor in
+                try? await Task.sleep(seconds: 0.8)
+                scrollDidEnd(for: request)
+            }
+        }
     }
 
     private struct PendingLocation {
@@ -299,6 +400,13 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
                 log(.warning, "The locator's href is not in the spread")
                 return false
             }
+        }
+
+        // A seek that stays on the page already shown must not scroll and
+        // must not start a transition. Read Aloud asks for this on every
+        // utterance, including one that has not left the column.
+        if await isZeroDisplacement(to: locator) {
+            return true
         }
 
         if locator.text.highlight != nil {
@@ -390,6 +498,10 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         }
         progression = firstProgression ... lastProgression
 
+        if isSuppressingProgressionUpdates {
+            progressionChangedWhileSuppressed = true
+            return
+        }
         setNeedsNotifyPagesDidChange()
     }
 
@@ -434,6 +546,147 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
 
     override func scrollViewDidScroll(_ scrollView: UIScrollView) {
         super.scrollViewDidScroll(scrollView)
+        if isSuppressingProgressionUpdates {
+            return
+        }
         setNeedsNotifyPagesDidChange()
+    }
+
+    override func setSuppressingProgressionUpdates(_ suppressing: Bool) {
+        if suppressing {
+            progressionChangedWhileSuppressed = false
+            NSObject.cancelPreviousPerformRequests(withTarget: self, selector: #selector(notifyPagesDidChange), object: nil)
+            isSuppressingProgressionUpdates = true
+            setTransitioningDataset(true)
+            return
+        }
+
+        isSuppressingProgressionUpdates = false
+        setTransitioningDataset(false)
+        if progressionChangedWhileSuppressed {
+            progressionChangedWhileSuppressed = false
+            notifyPagesDidChange()
+        }
+    }
+
+    @objc private func reduceMotionStatusDidChange() {
+        isReduceMotionEnabled = UIAccessibility.isReduceMotionEnabled
+        if isReduceMotionEnabled {
+            scrollDidEnd()
+        }
+    }
+
+    /// Tells the host page (Kudos's page digit) that a hidden scroll is not a
+    /// user drag. The flag is a dataset attribute so it does not need a new
+    /// script bundle.
+    private func setTransitioningDataset(_ on: Bool) {
+        let script = on
+            ? "document.documentElement.dataset.readiumTransitioning = '1';"
+            : "delete document.documentElement.dataset.readiumTransitioning;"
+        webView.evaluateJavaScript(script, completionHandler: nil)
+    }
+
+    /// `true` when the locator's snapped column is the one already on screen.
+    /// Highlight snippets stay on the existing path: their target is a text
+    /// range the script layer finds, and measuring it here would fork that.
+    private func isZeroDisplacement(to locator: Locator) async -> Bool {
+        guard !viewModel.scroll, locator.text.highlight == nil else {
+            return false
+        }
+
+        let fragment = locator.locations.fragments.first { !$0.isEmpty }
+        let progression = locator.locations.progression
+        guard fragment != nil || progression != nil else {
+            return false
+        }
+
+        let measured: [String: Any]? = await withCheckedContinuation { continuation in
+            let box = ReadyResumeBox(continuation)
+            Task { @MainActor [weak box] in
+                try? await Task.sleep(seconds: PageTransitionAnimator.paintTimeout)
+                box?.resume(returning: nil)
+            }
+            Task { @MainActor [weak box] in
+                do {
+                    let value = try await webView.callAsyncJavaScript(
+                        """
+                        const style = getComputedStyle(document.documentElement);
+                        const rtl = style.direction === 'rtl' || style.writingMode === 'vertical-rl';
+                        const viewport = window.innerWidth || 0;
+                        const current = window.scrollX;
+                        if (elementId) {
+                          const el = document.getElementById(elementId);
+                          if (!el) return { ok: false };
+                          return {
+                            ok: true,
+                            kind: 'element',
+                            current: current,
+                            viewport: viewport,
+                            raw: el.getBoundingClientRect().left + current,
+                            rtl: rtl
+                          };
+                        }
+                        const scrolling = document.scrollingElement;
+                        return {
+                          ok: true,
+                          kind: 'progression',
+                          current: current,
+                          viewport: viewport,
+                          width: scrolling ? scrolling.scrollWidth : 0,
+                          rtl: rtl
+                        };
+                        """,
+                        arguments: [
+                            "elementId": fragment ?? "",
+                            "progression": progression ?? 0,
+                        ],
+                        in: nil,
+                        contentWorld: .page
+                    )
+                    box?.resume(returning: value as? [String: Any])
+                } catch {
+                    box?.resume(returning: nil)
+                }
+            }
+        }
+
+        guard
+            let measured,
+            (measured["ok"] as? Bool) == true,
+            let viewport = jsDouble(measured["viewport"]),
+            viewport > 0,
+            let current = jsDouble(measured["current"]),
+            let rtl = measured["rtl"] as? Bool
+        else {
+            return false
+        }
+
+        let target: Double
+        if (measured["kind"] as? String) == "element", let raw = jsDouble(measured["raw"]) {
+            target = PageDisplacement.snapOffset(raw, rtl: rtl, viewportWidth: viewport)
+        } else if let progression, let width = jsDouble(measured["width"]) {
+            target = PageDisplacement.progressionOffset(
+                progression: progression,
+                documentWidth: width,
+                rtl: rtl,
+                viewportWidth: viewport
+            )
+        } else {
+            return false
+        }
+        return PageDisplacement.isZero(current: current, target: target)
+    }
+
+    private func jsDouble(_ value: Any?) -> Double? {
+        switch value {
+        case let number as Double:
+            return number
+        case let number as Int:
+            return Double(number)
+        case let number as NSNumber:
+            return number.doubleValue
+        default:
+            return nil
+        }
     }
 }

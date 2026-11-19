@@ -25,6 +25,7 @@ public struct EPUBSettings: ConfigurableSettings {
     public var lineHeight: Double?
     public var offsetFirstPage: Bool?
     public var pageMargins: Double
+    public var pageTransition: PageTransition
     public var paragraphIndent: Double?
     public var paragraphSpacing: Double?
     public var publisherStyles: Bool
@@ -60,6 +61,7 @@ public struct EPUBSettings: ConfigurableSettings {
         lineHeight: Double?,
         offsetFirstPage: Bool?,
         pageMargins: Double,
+        pageTransition: PageTransition = .slide,
         paragraphIndent: Double?,
         paragraphSpacing: Double?,
         publisherStyles: Bool,
@@ -102,6 +104,7 @@ public struct EPUBSettings: ConfigurableSettings {
         self.verticalText = verticalText
         self.wordSpacing = wordSpacing
         cssLayout = CSSLayout(verticalText: verticalText, language: language, readingProgression: readingProgression)
+        self.pageTransition = pageTransition
     }
 
     init(preferences: EPUBPreferences, defaults: EPUBDefaults, metadata: Metadata) {
@@ -170,6 +173,9 @@ public struct EPUBSettings: ConfigurableSettings {
             pageMargins: preferences.pageMargins
                 ?? defaults.pageMargins
                 ?? 1.0,
+            pageTransition: preferences.pageTransition
+                ?? defaults.pageTransition
+                ?? .slide,
             paragraphIndent: preferences.paragraphIndent
                 ?? defaults.paragraphIndent,
             paragraphSpacing: preferences.paragraphSpacing
@@ -218,6 +224,7 @@ public struct EPUBDefaults {
     public var lineHeight: Double?
     public var offsetFirstPage: Bool?
     public var pageMargins: Double?
+    public var pageTransition: PageTransition?
     public var paragraphIndent: Double?
     public var paragraphSpacing: Double?
     public var publisherStyles: Bool?
@@ -242,6 +249,7 @@ public struct EPUBDefaults {
         lineHeight: Double? = nil,
         offsetFirstPage: Bool? = nil,
         pageMargins: Double? = nil,
+        pageTransition: PageTransition? = nil,
         paragraphIndent: Double? = nil,
         paragraphSpacing: Double? = nil,
         publisherStyles: Bool? = nil,
@@ -275,6 +283,7 @@ public struct EPUBDefaults {
         self.textNormalization = textNormalization
         self.typeScale = typeScale
         self.wordSpacing = wordSpacing
+        self.pageTransition = pageTransition
     }
 }
 

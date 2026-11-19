@@ -59,6 +59,13 @@ class EPUBSpreadView: UIView, Loggable, PageView {
     private var activityIndicatorStopWorkItem: DispatchWorkItem?
 
     private(set) var isSpreadLoaded = false
+
+    /// Set only after layout, decorations, `showSpread()` and one paint.
+    /// `isSpreadLoaded` flips earlier, before the spread has scrolled to its
+    /// target, which is too soon to reveal the page.
+    private(set) var isSpreadReadyForPresentation = false
+    private let onSpreadReadyCallbacks = CompletionList()
+
     private var spreadLoadTask: Task<Void, Never>?
 
     required init(
@@ -116,6 +123,9 @@ class EPUBSpreadView: UIView, Loggable, PageView {
 
         spreadLoadTask?.cancel()
         spreadLoadTask = nil
+        // A transition waiting on this spread must not sit out the timeout
+        // after the view has already gone away.
+        onSpreadReadyCallbacks.complete()
 
         // Disable JS messages to break WKUserContentController reference.
         disableJSMessages()
@@ -401,9 +411,20 @@ class EPUBSpreadView: UIView, Loggable, PageView {
             isSpreadLoaded = true
             applySettings()
             await spreadDidLoad()
+            guard !Task.isCancelled else {
+                return
+            }
             await delegate?.spreadViewDidLoad(self)
+            guard !Task.isCancelled else {
+                return
+            }
             onSpreadLoadedCallbacks.complete()
             showSpread()
+            await awaitNextPaint()
+            guard !Task.isCancelled else {
+                return
+            }
+            markSpreadReadyForPresentation()
         }
     }
 
@@ -422,6 +443,80 @@ class EPUBSpreadView: UIView, Loggable, PageView {
             whenSpreadLoaded {
                 continuation.resume()
             }
+        }
+    }
+
+    /// Awaits until the spread is safe to reveal, or `readinessTimeout`.
+    func spreadReadyForPresentation() async {
+        if isSpreadReadyForPresentation {
+            return
+        }
+
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            let box = ReadyResumeBox(continuation)
+            whenSpreadReady {
+                box.resume()
+            }
+            Task { @MainActor [weak box] in
+                try? await Task.sleep(seconds: PageTransitionAnimator.readinessTimeout)
+                box?.resume()
+            }
+        }
+    }
+
+    func readyForPresentation() async {
+        await spreadReadyForPresentation()
+    }
+
+    func setSuppressingProgressionUpdates(_ suppressing: Bool) {}
+
+    /// Double `requestAnimationFrame` so the next paint has committed.
+    /// A stalled web process resolves on `paintTimeout` instead of hanging.
+    func awaitNextPaint() async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            let box = ReadyResumeBox(continuation)
+            Task { @MainActor [weak box] in
+                try? await Task.sleep(seconds: PageTransitionAnimator.paintTimeout)
+                box?.resume()
+            }
+            Task { @MainActor [weak box] in
+                do {
+                    _ = try await webView.callAsyncJavaScript(
+                        """
+                        return await new Promise((resolve) => {
+                          requestAnimationFrame(() => {
+                            requestAnimationFrame(() => resolve(true));
+                          });
+                        });
+                        """,
+                        arguments: [:],
+                        in: nil,
+                        contentWorld: .page
+                    )
+                } catch {
+                    // A spread that cannot run script still has to unblock the turn.
+                }
+                box?.resume()
+            }
+        }
+    }
+
+    private func markSpreadReadyForPresentation() {
+        guard !isSpreadReadyForPresentation else {
+            return
+        }
+        isSpreadReadyForPresentation = true
+        onSpreadReadyCallbacks.complete()
+    }
+
+    private func whenSpreadReady(_ callback: @escaping () -> Void) {
+        if isSpreadReadyForPresentation {
+            callback()
+            return
+        }
+        let callback = onSpreadReadyCallbacks.add(callback)
+        if isSpreadReadyForPresentation {
+            callback()
         }
     }
 
@@ -683,6 +778,28 @@ extension EPUBSpreadView: UIScrollViewDelegate {
 
     func scrollViewDidScroll(_ scrollView: UIScrollView) {
         // Do not remove, overridden in subclasses.
+    }
+}
+
+/// Resumes a continuation exactly once. A paint and its timeout both hold
+/// the box, and either one may win.
+final class ReadyResumeBox<Success> {
+    private var continuation: CheckedContinuation<Success, Never>?
+
+    init(_ continuation: CheckedContinuation<Success, Never>) {
+        self.continuation = continuation
+    }
+
+    func resume(returning value: Success) {
+        let continuation = continuation
+        self.continuation = nil
+        continuation?.resume(returning: value)
+    }
+}
+
+extension ReadyResumeBox where Success == Void {
+    func resume() {
+        resume(returning: ())
     }
 }
 

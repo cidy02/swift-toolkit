@@ -61,6 +61,12 @@ public struct EPUBPreferences: ConfigurablePreferences {
     /// Factor applied to horizontal margins.
     public var pageMargins: Double?
 
+    /// Animation used when turning pages.
+    ///
+    /// Shared across publications. Only effective when `scroll` is off.
+    /// Changing it does not reload the web views or the CSS.
+    public var pageTransition: PageTransition?
+
     /// Text indentation for paragraphs.
     public var paragraphIndent: Double?
 
@@ -122,6 +128,7 @@ public struct EPUBPreferences: ConfigurablePreferences {
         lineHeight: Double? = nil,
         offsetFirstPage: Bool? = nil,
         pageMargins: Double? = nil,
+        pageTransition: PageTransition? = nil,
         paragraphIndent: Double? = nil,
         paragraphSpacing: Double? = nil,
         publisherStyles: Bool? = nil,
@@ -150,6 +157,7 @@ public struct EPUBPreferences: ConfigurablePreferences {
         self.lineHeight = lineHeight
         self.offsetFirstPage = offsetFirstPage
         self.pageMargins = pageMargins.map { max($0, 0) }
+        self.pageTransition = pageTransition
         self.paragraphIndent = paragraphIndent
         self.paragraphSpacing = paragraphSpacing.map { max($0, 0) }
         self.publisherStyles = publisherStyles
@@ -181,6 +189,7 @@ public struct EPUBPreferences: ConfigurablePreferences {
             lineHeight: other.lineHeight ?? lineHeight,
             offsetFirstPage: other.offsetFirstPage ?? offsetFirstPage,
             pageMargins: other.pageMargins ?? pageMargins,
+            pageTransition: other.pageTransition ?? pageTransition,
             paragraphIndent: other.paragraphIndent ?? paragraphIndent,
             paragraphSpacing: other.paragraphSpacing ?? paragraphSpacing,
             publisherStyles: other.publisherStyles ?? publisherStyles,

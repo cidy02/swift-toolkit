@@ -32,6 +32,25 @@ enum PageLocation: Equatable {
 protocol PageView {
     /// Moves the page to the given internal location.
     func go(to location: PageLocation, animated: Bool) async
+
+    /// Resolves once the page has been laid out and painted, or the readiness
+    /// timeout has elapsed.
+    func readyForPresentation() async
+
+    /// One more paint, used after a preloaded page moves on screen.
+    func awaitNextPaint() async
+
+    /// While true, the page must not emit a progression change. A transition
+    /// turns this on before scrolling under its cover and off once.
+    func setSuppressingProgressionUpdates(_ suppressing: Bool)
+}
+
+extension PageView {
+    func readyForPresentation() async {}
+
+    func awaitNextPaint() async {}
+
+    func setSuppressingProgressionUpdates(_ suppressing: Bool) {}
 }
 
 protocol PaginationViewDelegate: AnyObject {
@@ -97,6 +116,24 @@ final class PaginationView: UIView, Loggable {
     /// `layoutSubviews` from resetting `contentOffset` and interrupting the
     /// animation.
     private var isAnimatingContentOffset = false
+
+    /// Page-turn style for animated resource changes. The navigator updates
+    /// this from `EPUBSettings` without reloading the publication.
+    var pageTransition: PageTransition = .slide
+
+    /// Scroll mode has no page turns. The navigator mirrors `EPUBSettings.scroll`.
+    var scrolls = false
+
+    /// Composited behind a transition snapshot. The pagination view itself is clear.
+    var transitionBackgroundColor: UIColor = .white
+
+    /// While a turn is preparing, progression events from the page being
+    /// moved to are held and flushed once when the turn ends.
+    private var suppressProgressionDuringLoad = false
+
+    /// Completes when the current page (the first queued view) has moved to
+    /// its location. Preloads continue afterwards and do not block a turn.
+    private var firstPageLoad: Task<Void, Never>?
 
     /// Allows the scroll view to scroll.
     var isScrollEnabled: Bool {
@@ -174,6 +211,7 @@ final class PaginationView: UIView, Loggable {
 
         if window == nil {
             loadPagesTask.cancel()
+            firstPageLoad?.cancel()
         } else {
             loadPages()
         }
@@ -242,15 +280,26 @@ final class PaginationView: UIView, Loggable {
     }
 
     private func loadPages() {
+        firstPageLoad?.cancel()
+        let first = Task { @MainActor in
+            await self.loadOnePage()
+        }
+        firstPageLoad = first
         loadPagesTask.replace { @MainActor in
-            await loadNextPage()
-            delegate?.paginationViewDidUpdateViews(self)
+            await first.value
+            await self.loadRemainingPages()
+            self.delegate?.paginationViewDidUpdateViews(self)
         }
     }
 
     private var loadPagesTask: Task<Void, Never>?
 
-    private func loadNextPage() async {
+    /// Loads the next queued page. The current page is queued first, so one
+    /// call prepares the page a turn is about to reveal.
+    private func loadOnePage() async {
+        guard !Task.isCancelled else {
+            return
+        }
         guard let (index, location) = loadingIndexQueue.popFirst() else {
             return
         }
@@ -268,8 +317,19 @@ final class PaginationView: UIView, Loggable {
             return
         }
 
+        if suppressProgressionDuringLoad, index == currentIndex {
+            view.setSuppressingProgressionUpdates(true)
+        }
         await view.go(to: location, animated: false)
-        await loadNextPage()
+    }
+
+    private func loadRemainingPages() async {
+        while !loadingIndexQueue.isEmpty {
+            guard !Task.isCancelled else {
+                return
+            }
+            await loadOnePage()
+        }
     }
 
     /// Queue views to be loaded until reaching the given number of pre-loaded positions.
@@ -329,77 +389,146 @@ final class PaginationView: UIView, Loggable {
             return false
         }
 
-        let shouldAnimate = options.animated && !UIAccessibility.isReduceMotionEnabled
-
+        // A locator seek inside the current resource keeps the 3.9.0 path.
+        // Page transitions apply when the resource index changes.
         if currentIndex == index {
+            let shouldAnimate = options.animated && !UIAccessibility.isReduceMotionEnabled
             await scrollToView(at: index, location: location, animated: shouldAnimate)
-        } else if abs(currentIndex - index) == 1 {
-            await slideToView(at: index, location: location, animated: shouldAnimate)
-        } else {
-            await fadeToView(at: index, location: location, animated: shouldAnimate)
+            return true
+        }
+
+        let distance = abs(currentIndex - index)
+        let transition = PageTransitionPolicy.rendered(PageTransitionPolicy.resolve(
+            PageTransitionPolicy.Request(
+                preference: pageTransition,
+                animated: options.animated,
+                reduceMotion: UIAccessibility.isReduceMotionEnabled,
+                scrolls: scrolls,
+                voiceOverRunning: UIAccessibility.isVoiceOverRunning,
+                resourceDistance: distance,
+                overrideRaw: options.pageTransitionOverride
+            )
+        ))
+
+        switch (transition, distance) {
+        case (.fade, _):
+            await crossfadeToView(at: index, location: location)
+        case (.slide, 1), (.curl, 1):
+            await slideToView(at: index, location: location, animated: true)
+        case (.slide, _), (.curl, _):
+            // A jump keeps the historical dip. A curl across chapters is a
+            // fade before this switch; `.curl` here is only the unrendered
+            // fallback and is not reached for a jump.
+            await fadeToView(at: index, location: location, animated: true)
+        case (.none, 1):
+            await slideToView(at: index, location: location, animated: false)
+        case (.none, _):
+            await fadeToView(at: index, location: location, animated: false)
         }
         return true
     }
 
+    /// Moves to the neighbour resource. The outgoing page stays on screen,
+    /// opaque, until the incoming spread has loaded and painted.
     private func slideToView(at index: Int, location: PageLocation, animated: Bool) async {
-        let fromOffset = scrollView.contentOffset
-        let targetOffset = CGPoint(x: xOffsetForIndex(index), y: fromOffset.y)
-        let translationX = fromOffset.x - targetOffset.x
-
-        // We use a snapshot of the current view for two reasons:
+        // The snapshot covers the outgoing page for two reasons:
         //
         // 1. The current view might get flushed when calling
         //    `setCurrentIndex()`, but we want to keep it on the screen during
         //    the animation.
         // 2. A workaround for visual glitches, see https://github.com/readium/swift-toolkit/issues/737#issuecomment-4090386881
-        let snapshot = snapshotView(afterScreenUpdates: false)
-        if let snapshot {
-            snapshot.frame = bounds
-            addSubview(snapshot)
-        } else {
+        let cover = PageTransitionAnimator.makeCover(of: self, backgroundColor: transitionBackgroundColor)
+        if cover.subviews.isEmpty {
             log(.warning, "Could not take a snapshot before sliding to view at index \(index); page transition may flash")
         }
+        addSubview(cover)
 
         isAnimatingContentOffset = true
         scrollView.isScrollEnabled = false
+        suppressProgressionDuringLoad = true
 
         defer {
-            snapshot?.removeFromSuperview()
+            suppressProgressionDuringLoad = false
+            loadedViews[index]?.setSuppressingProgressionUpdates(false)
+            cover.removeFromSuperview()
             isAnimatingContentOffset = false
             scrollView.isScrollEnabled = isScrollEnabled
         }
 
+        let fromOffset = scrollView.contentOffset
         setCurrentIndex(index, location: location)
+        await preparePageInViewport(at: index, fromOffset: fromOffset)
 
-        scrollView.contentOffset = fromOffset
-
-        if animated {
-            await animate(duration: 0.3) {
-                snapshot?.transform = CGAffineTransform(translationX: translationX, y: 0)
-                self.scrollView.contentOffset = targetOffset
-            }
-        } else {
-            scrollView.contentOffset = targetOffset
+        guard animated else {
+            // There are visual glitches when scrolling web views into view.
+            // To prevent these, we wait a few ms before removing the snapshot.
+            // See https://github.com/readium/swift-toolkit/issues/737#issuecomment-4090386881
+            try? await Task.sleep(seconds: 0.1)
+            return
         }
 
-        // There are visual glitches when scrolling web views into view.
-        // To prevent these, we wait a few ms before removing the snapshot.
-        // See https://github.com/readium/swift-toolkit/issues/737#issuecomment-4090386881
-        if !animated {
-            try? await Task.sleep(seconds: 0.1)
+        let targetOffset = scrollView.contentOffset
+        scrollView.contentOffset = fromOffset
+        let translationX = fromOffset.x - targetOffset.x
+        await animate(duration: PageTransitionAnimator.slideDuration) {
+            cover.transform = CGAffineTransform(translationX: translationX, y: 0)
+            self.scrollView.contentOffset = targetOffset
         }
     }
 
-    private func fadeToView(at index: Int, location: PageLocation, animated: Bool) async {
-        func fade(to alpha: CGFloat) async {
-            await animate(duration: animated ? 0.15 : 0) {
-                self.alpha = alpha
-            }
+    /// Fast fade: the outgoing page dissolves onto the incoming page.
+    /// The pagination view does not dip to transparent in between.
+    private func crossfadeToView(at index: Int, location: PageLocation) async {
+        let cover = PageTransitionAnimator.makeCover(of: self, backgroundColor: transitionBackgroundColor)
+        addSubview(cover)
+
+        isAnimatingContentOffset = true
+        scrollView.isScrollEnabled = false
+        suppressProgressionDuringLoad = true
+
+        defer {
+            suppressProgressionDuringLoad = false
+            loadedViews[index]?.setSuppressingProgressionUpdates(false)
+            cover.removeFromSuperview()
+            isAnimatingContentOffset = false
+            scrollView.isScrollEnabled = isScrollEnabled
         }
 
-        await fade(to: 0)
+        let fromOffset = scrollView.contentOffset
+        setCurrentIndex(index, location: location)
+        await preparePageInViewport(at: index, fromOffset: fromOffset)
+        await PageTransitionAnimator.fade(cover, to: 0, duration: PageTransitionAnimator.fadeDuration)
+    }
+
+    /// Historical jump: fade the whole pagination view out, move, fade in.
+    /// The move waits until the target spread is ready, so the fade-in is not
+    /// a blank or half-laid-out page.
+    private func fadeToView(at index: Int, location: PageLocation, animated: Bool) async {
+        suppressProgressionDuringLoad = true
+        defer {
+            suppressProgressionDuringLoad = false
+            loadedViews[index]?.setSuppressingProgressionUpdates(false)
+        }
+
+        let duration = animated ? 0.15 : 0
+        await animate(duration: duration) {
+            self.alpha = 0
+        }
         await scrollToView(at: index, location: location, animated: false)
-        await fade(to: 1)
+        await preparePageInViewport(at: index, fromOffset: scrollView.contentOffset)
+        await animate(duration: duration) {
+            self.alpha = 1
+        }
+    }
+
+    /// Loads the page at `index`, scrolls it into the viewport under whatever
+    /// cover is up, and waits until it has painted there.
+    private func preparePageInViewport(at index: Int, fromOffset: CGPoint) async {
+        await firstPageLoad?.value
+        layoutIfNeeded()
+        scrollView.contentOffset = CGPoint(x: xOffsetForIndex(index), y: fromOffset.y)
+        await loadedViews[index]?.readyForPresentation()
+        await loadedViews[index]?.awaitNextPaint()
     }
 
     private func scrollToView(at index: Int, location: PageLocation, animated: Bool) async {

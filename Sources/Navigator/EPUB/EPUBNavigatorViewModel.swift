@@ -220,6 +220,8 @@ enum EPUBScriptScope {
         settings = newSettings
         updateSpread()
 
+        // `pageTransition` is absent on purpose. It does not change layout or
+        // CSS, so the navigator applies it live in `applySettings()`.
         let needsInvalidation: Bool =
             oldSettings.readingProgression != newSettings.readingProgression
                 || oldSettings.language != newSettings.language

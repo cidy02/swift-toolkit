@@ -922,6 +922,9 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
         view.backgroundColor = settings.effectiveBackgroundColor.uiColor
         paginationView?.isScrollEnabled = isPaginationViewScrollingEnabled
+        paginationView?.pageTransition = settings.pageTransition
+        paginationView?.scrolls = settings.scroll
+        paginationView?.transitionBackgroundColor = settings.effectiveBackgroundColor.uiColor
     }
 
     // MARK: - EPUB-specific extensions

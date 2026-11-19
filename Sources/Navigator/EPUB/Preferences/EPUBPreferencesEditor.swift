@@ -6,6 +6,7 @@
 
 import Foundation
 import ReadiumShared
+import UIKit
 
 /// Editor for a set of `EPUBPreferences`.
 ///
@@ -258,6 +259,24 @@ public final class EPUBPreferencesEditor: StatefulPreferencesEditor<EPUBPreferen
             supportedRange: 0.0 ... 4.0,
             progressionStrategy: .increment(0.3),
             format: { $0.formatDecimal(maximumFractionDigits: 5) }
+        )
+
+    /// Animation used when turning pages.
+    ///
+    /// Only effective when the publication is paginated. Vertical text forces
+    /// scroll mode, and VoiceOver does too, so the preference is inactive then.
+    public lazy var pageTransition: AnyEnumPreference<PageTransition> =
+        enumPreference(
+            preference: \.pageTransition,
+            setting: \.pageTransition,
+            defaultEffectiveValue: defaults.pageTransition ?? .slide,
+            isEffective: {
+                PageTransitionPolicy.isEffective(
+                    scroll: $0.settings.scroll,
+                    voiceOverRunning: UIAccessibility.isVoiceOverRunning
+                )
+            },
+            supportedValues: [.none, .slide, .fade, .curl]
         )
 
     /// Text indentation for paragraphs.
