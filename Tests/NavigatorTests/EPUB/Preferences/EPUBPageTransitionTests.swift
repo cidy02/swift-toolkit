@@ -142,8 +142,8 @@ class EPUBPageTransitionTests: XCTestCase {
         XCTAssertEqual(resolve(animated: false, overrideRaw: "fade"), .none)
     }
 
-    func testCurlIsDeclaredButRendersAsASlide() {
-        XCTAssertEqual(PageTransitionPolicy.rendered(.curl), .slide)
+    func testCurlRendersAsACurl() {
+        XCTAssertEqual(PageTransitionPolicy.rendered(.curl), .curl)
         XCTAssertEqual(PageTransitionPolicy.rendered(.fade), .fade)
         XCTAssertEqual(PageTransitionPolicy.rendered(.none), .none)
         XCTAssertEqual(PageTransitionPolicy.rendered(.slide), .slide)

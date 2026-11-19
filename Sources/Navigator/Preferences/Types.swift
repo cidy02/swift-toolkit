@@ -61,9 +61,9 @@ public enum Fit: String, Codable, Hashable {
 
 /// Animation used when turning pages in a paginated publication.
 ///
-/// `curl` is part of the preference so a reader can store it. This revision
-/// does not render a curl; `PageTransitionPolicy.rendered` falls back until
-/// the renderer is wired. Changing the value never reloads the publication.
+/// `curl` is the Metal cylinder curl (a tap, or a finger in a later revision).
+/// A jump of more than one resource resolves to a fade before the renderer
+/// runs. Changing the value never reloads the publication.
 public enum PageTransition: String, Codable, Hashable {
     /// No animation. The page swaps instantly.
     case none

@@ -43,6 +43,10 @@ protocol PageView {
     /// While true, the page must not emit a progression change. A transition
     /// turns this on before scrolling under its cover and off once.
     func setSuppressingProgressionUpdates(_ suppressing: Bool)
+
+    /// Columns actually on screen. 2 selects the centre spine; 1 stays an
+    /// edge curl so a single column is never sliced down the middle.
+    func renderedColumnCount() async -> Int
 }
 
 extension PageView {
@@ -51,6 +55,8 @@ extension PageView {
     func awaitNextPaint() async {}
 
     func setSuppressingProgressionUpdates(_ suppressing: Bool) {}
+
+    func renderedColumnCount() async -> Int { 1 }
 }
 
 protocol PaginationViewDelegate: AnyObject {
@@ -413,19 +419,78 @@ final class PaginationView: UIView, Loggable {
         switch (transition, distance) {
         case (.fade, _):
             await crossfadeToView(at: index, location: location)
-        case (.slide, 1), (.curl, 1):
+        case (.curl, 1):
+            await curlToView(at: index, location: location)
+        case (.slide, 1):
             await slideToView(at: index, location: location, animated: true)
-        case (.slide, _), (.curl, _):
+        case (.slide, _):
             // A jump keeps the historical dip. A curl across chapters is a
-            // fade before this switch; `.curl` here is only the unrendered
-            // fallback and is not reached for a jump.
+            // fade before this switch.
             await fadeToView(at: index, location: location, animated: true)
         case (.none, 1):
             await slideToView(at: index, location: location, animated: false)
-        case (.none, _):
+        case (.none, _), (.curl, _):
             await fadeToView(at: index, location: location, animated: false)
         }
         return true
+    }
+
+    /// Neighbour resource. The outgoing leaf stays up, opaque, until the
+    /// incoming spread has loaded and painted, then the cylinder runs.
+    private func curlToView(at index: Int, location: PageLocation) async {
+        let source = loadedViews[currentIndex] ?? self
+        let background = transitionBackgroundColor
+        guard let outgoing = await PageCurlSnapshotter.capture(of: source, backgroundColor: background) else {
+            await slideToView(at: index, location: location, animated: true)
+            return
+        }
+
+        let columns: Int
+        if let page = loadedViews[currentIndex] {
+            columns = await page.renderedColumnCount()
+        } else {
+            columns = 1
+        }
+        let rtl = readingProgression == .rtl
+        let forward = index > currentIndex
+        let spine = PageCurlGeometry.animationSpine(
+            renderedColumns: columns,
+            rtl: rtl,
+            forward: forward,
+            divisionNormalizedX: nil
+        )
+        let curl = PageCurlView(frame: bounds)
+        curl.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        curl.showCover(outgoing, background: background)
+        addSubview(curl)
+
+        isAnimatingContentOffset = true
+        scrollView.isScrollEnabled = false
+        suppressProgressionDuringLoad = true
+
+        defer {
+            suppressProgressionDuringLoad = false
+            loadedViews[index]?.setSuppressingProgressionUpdates(false)
+            curl.releaseResources()
+            curl.removeFromSuperview()
+            isAnimatingContentOffset = false
+            scrollView.isScrollEnabled = isScrollEnabled
+        }
+
+        let fromOffset = scrollView.contentOffset
+        setCurrentIndex(index, location: location)
+        await preparePageInViewport(at: index, fromOffset: fromOffset)
+        let incoming = await PageCurlSnapshotter.capture(
+            of: loadedViews[index] ?? self,
+            backgroundColor: background
+        ) ?? outgoing
+        await curl.runTap(
+            outgoing: outgoing,
+            incoming: incoming,
+            spine: spine,
+            peelSign: PageCurlGeometry.peelSign(spine: spine, rtl: rtl, forward: forward),
+            realVerso: columns >= 2
+        )
     }
 
     /// Moves to the neighbour resource. The outgoing page stays on screen,

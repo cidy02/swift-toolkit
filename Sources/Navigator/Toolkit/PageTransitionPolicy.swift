@@ -48,18 +48,10 @@ enum PageTransitionPolicy {
         return requested
     }
 
-    /// What this revision can paint.
-    ///
-    /// `.curl` falls back to a slide. The curl renderer replaces this arm;
-    /// `resolve` already turns a non-adjacent curl into a fade, so that
-    /// downgrade does not live here.
+    /// What this revision can paint. `.curl` is the cylinder renderer.
+    /// `resolve` already turns a non-adjacent curl into a fade.
     static func rendered(_ transition: PageTransition) -> PageTransition {
-        switch transition {
-        case .curl:
-            return .slide
-        case .none, .slide, .fade:
-            return transition
-        }
+        transition
     }
 
     /// The preference is inactive while the publication scrolls, including

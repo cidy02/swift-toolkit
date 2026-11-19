@@ -636,6 +636,15 @@ class EPUBSpreadView: UIView, Loggable, PageView {
         false
     }
 
+    /// Fixed layout: a double spread is two pages. Reflowable overrides this
+    /// with the CSS column count, which is what actually painted.
+    func renderedColumnCount() async -> Int {
+        if case .double = spread {
+            return 2
+        }
+        return 1
+    }
+
     func findFirstVisibleElementLocator() async -> Locator? {
         let result = await evaluateScript("readium.findFirstVisibleLocator()")
         do {

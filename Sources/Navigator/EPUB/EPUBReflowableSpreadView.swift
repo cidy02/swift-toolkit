@@ -226,13 +226,87 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         switch transition {
         case .fade:
             await fade(by: offsetX)
-        case .slide, .curl:
+        case .curl:
+            await curl(by: offsetX, direction: direction)
+        case .slide:
             await slide(by: offsetX)
         case .none:
             await evaluateScript("window.scrollBy({ left: \(offsetX), behavior: 'instant' });")
         }
 
         return true
+    }
+
+    /// Cylinder curl. The outgoing bitmap is up before the column scrolls.
+    /// The incoming bitmap is taken after the paint wait, then the leaf lifts.
+    /// Progression stays suppressed until the leaf is gone, so the scroll
+    /// reports one location.
+    private func curl(by offsetX: CGFloat, direction: Direction) async {
+        setSuppressingProgressionUpdates(true)
+        let background = viewModel.settings.effectiveBackgroundColor.uiColor
+        guard let outgoing = await PageCurlSnapshotter.capture(of: self, backgroundColor: background) else {
+            setSuppressingProgressionUpdates(false)
+            await slide(by: offsetX)
+            return
+        }
+
+        let columns = await renderedColumnCount()
+        let rtl = viewModel.readingProgression == .rtl
+        let forward = isForward(direction)
+        let spine = PageCurlGeometry.animationSpine(
+            renderedColumns: columns,
+            rtl: rtl,
+            forward: forward,
+            divisionNormalizedX: nil
+        )
+        let curlView = PageCurlView(frame: bounds)
+        curlView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        curlView.showCover(outgoing, background: background)
+        addSubview(curlView)
+        defer {
+            curlView.releaseResources()
+            curlView.removeFromSuperview()
+            setSuppressingProgressionUpdates(false)
+        }
+
+        await scrollByAwaitingPaint(offsetX)
+        let incoming = await PageCurlSnapshotter.capture(of: self, backgroundColor: background) ?? outgoing
+        await curlView.runTap(
+            outgoing: outgoing,
+            incoming: incoming,
+            spine: spine,
+            peelSign: PageCurlGeometry.peelSign(spine: spine, rtl: rtl, forward: forward),
+            realVerso: columns >= 2
+        )
+    }
+
+    /// LTR forward is `.right` (`goForward`). RTL forward is `.left`.
+    private func isForward(_ direction: Direction) -> Bool {
+        let rtl = viewModel.readingProgression == .rtl
+        switch direction {
+        case .right:
+            return !rtl
+        case .left:
+            return rtl
+        }
+    }
+
+    /// CSS `column-count` on the root, which is what Readium actually painted.
+    /// A fixed double spread is already 2. One column stays an edge curl.
+    override func renderedColumnCount() async -> Int {
+        if case .double = spread {
+            return 2
+        }
+        let result = await evaluateScript(
+            "(function(){ var n = parseInt(getComputedStyle(document.documentElement).columnCount, 10); return (isNaN(n) || n < 1) ? 1 : n; })()"
+        )
+        guard case let .success(value) = result else {
+            return 1
+        }
+        if let number = value as? NSNumber {
+            return max(1, number.intValue)
+        }
+        return 1
     }
 
     /// WebKit smooth scroll. Progression is held until the scroll settles so
