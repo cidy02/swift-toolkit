@@ -299,17 +299,21 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
         phase = .finishing
         let width = delegate?.curlPanHostView()?.bounds.width ?? 1
         let progressVelocity = width > 1 ? velocity / width : 0
+        // A load during the spring sets `aborted`. The release already chose.
+        // Re-reading the flag after the spring turned a finished curl into a
+        // cancel, and the page under the cover was the one the finger left.
+        let willCommit = commit && !aborted
         if metalArmed, let curlView {
             // A cancel does not carry a forward flick: that velocity already lost
             // the commit test, and keeping it would drag the page the wrong way.
             await curlView.finishInteractive(
-                target: commit ? 1 : 0,
-                progressVelocity: commit ? progressVelocity : min(0, progressVelocity)
+                target: willCommit ? 1 : 0,
+                progressVelocity: willCommit ? progressVelocity : min(0, progressVelocity)
             )
-        } else if commit, let curlView {
+        } else if willCommit, let curlView {
             await fadeOut(curlView)
         }
-        if commit, !aborted {
+        if willCommit {
             await delegate?.curlPanCommit(direction: direction, withinResource: withinResource)
         } else if revealed {
             await delegate?.curlPanCancel(direction: direction, withinResource: withinResource)

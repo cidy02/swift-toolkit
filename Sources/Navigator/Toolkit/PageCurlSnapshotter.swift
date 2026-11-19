@@ -12,7 +12,11 @@ import WebKit
 /// A transparent grab would let the page underneath show through the leaf.
 @MainActor
 enum PageCurlSnapshotter {
-    static func capture(of view: UIView, backgroundColor: UIColor) async -> UIImage? {
+    static func capture(
+        of view: UIView,
+        backgroundColor: UIColor,
+        afterScreenUpdates: Bool = true
+    ) async -> UIImage? {
         let bounds = view.bounds
         guard bounds.width > 1, bounds.height > 1 else {
             return nil
@@ -26,7 +30,7 @@ enum PageCurlSnapshotter {
 
         let webs = webViews(in: view)
         if webs.count == 1, let web = webs.first, web.bounds.width > 1, web.bounds.height > 1,
-           let shot = await takeSnapshot(of: web, scale: scale)
+           let shot = await takeSnapshot(of: web, scale: scale, afterScreenUpdates: afterScreenUpdates)
         {
             let frame = web.convert(web.bounds, to: view)
             return renderer.image { context in
@@ -47,11 +51,15 @@ enum PageCurlSnapshotter {
         return image
     }
 
-    private static func takeSnapshot(of web: WKWebView, scale: CGFloat) async -> UIImage? {
+    private static func takeSnapshot(
+        of web: WKWebView,
+        scale: CGFloat,
+        afterScreenUpdates: Bool
+    ) async -> UIImage? {
         await withCheckedContinuation { continuation in
             let config = WKSnapshotConfiguration()
             config.rect = web.bounds
-            config.afterScreenUpdates = true
+            config.afterScreenUpdates = afterScreenUpdates
             let width = web.bounds.width * scale
             if width > 1 {
                 config.snapshotWidth = NSNumber(value: Double(width))
