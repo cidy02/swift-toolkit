@@ -112,14 +112,10 @@ enum PageCurlShader {
             return float4(flat, 1.0);
         }
 
+        // `finger` is already within reach of the spine
+        // (PageCurlGeometry.attachedHeldPoint), so the bisector never crosses it.
         float2 N = delta / len;
         float2 M = (p0 + finger) * 0.5;
-        float sTop = dot(float2(u.spineX, 0.0) - M, N);
-        float sBot = dot(float2(u.spineX, pageH) - M, N);
-        float minS = min(sTop, sBot);
-        if (minS < 0.0) {
-            M += N * minS;
-        }
 
         float R = max(u.radius, 0.0);
         float s = dot(iso - M, N);

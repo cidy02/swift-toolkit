@@ -20,6 +20,10 @@ struct PageCurlPanSample: Equatable {
     var velocityY: CGFloat
     var locationX: CGFloat
     var locationY: CGFloat
+    /// Where this touch went down, when it was seen. The pan is recognised
+    /// late (it waits for the text long-press to fail), so `location -
+    /// translation` is about 50 pt inside the real touch-down.
+    var touchDownX: CGFloat? = nil
 }
 
 struct PageCurlPanContext: Equatable {
@@ -119,7 +123,8 @@ enum PageCurlPanStateMachine {
 
         // Recognition happens after the finger has already moved, so the bezel
         // test uses where the touch went down, not where it is now.
-        let startX = finite(sample.locationX) - finite(sample.translationX)
+        let startX = sample.touchDownX.flatMap { $0.isFinite ? $0 : nil }
+            ?? finite(sample.locationX) - finite(sample.translationX)
         if isDismissBezel(locationX: startX, forward: forward, context: context) {
             return .rejectBezel
         }
@@ -172,14 +177,6 @@ enum PageCurlPanStateMachine {
         return velocityX * turnScreenSign(forward: forward, rtl: rtl)
     }
 
-    /// 0 is the top of the page, 1 is the bottom. Mid-page is a vertical axis.
-    static func touchY(locationY: CGFloat, height: CGFloat) -> CGFloat {
-        guard height > 1, locationY.isFinite else {
-            return 0.5
-        }
-        return min(1, max(0, locationY / height))
-    }
-
     /// Mean of the last three samples. A one-frame spike does not commit a short drag.
     static func smoothedVelocity(_ samples: [CGFloat]) -> CGFloat {
         let recent = samples.suffix(3).filter(\.isFinite)
@@ -226,20 +223,22 @@ enum PageCurlPanStateMachine {
     /// long-press to fail), and `location - translation` at `.began` was about
     /// 50 pt inside the real touch-down on a slow drag, so the leaf trailed the
     /// finger by that much. The touch-down, when it was seen, is the origin.
+    /// The recorded touch-down is only this drag's if it belongs to the touch
+    /// that is moving: no second finger came down after it, and it has not
+    /// lifted. A resting thumb's touch-down pinned a later finger's drag at
+    /// progress 0, or committed a short nudge.
+    static func touchDown(_ point: CGPoint?, sawAnotherTouch: Bool, touchEnded: Bool) -> CGPoint? {
+        guard let point, !sawAnotherTouch, !touchEnded else {
+            return nil
+        }
+        return point
+    }
+
     static func grabOrigin(touchDown: CGPoint?, location: CGPoint, translation: CGPoint) -> CGPoint {
         if let touchDown, touchDown.x.isFinite, touchDown.y.isFinite {
             return touchDown
         }
         return CGPoint(x: location.x - translation.x, y: location.y - translation.y)
-    }
-
-    /// Once the gesture has reset to `.possible`, its location is the origin.
-    /// The arm uses the touch stored while the finger was down.
-    static func touchYForArm(gestureSettled: Bool, liveTouchY: CGFloat, storedTouchY: CGFloat) -> CGFloat {
-        if gestureSettled {
-            return storedTouchY
-        }
-        return liveTouchY.isFinite ? liveTouchY : storedTouchY
     }
 
     static func projectedProgress(progress: CGFloat, turnVelocity: CGFloat, width: CGFloat) -> CGFloat {

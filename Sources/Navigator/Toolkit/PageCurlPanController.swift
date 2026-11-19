@@ -69,8 +69,11 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
     /// peeling edge. `.possible` reports the origin, so a settled gesture
     /// keeps the last point from `.began` / `.changed` / `.ended`.
     private var grabStart = CGPoint(x: 0, y: 0)
-    /// First touch of the current sequence, recorded before the pan begins.
+    /// First touch of the current sequence, recorded before the pan begins,
+    /// and that touch. A second finger makes the origin ambiguous.
     private var touchDown: CGPoint?
+    private weak var touchDownTouch: UITouch?
+    private var sawAnotherTouch = false
     private var lastFinger = CGPoint(x: 0, y: 0)
     /// Reading direction for this drag. Sampled once so a move does not rebuild
     /// the pan context on every touch.
@@ -94,12 +97,6 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
 
     func attach(to view: UIView) {
         view.addGestureRecognizer(recognizer)
-    }
-
-    /// True while a finger curl is preparing or tracking. A commit spring that
-    /// has already started is not a drag: a posture change leaves that release.
-    var dragInFlight: Bool {
-        phase == .preparing || phase == .armed
     }
 
     /// True from the first touch until the cover is gone, including the spring.
@@ -167,10 +164,23 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
     /// Records the touch-down. The pan's own translation starts where it was
     /// recognised, not where the finger landed.
     func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
-        if gestureRecognizer.numberOfTouches == 0, phase == .idle, let view = gestureRecognizer.view {
+        guard phase == .idle, let view = gestureRecognizer.view else {
+            return true
+        }
+        if gestureRecognizer.numberOfTouches == 0 {
             touchDown = touch.location(in: view)
+            touchDownTouch = touch
+            sawAnotherTouch = false
+        } else if touch !== touchDownTouch {
+            sawAnotherTouch = true
         }
         return true
+    }
+
+    /// The recorded touch-down, if it is still the one touch on the page.
+    private func currentTouchDown() -> CGPoint? {
+        let ended = touchDownTouch.map { $0.phase == .ended || $0.phase == .cancelled } ?? true
+        return PageCurlPanStateMachine.touchDown(touchDown, sawAnotherTouch: sawAnotherTouch, touchEnded: ended)
     }
 
     func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
@@ -228,11 +238,12 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
         if let host = gesture.view {
             rtl = delegate.curlPanContext(in: host).rtl
             grabStart = PageCurlPanStateMachine.grabOrigin(
-                touchDown: touchDown,
+                touchDown: currentTouchDown(),
                 location: gesture.location(in: host),
                 translation: gesture.translation(in: host)
             )
             touchDown = nil
+            touchDownTouch = nil
             let finger = fingerState(of: gesture, in: host)
             lastFinger = finger.point
             lastProgress = finger.progress
@@ -463,7 +474,8 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
             velocityX: velocity.x,
             velocityY: velocity.y,
             locationX: location.x,
-            locationY: location.y
+            locationY: location.y,
+            touchDownX: currentTouchDown()?.x
         )
     }
 

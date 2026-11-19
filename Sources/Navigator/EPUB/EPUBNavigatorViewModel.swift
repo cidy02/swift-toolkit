@@ -370,38 +370,31 @@ enum EPUBScriptScope {
         }
     }
 
-    /// Keys this navigator adds and must remove again. Omitting a key from
-    /// `setCSSProperties` leaves the previous inline value in place.
-    private static let removableRSKeys = ["--RS__colCount", "--RS__colWidth", "--RS__foldInset"]
+    /// A group that changed is sent whole. A nil value, or a key the new
+    /// group no longer has (a removed override), goes as JSON null, which
+    /// `setProperty` turns into `removeProperty`. Omitting it leaves the old
+    /// inline value on `:root`: Light kept `readium-night-on`, Justify off
+    /// kept `justify`.
+    static func cssPropertiesChange(from previous: ReadiumCSS, to new: ReadiumCSS) -> [String: Any] {
+        var properties: [String: Any] = [:]
+        func merge(_ old: [String: String?], _ current: [String: String?]) {
+            guard old != current else {
+                return
+            }
+            for (key, value) in current {
+                properties[key] = value ?? NSNull()
+            }
+            for key in old.keys where current[key] == nil {
+                properties[key] = NSNull()
+            }
+        }
+        merge(previous.rsProperties.cssProperties(), new.rsProperties.cssProperties())
+        merge(previous.userProperties.cssProperties(), new.userProperties.cssProperties())
+        return properties
+    }
 
     private func commitCSSChange(from previous: ReadiumCSS, to new: ReadiumCSS) {
-        var properties: [String: Any] = [:]
-        let rsProperties = new.rsProperties.cssProperties()
-        let previousRS = previous.rsProperties.cssProperties()
-        if previousRS != rsProperties {
-            for (k, v) in rsProperties {
-                if let v {
-                    properties[k] = v
-                }
-            }
-            // `putCSS` stores a nil value, so the key is still present. A
-            // missing entry does not remove an inline property; JSON null does.
-            for key in Self.removableRSKeys {
-                let had = previousRS[key].flatMap { $0 } != nil
-                let has = rsProperties[key].flatMap { $0 } != nil
-                if had, !has {
-                    properties[key] = NSNull()
-                }
-            }
-        }
-        let userProperties = new.userProperties.cssProperties()
-        if previous.userProperties.cssProperties() != userProperties {
-            for (k, v) in userProperties {
-                if let v {
-                    properties[k] = v
-                }
-            }
-        }
+        let properties = Self.cssPropertiesChange(from: previous, to: new)
         if !properties.isEmpty {
             guard
                 let data = try? JSONSerialization.data(withJSONObject: properties),
@@ -424,8 +417,18 @@ enum EPUBScriptScope {
     /// a single column does not open a gap at the hinge.
     private var requestedFoldClearance: CGFloat = 0
 
-    func foldColumnGapWouldChange(_ points: CGFloat?) -> Bool {
-        foldInsetToken(normalizedClearance(points)) != currentFoldInset()
+    /// Records the clearance whatever the column count, and says whether the
+    /// inset on screen would change. The fold reports once per posture; a
+    /// report that arrives while the book is still one column (opening in
+    /// the Book pose, the hinge beating the preference, Scroll to Paged) is
+    /// the one the later `.two` needs.
+    func noteFoldClearance(_ points: CGFloat?) -> Bool {
+        requestedFoldClearance = normalizedClearance(points)
+        return foldInsetNeedsCommit
+    }
+
+    var foldInsetNeedsCommit: Bool {
+        foldInsetToken(requestedFoldClearance) != currentFoldInset()
     }
 
     /// Writes `--RS__foldInset` when the crease changes. Returns false when
@@ -470,7 +473,7 @@ enum EPUBScriptScope {
     /// a simulator with no hinge can still measure the stride.
     private func foldInsetToken(_ clearance: CGFloat) -> String? {
         let forced = PageCurlDebug.foldClearanceOverride
-        guard settings.columnCount == .two || forced != nil else {
+        guard ReadiumCSS.takesExplicitColumns(settings), settings.columnCount == .two || forced != nil else {
             return nil
         }
         return PageCurlGeometry.foldInsetLength(clearance: forced ?? clearance)

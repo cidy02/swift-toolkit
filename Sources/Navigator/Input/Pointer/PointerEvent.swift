@@ -199,3 +199,40 @@ extension PointerEvent {
         }
     }
 }
+
+/// Pointer sequences the observers saw start and have not seen end. The web
+/// view drops a pointer's up when it lands on a decoration, and a reload
+/// drops it with the page, so the observers can wait forever on a down. When
+/// the navigator leaves idle (a turn, a load, a jump) each open sequence is
+/// ended with a cancel.
+struct OpenPointerSequences {
+    private var open: [AnyHashable: PointerEvent] = [:]
+
+    var isEmpty: Bool {
+        open.isEmpty
+    }
+
+    mutating func note(_ event: PointerEvent) {
+        switch event.phase {
+        case .down:
+            open[event.pointer.id] = event
+        case .move:
+            if open[event.pointer.id] != nil {
+                open[event.pointer.id] = event
+            }
+        case .up, .cancel:
+            open.removeValue(forKey: event.pointer.id)
+        }
+    }
+
+    /// One cancel per open sequence, and forgets them.
+    mutating func cancelAll() -> [PointerEvent] {
+        let events = open.values.map { event -> PointerEvent in
+            var cancel = event
+            cancel.phase = .cancel
+            return cancel
+        }
+        open.removeAll()
+        return events
+    }
+}

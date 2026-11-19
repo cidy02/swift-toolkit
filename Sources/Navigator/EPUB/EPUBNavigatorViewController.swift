@@ -576,6 +576,12 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         }
         let visible = await view.findFirstVisibleElementLocator()
         guard view === paginationView?.currentView, !reflowPosition.isHolding else {
+            // The tap curl cancelled above kept its suppression for a hold
+            // this call no longer takes.
+            if view !== paginationView?.currentView {
+                view.releaseCurlCancelSuppression()
+            }
+            releaseCurlSuppressionIfIdle()
             return
         }
         let locator = visible ?? reflowPosition.resolvedAnchor(on: view, fallback: currentLocation)
@@ -590,7 +596,16 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             log(.debug, "-> on \(event)")
         }
 
+        let wasIdle = state == .idle
         let accepted = state.transition(event)
+        if accepted, wasIdle, state != .idle, !openPointers.isEmpty {
+            let cancels = openPointers.cancelAll()
+            Task {
+                for cancel in cancels {
+                    _ = await inputObservers.didReceive(cancel)
+                }
+            }
+        }
         if accepted {
             switch anchorNavigation(for: event) {
             case .load, .jump:
@@ -706,6 +721,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     private var curlSessionGeneration: UInt = 0
     private weak var curlSessionSpread: EPUBSpreadView?
     private let reflowPosition = ReflowPositionKeeper()
+    private var openPointers = OpenPointerSequences()
 
     private func makePaginationView(hasPositions: Bool) -> PaginationView {
         let view = PaginationView(
@@ -1339,6 +1355,7 @@ extension EPUBNavigatorViewController: EPUBSpreadViewDelegate {
         guard let delivered else {
             return
         }
+        openPointers.note(delivered)
         Task {
             var event = delivered
             event.location = view.convert(event.location, from: spreadView)
@@ -1573,7 +1590,7 @@ extension EPUBNavigatorViewController: PaginationViewDelegate {
         if curlPan?.turnInFlight == true {
             await curlPan?.abortDrag()
         }
-        guard viewModel.foldColumnGapWouldChange(points) else {
+        guard viewModel.noteFoldClearance(points) else {
             releaseCurlSuppressionIfIdle()
             return
         }
@@ -1583,7 +1600,7 @@ extension EPUBNavigatorViewController: PaginationViewDelegate {
         {
             let visible = await spread.findFirstVisibleElementLocator()
             guard spread === paginationView?.currentView,
-                  viewModel.foldColumnGapWouldChange(points),
+                  viewModel.foldInsetNeedsCommit,
                   !reflowPosition.isHolding
             else {
                 releaseCurlSuppressionIfIdle()
@@ -1752,6 +1769,12 @@ extension EPUBNavigatorViewController: PageCurlPanDelegate {
             return
         }
         await (curlSessionSpread as? EPUBReflowableSpreadView)?.revertCurlIncoming()
+        // The revert clears progression suppression. A posture or size change
+        // that aborted this drag has already taken its hold, and the relayout
+        // it is about to run must stay suppressed.
+        if let spread = curlSessionSpread {
+            reflowPosition.reassertSuppression(on: spread)
+        }
     }
 
     func curlPanDidFinish() {

@@ -136,6 +136,14 @@ final class ReflowPositionKeeper {
         }
     }
 
+    /// A curl cancel cleared the spread's suppression after this hold took it.
+    func reassertSuppression(on spread: EPUBSpreadView) {
+        guard machine.isHolding, self.spread === spread else {
+            return
+        }
+        spread.setSuppressingProgressionUpdates(true)
+    }
+
     func cancelForNavigation() {
         guard machine.isHolding else {
             return

@@ -8,10 +8,13 @@ import Foundation
 import os
 
 /// Page-curl geometry lines. Off unless the process was launched with
-/// `-ReadiumCurlDebug YES`. The navigator and the host app share a process,
-/// so the host does not forward the flag.
+/// `-ReadiumCurlDebug YES`, and compiled out of release builds. The navigator
+/// and the host app share a process, so the host does not forward the flag.
 enum PageCurlDebug {
     static let enabled: Bool = {
+        #if !DEBUG
+            return false
+        #endif
         let args = ProcessInfo.processInfo.arguments
         guard let index = args.firstIndex(of: "-ReadiumCurlDebug"), index + 1 < args.count else {
             return false

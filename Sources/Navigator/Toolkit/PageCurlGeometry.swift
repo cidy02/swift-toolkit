@@ -111,9 +111,10 @@ struct PageCurlGrabFold: Equatable {
 enum PageCurlGeometry {
     /// Tap-curl length. A finger drag does not use this.
     static let tapDuration: TimeInterval = 0.38
-    /// Where a tap's corner finishes, as a fraction of the page height from the top.
-    /// The corner starts at the bottom and rises as it crosses.
-    static let tapLift: CGFloat = 0.36
+    /// Height of a tap's arc, as a fraction of the leaf (and at most of the
+    /// page). The corner rises and comes back down onto the mirror of where
+    /// it started, so the turn ends with the fold on the spine.
+    static let tapArc: CGFloat = 0.5
     /// Peak cylinder radius as a fraction of view width, at progress 0.5.
     /// The roll on screen is `2 * radius` wide, so 0.10 is a fifth of the page
     /// at mid-turn. 0.07 read as a thin band rather than a paper roll.
@@ -189,9 +190,10 @@ enum PageCurlGeometry {
         return CGPoint(x: x, y: y / safeAspect)
     }
 
-    /// Synthetic grab for a tap. P0 is the lower outer corner. P moves toward
-    /// the mirror of that corner across the spine, and up, so the fold is the
-    /// diagonal a corner peel makes. Progress 0 is flat (P = P0).
+    /// Synthetic grab for a tap. P0 is the lower outer corner. P travels to
+    /// the mirror of that corner across the spine along an arc, so the fold
+    /// starts as the diagonal of a corner peel and lands on the spine.
+    /// Progress 0 is flat (P = P0).
     static func tapGrab(
         progress: CGFloat,
         spineX: CGFloat,
@@ -204,45 +206,121 @@ enum PageCurlGeometry {
         let height = max(pageHeight.isFinite ? pageHeight : 1, 0.05)
         let spine = spineX.isFinite ? spineX : 0
         let p0 = CGPoint(x: spine + sign * leaf, y: height)
-        let landing = CGPoint(x: spine - sign * leaf, y: height * tapLift)
-        let p = mix(p0, landing, clampProgress(progress))
-        return (p0, p)
+        let t = clampProgress(progress)
+        let lift = tapArc * min(leaf, height) * sin(t * .pi)
+        let across = spine - sign * leaf
+        return (p0, CGPoint(x: p0.x + (across - p0.x) * t, y: p0.y - lift))
     }
 
-    /// Where the held point should finish on a commit, continuing the drag's
-    /// own direction until it has crossed the spine. A straight drag stays at
-    /// its height. A corner drag keeps its diagonal.
+    /// Where the held point finishes on a commit: the mirror of P0 across
+    /// the spine, so the fold lies on the spine and the leaf is flat on the
+    /// other side. The spring travels there from wherever the drag left P,
+    /// so a corner drag's diagonal relaxes as the page lands instead of
+    /// stopping short of the spine.
     static func commitLanding(
         p0: CGPoint,
-        p: CGPoint,
+        spineX: CGFloat,
+        peelSign: CGFloat,
+        span: CGFloat
+    ) -> CGPoint {
+        let sign: CGFloat = peelSign >= 0 ? 1 : -1
+        let leaf = max(span.isFinite ? span : 1, 0.05)
+        let spine = spineX.isFinite ? spineX : 0
+        return CGPoint(x: spine - sign * leaf, y: p0.y.isFinite ? p0.y : 0)
+    }
+
+    /// One page going back plays the forward curl from landed to flat.
+    /// `shown` is that forward progress (1 at the start of the drag). x runs
+    /// from the mirror back to P0; the finger's vertical movement tilts the
+    /// leaf the way it would tilt a forward drag, faded out at both ends so
+    /// the start does not pop a wedge in at the spine.
+    static func reversedGrab(
+        p0: CGPoint,
+        fingerDY: CGFloat,
+        shown: CGFloat,
         spineX: CGFloat,
         peelSign: CGFloat,
         span: CGFloat,
         pageHeight: CGFloat
     ) -> CGPoint {
-        let sign: CGFloat = peelSign >= 0 ? 1 : -1
-        let leaf = max(span.isFinite ? span : 1, 0.05)
-        let spine = spineX.isFinite ? spineX : 0
-        let across = spine - sign * leaf
+        let across = commitLanding(p0: p0, spineX: spineX, peelSign: peelSign, span: span)
+        let t = clampProgress(shown)
         let height = max(pageHeight.isFinite ? pageHeight : 1, 0.05)
-        let xDelta = p.x - p0.x
-        let travelX = across - p0.x
-        if !xDelta.isFinite || !travelX.isFinite || abs(xDelta) < 0.02 || abs(travelX) < 0.02 {
-            return CGPoint(x: across, y: height * tapLift)
-        }
-        let scale = travelX / xDelta
-        var y = p0.y + (p.y - p0.y) * scale
-        if !y.isFinite {
-            y = height * tapLift
-        }
         let pad = height * 0.35
-        y = min(height + pad, max(-pad, y))
-        return CGPoint(x: across, y: y)
+        let dy = min(pad, max(-pad, fingerDY.isFinite ? fingerDY : 0)) * sin(t * .pi)
+        return CGPoint(x: p0.x + (across.x - p0.x) * t, y: p0.y + dy)
     }
 
-    /// Perpendicular bisector of P0→P, then pushed so the spine segment stays
-    /// on the unturned side. The cylinder axis is that line offset by `radius`
-    /// toward the finger. Nil when the finger has not moved.
+    /// Commit or cancel spring for a finger curl. A quadratic through
+    /// `control`: the midpoint is a straight line, the finger's own point
+    /// (a flick released before the leaf caught up) keeps the drag's angle.
+    static func springGrab(from: CGPoint, control: CGPoint, to: CGPoint, u: CGFloat) -> CGPoint {
+        let t = min(1, max(0, u.isFinite ? u : 1))
+        let a = (1 - t) * (1 - t)
+        let b = 2 * t * (1 - t)
+        let c = t * t
+        return CGPoint(
+            x: a * from.x + b * control.x + c * to.x,
+            y: a * from.y + b * control.y + c * to.y
+        )
+    }
+
+    /// The held point, kept where a leaf attached along the whole spine can
+    /// reach. Paper does not stretch, so P stays within |P0 − S| of each spine
+    /// end S (that is also exactly when the bisector leaves both ends on the
+    /// unturned side). Inside both disks P is unchanged; outside, it is the
+    /// nearest point of their intersection. That moves continuously, so the
+    /// fold keeps rotating instead of sliding to a stop.
+    static func attachedHeldPoint(
+        p0: CGPoint,
+        p: CGPoint,
+        spineX: CGFloat,
+        pageHeight: CGFloat
+    ) -> CGPoint {
+        guard p.x.isFinite, p.y.isFinite, p0.x.isFinite, p0.y.isFinite else {
+            return p
+        }
+        let height = max(pageHeight.isFinite ? pageHeight : 1, 0.05)
+        let spine = spineX.isFinite ? spineX : 0
+        let top = CGPoint(x: spine, y: 0)
+        let bottom = CGPoint(x: spine, y: height)
+        func distance(_ a: CGPoint, _ b: CGPoint) -> CGFloat {
+            hypot(a.x - b.x, a.y - b.y)
+        }
+        let rTop = distance(p0, top)
+        let rBottom = distance(p0, bottom)
+        let slack: CGFloat = 1e-9
+        func inside(_ q: CGPoint) -> Bool {
+            distance(q, top) <= rTop + slack && distance(q, bottom) <= rBottom + slack
+        }
+        if inside(p) {
+            return p
+        }
+        func project(_ q: CGPoint, onto center: CGPoint, radius: CGFloat) -> CGPoint {
+            let d = distance(q, center)
+            guard d > radius, d > 0 else {
+                return q
+            }
+            return CGPoint(x: center.x + (q.x - center.x) * radius / d, y: center.y + (q.y - center.y) * radius / d)
+        }
+        let candidates = [
+            project(p, onto: top, radius: rTop),
+            project(p, onto: bottom, radius: rBottom),
+        ].filter { inside($0) }
+        if let best = candidates.min(by: { distance($0, p) < distance($1, p) }) {
+            return best
+        }
+        // Both limits bind: a corner of the lens, on the circles' common chord.
+        let y = (rTop * rTop - rBottom * rBottom + height * height) / (2 * height)
+        let h = max(rTop * rTop - y * y, 0).squareRoot()
+        let right = CGPoint(x: spine + h, y: y)
+        let left = CGPoint(x: spine - h, y: y)
+        return distance(right, p) <= distance(left, p) ? right : left
+    }
+
+    /// Perpendicular bisector of P0→P, with P first kept within reach of the
+    /// spine (`attachedHeldPoint`). The cylinder axis is that line offset by
+    /// `radius` toward the finger. Nil when the finger has not moved.
     static func grabFold(
         p0: CGPoint,
         p: CGPoint,
@@ -250,8 +328,14 @@ enum PageCurlGeometry {
         spineX: CGFloat,
         pageHeight: CGFloat
     ) -> PageCurlGrabFold? {
-        let dx = p.x - p0.x
-        let dy = p.y - p0.y
+        guard p.x.isFinite, p.y.isFinite else {
+            return nil
+        }
+        let height = pageHeight.isFinite ? pageHeight : 1
+        let spine = spineX.isFinite ? spineX : 0
+        let held = attachedHeldPoint(p0: p0, p: p, spineX: spine, pageHeight: height)
+        let dx = held.x - p0.x
+        let dy = held.y - p0.y
         guard dx.isFinite, dy.isFinite else {
             return nil
         }
@@ -261,25 +345,15 @@ enum PageCurlGeometry {
         }
         let nx = dx / len
         let ny = dy / len
-        var mx = (p0.x + p.x) * 0.5
-        var my = (p0.y + p.y) * 0.5
-        let height = pageHeight.isFinite ? pageHeight : 1
-        let spine = spineX.isFinite ? spineX : 0
-        let sTop = (spine - mx) * nx + (0 - my) * ny
-        let sBot = (spine - mx) * nx + (height - my) * ny
-        let minS = min(sTop, sBot)
-        let clamped = minS < 0
-        if clamped {
-            mx += nx * minS
-            my += ny * minS
-        }
+        let mx = (p0.x + held.x) * 0.5
+        let my = (p0.y + held.y) * 0.5
         let r = max(radius.isFinite ? radius : 0, 0)
         return PageCurlGrabFold(
             point: CGPoint(x: mx, y: my),
             normal: CGPoint(x: nx, y: ny),
             axis: CGPoint(x: mx + nx * r, y: my + ny * r),
             radius: r,
-            clamped: clamped
+            clamped: hypot(held.x - p.x, held.y - p.y) > 1e-6
         )
     }
 

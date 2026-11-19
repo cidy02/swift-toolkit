@@ -84,4 +84,33 @@ class PointerBusyDeliveryTests: XCTestCase {
         await deliver(event(2, .up), busy: false, to: observer)
         XCTAssertEqual(taps, 1)
     }
+
+    /// The web view drops an up that lands on a decoration (and a reload drops
+    /// it with the page). Leaving idle ends every open sequence with a cancel,
+    /// so the next tap still activates.
+    func testLeavingIdleEndsSequencesWhoseUpNeverCame() async {
+        var taps = 0
+        let observer = tapObserver { taps += 1 }
+        var open = OpenPointerSequences()
+        for e in [event(1, .down, x: 388), event(1, .move, x: 360)] {
+            open.note(e)
+            _ = await observer.didReceive(e)
+        }
+        // The turn starts; the up is never posted.
+        let cancels = open.cancelAll()
+        XCTAssertEqual(cancels.map(\.phase), [.cancel])
+        XCTAssertEqual(cancels.first?.pointer.id, AnyHashable(1))
+        for c in cancels {
+            _ = await observer.didReceive(c)
+        }
+        XCTAssertTrue(open.isEmpty)
+        _ = await observer.didReceive(event(2, .down, x: 28))
+        _ = await observer.didReceive(event(2, .up, x: 28))
+        XCTAssertEqual(taps, 1)
+        // A finished sequence and a hover move are not open.
+        open.note(event(3, .down))
+        open.note(event(3, .up))
+        open.note(event(4, .move))
+        XCTAssertTrue(open.cancelAll().isEmpty)
+    }
 }

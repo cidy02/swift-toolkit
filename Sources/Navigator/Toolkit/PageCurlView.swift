@@ -39,6 +39,7 @@ final class PageCurlView: UIView {
     /// Isotropic finger positions captured when the spring starts.
     private var springPFrom = CGPoint(x: 1, y: 1)
     private var springPTo = CGPoint(x: 1, y: 1)
+    private var springPControl = CGPoint(x: 1, y: 1)
 
     /// Finger position while a drag is in flight. The display link reads it.
     private var fingerProgress: CGFloat = 0
@@ -343,16 +344,13 @@ final class PageCurlView: UIView {
         springStart = CACurrentMediaTime()
         let aspect = pageAspect()
         let leaf = PageCurlGeometry.span(spine: spine, peelSign: peelSign)
-        let pageH = 1 / max(aspect, 0.05)
         let grab = liveGrab(span: leaf, aspect: aspect)
         springPFrom = grab.p
         let landing = PageCurlGeometry.commitLanding(
             p0: grab.p0,
-            p: grab.p,
             spineX: spine.normalizedX,
             peelSign: peelSign,
-            span: leaf,
-            pageHeight: pageH
+            span: leaf
         )
         // A reversed drag is the forward curl run backwards: committing it
         // closes onto the previous page (P returns to the held point).
@@ -360,6 +358,14 @@ final class PageCurlView: UIView {
             springPTo = target >= 0.5 ? grab.p0 : landing
         } else {
             springPTo = target >= 0.5 ? landing : grab.p0
+        }
+        // Released before the leaf caught the finger (a flick that ended while
+        // the snapshot was taken): bend the path through the finger, or the
+        // drag's angle is lost and the turn plays as a straight peel.
+        if interactivePhase == .catchUp, !reversed {
+            springPControl = fingerAim(p0: grab.p0, aspect: aspect)
+        } else {
+            springPControl = PageCurlGeometry.mix(springPFrom, springPTo, 0.5)
         }
         interactivePhase = .spring
         if abs(progress - target) < 0.004, abs(velocity) < 0.02 {
@@ -431,7 +437,14 @@ final class PageCurlView: UIView {
         let shown = shownProgress
         let radius = PageCurlGeometry.cylinderRadius(progress: shown, span: span)
         let aspect = pageAspect(of: metal)
-        let grab = liveGrab(span: span, aspect: aspect)
+        let live = liveGrab(span: span, aspect: aspect)
+        let held = PageCurlGeometry.attachedHeldPoint(
+            p0: live.p0,
+            p: live.p,
+            spineX: spine.normalizedX,
+            pageHeight: 1 / max(aspect, 0.05)
+        )
+        let grab = (p0: live.p0, p: held)
         return PageCurlUniforms(
             progress: Float(shown),
             spineX: Float(spine.normalizedX),
@@ -500,28 +513,35 @@ final class PageCurlView: UIView {
             } else {
                 u = min(1, max(0, (progress - springFrom) / denom))
             }
-            return (p0, PageCurlGeometry.mix(springPFrom, springPTo, u))
+            return (p0, PageCurlGeometry.springGrab(from: springPFrom, control: springPControl, to: springPTo, u: u))
         }
-        let origin = PageCurlGeometry.fingerPoint(touchUV: grabUV, aspect: aspect)
-        let finger = PageCurlGeometry.fingerPoint(touchUV: fingerUV, aspect: aspect)
-        var aim = CGPoint(x: p0.x + (finger.x - origin.x), y: p0.y + (finger.y - origin.y))
+        if reversed {
+            let origin = PageCurlGeometry.fingerPoint(touchUV: grabUV, aspect: aspect)
+            let finger = PageCurlGeometry.fingerPoint(touchUV: fingerUV, aspect: aspect)
+            return (p0, PageCurlGeometry.reversedGrab(
+                p0: p0,
+                fingerDY: finger.y - origin.y,
+                shown: shownProgress,
+                spineX: spineX,
+                peelSign: peelSign,
+                span: span,
+                pageHeight: pageH
+            ))
+        }
+        var aim = fingerAim(p0: p0, aspect: aspect)
         if interactivePhase == .catchUp {
             let denom = max(fingerProgress, 0.0001)
             let u = min(1, max(0, progress / denom))
             aim = PageCurlGeometry.mix(p0, aim, u)
         }
-        guard reversed else {
-            return (p0, aim)
-        }
-        let landing = PageCurlGeometry.commitLanding(
-            p0: p0,
-            p: aim,
-            spineX: spineX,
-            peelSign: peelSign,
-            span: span,
-            pageHeight: pageH
-        )
-        return (p0, PageCurlGeometry.mix(p0, landing, shownProgress))
+        return (p0, aim)
+    }
+
+    /// The held point moved by the finger's travel since the touch-down.
+    private func fingerAim(p0: CGPoint, aspect: CGFloat) -> CGPoint {
+        let origin = PageCurlGeometry.fingerPoint(touchUV: grabUV, aspect: aspect)
+        let finger = PageCurlGeometry.fingerPoint(touchUV: fingerUV, aspect: aspect)
+        return CGPoint(x: p0.x + (finger.x - origin.x), y: p0.y + (finger.y - origin.y))
     }
 
     /// Visual progress. A reversed one-page turn runs the forward curl from

@@ -662,21 +662,26 @@ class PageCurlGeometryTests: XCTestCase {
         XCTAssertLessThan(spine - 0.50, 0)
     }
 
-    func testCommitLandingKeepsAStraightDragLevel() {
-        let p0 = CGPoint(x: 1, y: 1.2)
-        let p = CGPoint(x: 0.6, y: 1.2)
-        let landing = PageCurlGeometry.commitLanding(
-            p0: p0, p: p, spineX: 0, peelSign: 1, span: 1, pageHeight: 2
+    func testCommitLandsOnTheMirrorOfTheHeldPoint() {
+        let straight = PageCurlGeometry.commitLanding(
+            p0: CGPoint(x: 1, y: 1.2), spineX: 0, peelSign: 1, span: 1
         )
-        XCTAssertEqual(landing.x, -1, accuracy: 0.0001)
-        XCTAssertEqual(landing.y, 1.2, accuracy: 0.0001)
+        XCTAssertEqual(straight.x, -1, accuracy: 0.0001)
+        XCTAssertEqual(straight.y, 1.2, accuracy: 0.0001)
+        // A corner lands flat too: the fold is on the spine at the end.
         let corner = PageCurlGeometry.commitLanding(
-            p0: CGPoint(x: 1, y: 2),
-            p: CGPoint(x: 0.5, y: 1.4),
-            spineX: 0, peelSign: 1, span: 1, pageHeight: 2
+            p0: CGPoint(x: 1, y: 2), spineX: 0, peelSign: 1, span: 1
         )
         XCTAssertEqual(corner.x, -1, accuracy: 0.0001)
-        XCTAssertLessThan(corner.y, 2)
+        XCTAssertEqual(corner.y, 2, accuracy: 0.0001)
+        let fold = tryGrab(p0: CGPoint(x: 1, y: 2), p: corner, radius: 0.01, spineX: 0, pageHeight: 2)
+        XCTAssertEqual(fold.point.x, 0, accuracy: 0.0001)
+        XCTAssertEqual(fold.normal.y, 0, accuracy: 0.0001)
+        // Two pages: the mirror across the centre spine.
+        let spread = PageCurlGeometry.commitLanding(
+            p0: CGPoint(x: 1, y: 0.4), spineX: 0.5, peelSign: 1, span: 0.5
+        )
+        XCTAssertEqual(spread.x, 0, accuracy: 0.0001)
     }
 
     func testColumnCorrectionScrollsToTheAbsoluteTarget() {
@@ -689,7 +694,7 @@ class PageCurlGeometryTests: XCTestCase {
         XCTAssertEqual(PageCurlGeometry.curlColumnCorrection(offset: 1170, target: 783), -387, accuracy: 0.001)
     }
 
-    /// T-561g. The back is the paper, darker only next to the fold. On a
+    /// The back is the paper, darker only next to the fold. On a
     /// mid-edge drag of 0.5 view widths the flap is 0.25 wide; all but the
     /// band next to the fold is the paper itself.
     func testBackIsPaperAwayFromTheFold() {
@@ -713,7 +718,7 @@ class PageCurlGeometryTests: XCTestCase {
         XCTAssertFalse(source.contains("0.74, 0.98"))
     }
 
-    /// T-561g. A mid-edge drag: the moved edge lands on P, the fold is the
+    /// A mid-edge drag: the moved edge lands on P, the fold is the
     /// midpoint, so the flap is half the finger's travel wide.
     func testMidEdgeFlapIsHalfTheTravel() {
         let p0 = CGPoint(x: 1, y: 1)

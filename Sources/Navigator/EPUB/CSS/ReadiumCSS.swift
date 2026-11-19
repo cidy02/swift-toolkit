@@ -15,6 +15,8 @@ struct ReadiumCSS {
     /// Set when this struct forced `--RS__colCount: 2`. Cleared with the
     /// override, so a host-supplied count is left alone.
     var explicitTwoColumns = false
+    /// The host's own count and width, put back when two columns end.
+    var hostColumns: (count: CSSColCount?, width: String??) = (nil, nil)
 
     /// Base URL of the Readium CSS assets.
     var baseURL: any AbsoluteURL
@@ -74,7 +76,14 @@ extension ReadiumCSS {
                     ?? "",
             ]
         )
-        applyExplicitColumnCount(settings.columnCount)
+        applyExplicitColumnCount(Self.takesExplicitColumns(settings) ? settings.columnCount : .auto)
+    }
+
+    /// Paged horizontal text only. Vertical text pages by rows (its stylesheet
+    /// fixes one `100vh` column) and scroll is one column, so neither takes
+    /// the forced count or the fold inset.
+    static func takesExplicitColumns(_ settings: EPUBSettings) -> Bool {
+        !settings.scroll && !settings.verticalText
     }
 
     /// `--USER__colCount: 2` is applied by the stylesheet only inside
@@ -86,6 +95,9 @@ extension ReadiumCSS {
     mutating func applyExplicitColumnCount(_ count: ColumnCount) {
         switch count {
         case .two:
+            if !explicitTwoColumns {
+                hostColumns = (rsProperties.colCount, rsProperties.overrides["--RS__colWidth"])
+            }
             rsProperties.colCount = .two
             rsProperties.overrides["--RS__colWidth"] = "auto"
             explicitTwoColumns = true
@@ -93,8 +105,13 @@ extension ReadiumCSS {
             guard explicitTwoColumns else {
                 return
             }
-            rsProperties.colCount = nil
-            rsProperties.overrides.removeValue(forKey: "--RS__colWidth")
+            rsProperties.colCount = hostColumns.count
+            if let width = hostColumns.width {
+                rsProperties.overrides["--RS__colWidth"] = width
+            } else {
+                rsProperties.overrides.removeValue(forKey: "--RS__colWidth")
+            }
+            hostColumns = (nil, nil)
             explicitTwoColumns = false
         }
     }

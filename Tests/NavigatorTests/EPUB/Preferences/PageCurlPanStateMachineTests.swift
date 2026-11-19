@@ -117,7 +117,7 @@ class PageCurlPanStateMachineTests: XCTestCase {
         )
     }
 
-    /// T-561g. The leaf is anchored where the finger landed, not where the
+    /// The leaf is anchored where the finger landed, not where the
     /// pan was recognised (about 50 pt later on a slow drag).
     func testGrabOriginIsTheTouchDown() {
         let origin = PageCurlPanStateMachine.grabOrigin(
@@ -349,14 +349,7 @@ class PageCurlPanStateMachineTests: XCTestCase {
         )
     }
 
-    func testTouchYAndSmoothedVelocity() {
-        XCTAssertEqual(PageCurlPanStateMachine.touchY(locationY: 0, height: 800), 0, accuracy: 0.001)
-        XCTAssertEqual(PageCurlPanStateMachine.touchY(locationY: 800, height: 800), 1, accuracy: 0.001)
-        XCTAssertEqual(PageCurlPanStateMachine.touchY(locationY: 400, height: 800), 0.5, accuracy: 0.001)
-        XCTAssertEqual(PageCurlPanStateMachine.touchY(locationY: -20, height: 800), 0, accuracy: 0.001)
-        XCTAssertEqual(PageCurlPanStateMachine.touchY(locationY: 900, height: 800), 1, accuracy: 0.001)
-        XCTAssertEqual(PageCurlPanStateMachine.touchY(locationY: .nan, height: 800), 0.5, accuracy: 0.001)
-
+    func testSmoothedVelocity() {
         XCTAssertEqual(PageCurlPanStateMachine.smoothedVelocity([100, 200, 300]), 200, accuracy: 0.001)
         XCTAssertEqual(PageCurlPanStateMachine.smoothedVelocity([10, 100, 200, 300]), 200, accuracy: 0.001)
         XCTAssertEqual(PageCurlPanStateMachine.smoothedVelocity([40]), 40, accuracy: 0.001)
@@ -393,17 +386,6 @@ class PageCurlPanStateMachineTests: XCTestCase {
                 cancelled: false
             ),
             .cancel
-        )
-        // The gesture has reset. A live reading of 0 is the origin, not the finger.
-        XCTAssertEqual(
-            PageCurlPanStateMachine.touchYForArm(gestureSettled: true, liveTouchY: 0, storedTouchY: 0.85),
-            0.85,
-            accuracy: 0.0001
-        )
-        XCTAssertEqual(
-            PageCurlPanStateMachine.touchYForArm(gestureSettled: false, liveTouchY: 0.85, storedTouchY: 0.2),
-            0.85,
-            accuracy: 0.0001
         )
     }
 
@@ -463,5 +445,27 @@ class PageCurlPanStateMachineTests: XCTestCase {
         XCTAssertGreaterThan(fast, 0.12)
         XCTAssertLessThan(fast, 0.24)
         XCTAssertLessThan(fast, slow)
+    }
+
+    /// A slow back swipe from 10 pt is recognised about 50 pt later. The
+    /// bezel test must use the touch-down, or the curl steals the dismiss.
+    func testBezelUsesTheTouchDownNotTheLateOrigin() {
+        let late = PageCurlPanSample(
+            translationX: 51, translationY: 0, velocityX: 0, velocityY: 0,
+            locationX: 112, locationY: 400, touchDownX: 10
+        )
+        XCTAssertEqual(PageCurlPanStateMachine.shouldBegin(sample: late, context: context()), .rejectBezel)
+        var unknown = late
+        unknown.touchDownX = nil
+        XCTAssertEqual(PageCurlPanStateMachine.shouldBegin(sample: unknown, context: context()), .track(.backward))
+    }
+
+    /// A resting thumb's touch-down is not the origin of another finger's drag.
+    func testTouchDownBelongsToTheMovingTouch() {
+        let thumb = CGPoint(x: 20, y: 700)
+        XCTAssertEqual(PageCurlPanStateMachine.touchDown(thumb, sawAnotherTouch: false, touchEnded: false), thumb)
+        XCTAssertNil(PageCurlPanStateMachine.touchDown(thumb, sawAnotherTouch: true, touchEnded: false))
+        XCTAssertNil(PageCurlPanStateMachine.touchDown(thumb, sawAnotherTouch: false, touchEnded: true))
+        XCTAssertNil(PageCurlPanStateMachine.touchDown(nil, sawAnotherTouch: false, touchEnded: false))
     }
 }
