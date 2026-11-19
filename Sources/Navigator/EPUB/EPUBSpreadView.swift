@@ -62,9 +62,15 @@ class EPUBSpreadView: UIView, Loggable, PageView {
 
     /// Set only after layout, decorations, `showSpread()` and one paint.
     /// `isSpreadLoaded` flips earlier, before the spread has scrolled to its
-    /// target, which is too soon to reveal the page.
+    /// target, which is too soon to reveal the page. Cleared when this view
+    /// loads again or relays out, so the next turn waits for the new layout.
     private(set) var isSpreadReadyForPresentation = false
     private let onSpreadReadyCallbacks = CompletionList()
+    /// Paint after a CSS or size change. Cancelled when a new load starts.
+    private var presentationSettleTask: Task<Void, Never>?
+    /// Last non-empty bounds. The first real size is the initial layout and
+    /// does not count as a relayout.
+    private var lastLaidOutSize: CGSize = .zero
 
     private var spreadLoadTask: Task<Void, Never>?
 
@@ -123,6 +129,8 @@ class EPUBSpreadView: UIView, Loggable, PageView {
 
         spreadLoadTask?.cancel()
         spreadLoadTask = nil
+        presentationSettleTask?.cancel()
+        presentationSettleTask = nil
         // A transition waiting on this spread must not sit out the timeout
         // after the view has already gone away.
         onSpreadReadyCallbacks.complete()
@@ -407,6 +415,9 @@ class EPUBSpreadView: UIView, Loggable, PageView {
     /// The JS message `spreadLoaded` needs to be emitted by a subclass script, EPUBSpreadView's scripts don't.
     private func spreadDidLoad(_ body: Any) {
         spreadLoadTask?.cancel()
+        presentationSettleTask?.cancel()
+        // A second load on this view must not look ready while it scrolls.
+        isSpreadReadyForPresentation = false
         spreadLoadTask = Task { @MainActor in
             isSpreadLoaded = true
             applySettings()
@@ -415,9 +426,6 @@ class EPUBSpreadView: UIView, Loggable, PageView {
                 return
             }
             await delegate?.spreadViewDidLoad(self)
-            guard !Task.isCancelled else {
-                return
-            }
             onSpreadLoadedCallbacks.complete()
             showSpread()
             await awaitNextPaint()
@@ -452,14 +460,13 @@ class EPUBSpreadView: UIView, Loggable, PageView {
             return
         }
 
-        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-            let box = ReadyResumeBox(continuation)
-            whenSpreadReady {
+        await ReadyResume.awaitFirst { box in
+            self.whenSpreadReady {
                 box.resume()
             }
-            Task { @MainActor [weak box] in
+            Task { @MainActor in
                 try? await Task.sleep(seconds: PageTransitionAnimator.readinessTimeout)
-                box?.resume()
+                box.resume()
             }
         }
     }
@@ -473,15 +480,14 @@ class EPUBSpreadView: UIView, Loggable, PageView {
     /// Double `requestAnimationFrame` so the next paint has committed.
     /// A stalled web process resolves on `paintTimeout` instead of hanging.
     func awaitNextPaint() async {
-        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-            let box = ReadyResumeBox(continuation)
-            Task { @MainActor [weak box] in
+        await ReadyResume.awaitFirst { box in
+            Task { @MainActor in
                 try? await Task.sleep(seconds: PageTransitionAnimator.paintTimeout)
-                box?.resume()
+                box.resume()
             }
-            Task { @MainActor [weak box] in
+            Task { @MainActor in
                 do {
-                    _ = try await webView.callAsyncJavaScript(
+                    _ = try await self.webView.callAsyncJavaScript(
                         """
                         return await new Promise((resolve) => {
                           requestAnimationFrame(() => {
@@ -496,9 +502,42 @@ class EPUBSpreadView: UIView, Loggable, PageView {
                 } catch {
                     // A spread that cannot run script still has to unblock the turn.
                 }
-                box?.resume()
+                box.resume()
             }
         }
+    }
+
+    /// The next turn waits out this paint. No-op until the first presentation:
+    /// the load task owns that flag, and clearing it here would let this
+    /// method mark the spread ready before the initial scroll.
+    func settlePresentationAfterRelayout() {
+        guard isSpreadReadyForPresentation else {
+            return
+        }
+        isSpreadReadyForPresentation = false
+        presentationSettleTask?.cancel()
+        presentationSettleTask = Task { @MainActor [weak self] in
+            await self?.awaitNextPaint()
+            guard let self, !Task.isCancelled else {
+                return
+            }
+            self.markSpreadReadyForPresentation()
+        }
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+
+        let size = bounds.size
+        guard size.width > 1, size.height > 1, size != lastLaidOutSize else {
+            return
+        }
+        let hadSize = lastLaidOutSize != .zero
+        lastLaidOutSize = size
+        guard hadSize else {
+            return
+        }
+        settlePresentationAfterRelayout()
     }
 
     private func markSpreadReadyForPresentation() {
@@ -800,6 +839,27 @@ final class ReadyResumeBox<Success> {
 extension ReadyResumeBox where Success == Void {
     func resume() {
         resume(returning: ())
+    }
+}
+
+enum ReadyResume {
+    /// Invokes `start` on the main actor and waits until it resumes `box`.
+    ///
+    /// The task that calls `start` retains `box`, and so does every racer
+    /// `start` creates. That task is queued, so it runs after this function's
+    /// synchronous return. A weak capture dropped the box on that gap: nothing
+    /// resumed the continuation, `spreadDidLoad` never reached `showSpread()`,
+    /// and paged mode stayed on the clear scroll view (a blank screen taps
+    /// could not hit).
+    static func awaitFirst<Success>(
+        _ start: @escaping @MainActor (ReadyResumeBox<Success>) -> Void
+    ) async -> Success {
+        await withCheckedContinuation { continuation in
+            let box = ReadyResumeBox(continuation)
+            Task { @MainActor in
+                start(box)
+            }
+        }
     }
 }
 

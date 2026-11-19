@@ -590,6 +590,13 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
     /// Highlight snippets stay on the existing path: their target is a text
     /// range the script layer finds, and measuring it here would fork that.
     private func isZeroDisplacement(to locator: Locator) async -> Bool {
+        // The first `go` runs from `spreadDidLoad`, before `showSpread()`.
+        // Column metrics are not real yet: a probe here either hangs the
+        // open (the continuation used to be dropped) or reports the origin
+        // and skips the scroll that reveals the chapter.
+        guard isSpreadReadyForPresentation else {
+            return false
+        }
         guard !viewModel.scroll, locator.text.highlight == nil else {
             return false
         }
@@ -600,15 +607,14 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
             return false
         }
 
-        let measured: [String: Any]? = await withCheckedContinuation { continuation in
-            let box = ReadyResumeBox(continuation)
-            Task { @MainActor [weak box] in
+        let measured: [String: Any]? = await ReadyResume.awaitFirst { box in
+            Task { @MainActor in
                 try? await Task.sleep(seconds: PageTransitionAnimator.paintTimeout)
-                box?.resume(returning: nil)
+                box.resume(returning: nil)
             }
-            Task { @MainActor [weak box] in
+            Task { @MainActor in
                 do {
-                    let value = try await webView.callAsyncJavaScript(
+                    let value = try await self.webView.callAsyncJavaScript(
                         """
                         const style = getComputedStyle(document.documentElement);
                         const rtl = style.direction === 'rtl' || style.writingMode === 'vertical-rl';
@@ -643,9 +649,9 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
                         in: nil,
                         contentWorld: .page
                     )
-                    box?.resume(returning: value as? [String: Any])
+                    box.resume(returning: value as? [String: Any])
                 } catch {
-                    box?.resume(returning: nil)
+                    box.resume(returning: nil)
                 }
             }
         }

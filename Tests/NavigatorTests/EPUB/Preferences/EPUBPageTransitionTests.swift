@@ -180,4 +180,47 @@ class EPUBPageTransitionTests: XCTestCase {
         XCTAssertTrue(PageDisplacement.isZero(current: 780, target: 780.4))
         XCTAssertFalse(PageDisplacement.isZero(current: 780, target: 782))
     }
+
+    /// The box has to outlive the turn that scheduled the racers. A weak
+    /// capture resumes nothing, and this returns the watchdog's nil.
+    func testReadyResumeSurvivesUntilTheNextTurn() async {
+        let value: String? = await withTaskGroup(of: String?.self) { group in
+            group.addTask {
+                let painted: String = await ReadyResume.awaitFirst { box in
+                    DispatchQueue.main.async {
+                        box.resume(returning: "painted")
+                    }
+                }
+                return painted
+            }
+            group.addTask {
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                return nil
+            }
+            let first = await group.next() ?? nil
+            group.cancelAll()
+            return first ?? nil
+        }
+        XCTAssertEqual(value, "painted")
+    }
+
+    func testReadyResumeKeepsTheFirstValue() async {
+        let value: String? = await withTaskGroup(of: String?.self) { group in
+            group.addTask {
+                let first: String = await ReadyResume.awaitFirst { box in
+                    box.resume(returning: "first")
+                    box.resume(returning: "second")
+                }
+                return first
+            }
+            group.addTask {
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                return nil
+            }
+            let first = await group.next() ?? nil
+            group.cancelAll()
+            return first ?? nil
+        }
+        XCTAssertEqual(value, "first")
+    }
 }

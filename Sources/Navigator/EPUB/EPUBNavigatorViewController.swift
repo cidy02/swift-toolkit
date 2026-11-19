@@ -978,15 +978,35 @@ extension EPUBNavigatorViewController: EPUBNavigatorViewModelDelegate {
                 return
             }
 
+            // Font size and theme commit through `readium.setCSSProperties`,
+            // which reflows the columns without reloading the spread.
+            let relayouts = script.contains("readium.setCSSProperties(")
+
+            func run(_ view: EPUBSpreadView, href: AnyURL? = nil) async {
+                await view.evaluateScript(script, inHREF: href)
+                if relayouts {
+                    // The script task is not on the main actor. The flag lives
+                    // on the spread view, which is.
+                    await MainActor.run {
+                        view.settlePresentationAfterRelayout()
+                    }
+                }
+            }
+
             switch scope {
             case .currentResource:
-                await (paginationView.currentView as? EPUBSpreadView)?.evaluateScript(script)
+                if let view = paginationView.currentView as? EPUBSpreadView {
+                    await run(view)
+                }
 
             case .loadedResources:
                 await withTaskGroup(of: Void.self) { tasks in
                     for (_, view) in paginationView.loadedViews {
                         tasks.addTask {
-                            await (view as? EPUBSpreadView)?.evaluateScript(script)
+                            guard let view = view as? EPUBSpreadView else {
+                                return
+                            }
+                            await run(view)
                         }
                     }
                 }
@@ -1000,7 +1020,7 @@ extension EPUBNavigatorViewController: EPUBNavigatorViewModelDelegate {
                     else {
                         continue
                     }
-                    await view.evaluateScript(script, inHREF: href)
+                    await run(view, href: href)
                     return
                 }
             }
