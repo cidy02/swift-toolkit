@@ -124,12 +124,10 @@ final class PageCurlView: UIView {
             tapContinuation = continuation
             tapStart = CACurrentMediaTime()
             tapDuration = duration
-            let link: CADisplayLink
-            if let scene = window?.windowScene {
-                link = scene.displayLink(target: self, selector: #selector(stepTap))
-            } else {
-                link = CADisplayLink(target: self, selector: #selector(stepTap))
-            }
+            // `preferredFrameRateRange` asks for 120 Hz. The scene's
+            // `displayLink` is optional on this SDK and nil off-screen;
+            // a display link created here still tracks the screen once added.
+            let link = CADisplayLink(target: self, selector: #selector(stepTap))
             link.preferredFrameRateRange = CAFrameRateRange(minimum: 80, maximum: 120, preferred: 120)
             displayLink = link
             link.add(to: .main, forMode: .common)
@@ -284,7 +282,7 @@ private final class PageCurlRenderer {
     }
 
     private func ensurePipeline() -> Bool {
-        if let pipeline {
+        if pipeline != nil {
             return true
         }
         if let cached = Self.cachedPipeline, Self.cachedDevice === device {
