@@ -11,7 +11,8 @@ import Foundation
 ///
 /// The shader has no duration and no easing. `progress` is already the visual
 /// position, 0 = outgoing flat, 1 = incoming flat. `radius` is zero at both
-/// ends. Task 4 sets `tilt` from the finger; a tap leaves it at 0.
+/// ends. `tilt` is radians from vertical; a tap passes the bottom-corner value,
+/// and Task 4 passes the finger's `touchY`.
 enum PageCurlShader {
     static let source = #"""
     #include <metal_stdlib>
@@ -70,6 +71,16 @@ enum PageCurlShader {
         return mix(src, paper, clamp(u.paperMix, 0.0, 1.0));
     }
 
+    // Flat outgoing. A centre spine gets a narrow crease. A one-page leaf does
+    // not: a wide spine shadow reads as a veil over the unturned page.
+    static float3 flatOutgoing(float3 color, float along, float envelope, constant CurlUniforms &u) {
+        if (u.twoPage < 0.5) {
+            return color;
+        }
+        float ao = exp(-abs(along) / 0.025) * 0.12 * envelope;
+        return color * (1.0 - ao);
+    }
+
     fragment float4 curlFragment(
         CurlVertexOut in [[stage_in]],
         texture2d<float> outgoing [[texture(0)]],
@@ -89,91 +100,71 @@ enum PageCurlShader {
             return float4(flat, 1.0);
         }
 
-        float aspect = max(u.aspect, 0.05);
-        float dx = uv.x - u.spineX;
-        float dy = (uv.y - 0.5) / aspect;
-        float ct = cos(-u.tilt);
-        float st = sin(-u.tilt);
-        float rotatedX = dx * ct - dy * st;
-        float leafX = rotatedX * u.peelSign;
-
         float span = max(u.span, 0.05);
         float R = max(u.radius, 1.0e-4);
         float PI = 3.14159265;
-        // Peel travel is linear in progress. Radius only fattens the roll,
-        // so the ridge can close at the ends without the peel jumping back.
-        float travel = u.twoPage > 0.5 ? (span * 2.0) : (span + 0.36);
-        float pulled = u.progress * travel;
-        float lift = span - pulled;
-
         float3 inC = sampleTex(incoming, uv);
         float envelope = sin(clamp(u.progress, 0.0, 1.0) * PI);
 
-        // Free-edge side of the peel: the page underneath.
-        if (leafX > lift) {
-            float dist = leafX - lift;
-            float shadow = exp(-dist / max(R * 2.2, 0.015)) * 0.50 * envelope;
+        // Distance along the peel, then a fold line tilted in the same units.
+        // Positive tilt drops the fold toward the spine at the bottom, so that
+        // corner leads. The page image itself is not rotated.
+        float aspect = max(u.aspect, 0.05);
+        float along = (uv.x - u.spineX) * u.peelSign;
+        float yOff = (uv.y - 0.5) / aspect;
+        float tilt = clamp(u.tilt, -0.5, 0.5);
+        float fold = span * (1.0 - u.progress);
+        float foldLine = fold - tan(tilt) * yOff;
+        float dist = along - foldLine;
+
+        // The half that is not this leaf (centre spine). It stays the outgoing page.
+        if (along < 0.0) {
+            return float4(flatOutgoing(outC, along, envelope, u), 1.0);
+        }
+
+        // Unturned remainder. Full contrast until the roll starts.
+        if (dist <= 0.0) {
+            return float4(flatOutgoing(outC, along, envelope, u), 1.0);
+        }
+
+        // Screen width of the roll. Arc length across it is pi*R, so the page is
+        // compressed by pi/2 and no more. Mapping x = R*(1-cos) piles a finite
+        // arc onto the tangent and reads as stripes.
+        float curlWidth = 2.0 * R;
+        if (dist >= curlWidth) {
+            float past = dist - curlWidth;
+            float shadow = (exp(-past / 0.050) * 0.26 + exp(-past / 0.18) * 0.07) * envelope;
             return float4(clamp(inC * (1.0 - shadow), 0.0, 1.0), 1.0);
         }
 
-        float arc = PI * R;
-        float flatLen = max(pulled - arc, 0.0);
-        float backTangent = lift - 2.0 * R;
-        float backTip = backTangent - flatLen;
+        float t = dist / curlWidth;
+        float orig = foldLine + t * PI * R;
+        float crest = sin(t * PI);
+        float spec = pow(max(crest, 0.0), 2.5) * u.specular * 0.35 * envelope;
+        float3 specColor = spec * float3(1.0, 0.98, 0.94);
 
-        // On the cylinder, between the peel and the back tangent.
-        if (leafX >= backTangent) {
-            float local = lift - leafX;
-            float cosTheta = clamp(1.0 - local / R, -1.0, 1.0);
-            float theta = acos(cosTheta);
-            float orig = lift + theta * R;
-            float ridge = sin(theta);
-            float spec = pow(max(ridge, 0.0), 16.0) * u.specular * envelope;
-            float3 specColor = spec * float3(1.0, 0.98, 0.94);
-
-            if (theta <= PI * 0.5) {
-                float3 front = sampleTex(outgoing, leafUV(orig, uv.y, u));
-                float shade = 0.58 + 0.42 * ridge;
-                return float4(clamp(front * shade + specColor, 0.0, 1.0), 1.0);
-            }
-
-            float3 back;
-            if (u.realVerso > 0.5) {
-                // The printed verso, right-reading, symmetric across the spine.
-                back = sampleTex(incoming, leafUV(-orig, uv.y, u));
-            } else {
-                float mirrored = span - orig;
-                back = paperBack(sampleTex(outgoing, leafUV(mirrored, uv.y, u)), u);
-            }
-            float shade = 0.70 + 0.22 * ridge;
-            return float4(clamp(back * shade + specColor * 0.35, 0.0, 1.0), 1.0);
+        // Front of the roll. Shade starts at 1 so it meets the flat page.
+        if (t < 0.5) {
+            float3 front = sampleTex(outgoing, leafUV(orig, uv.y, u));
+            float shade = mix(1.0, 0.90, smoothstep(0.0, 0.5, t));
+            return float4(clamp(front * shade + specColor, 0.0, 1.0), 1.0);
         }
 
-        // Flat underside that has already folded past the cylinder.
-        if (leafX >= backTip) {
-            float s = arc + (backTangent - leafX);
-            float orig = lift + s;
-            float3 back;
-            if (u.realVerso > 0.5) {
-                back = sampleTex(incoming, leafUV(-orig, uv.y, u));
-            } else {
-                float mirrored = span - orig;
-                back = paperBack(sampleTex(outgoing, leafUV(mirrored, uv.y, u)), u);
-            }
-            float shade = 0.86;
-            float spineAO = u.twoPage > 0.5
-                ? exp(-abs(leafX) / 0.045) * 0.16 * envelope
-                : 0.0;
-            return float4(clamp(back * shade * (1.0 - spineAO), 0.0, 1.0), 1.0);
+        // Back of the roll. Opaque: it covers the next page, it is not mixed with it.
+        // One page is a paper ghost. Two pages are the real verso.
+        float3 back;
+        float specScale;
+        if (u.realVerso > 0.5) {
+            back = sampleTex(incoming, leafUV(-orig, uv.y, u));
+            specScale = 1.0;
+        } else {
+            float mirrored = span - orig;
+            back = paperBack(sampleTex(outgoing, leafUV(mirrored, uv.y, u)), u);
+            specScale = 0.40;
         }
-
-        // Still-flat outgoing, with the curl's shadow and a spine crease.
-        float gap = backTip - leafX;
-        float shadow = exp(-max(gap, 0.0) / max(R * 3.0, 0.02)) * 0.32 * envelope;
-        float spineAO = u.twoPage > 0.5
-            ? exp(-abs(leafX) / 0.045) * 0.18 * envelope
-            : exp(-max(leafX, 0.0) / 0.08) * 0.06 * envelope;
-        return float4(clamp(outC * (1.0 - shadow - spineAO), 0.0, 1.0), 1.0);
+        float backT = clamp((t - 0.5) / 0.5, 0.0, 1.0);
+        float shade = mix(0.90, 0.98, smoothstep(0.0, 1.0, backT));
+        return float4(clamp(back * shade + specColor * specScale, 0.0, 1.0), 1.0);
     }
     """#
 }

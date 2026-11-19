@@ -50,13 +50,18 @@ class PageCurlGeometryTests: XCTestCase {
         XCTAssertEqual(PageCurlGeometry.cylinderRadius(progress: 0, span: 1), 0, accuracy: 0.0001)
         XCTAssertEqual(PageCurlGeometry.cylinderRadius(progress: 1, span: 1), 0, accuracy: 0.0001)
         let mid = PageCurlGeometry.cylinderRadius(progress: 0.5, span: 1)
+        XCTAssertEqual(mid, PageCurlGeometry.peakRadius, accuracy: 0.0001)
         XCTAssertGreaterThan(mid, 0.05)
         XCTAssertLessThan(mid, 0.2)
         // A narrow leaf does not grow a cylinder wider than itself.
         let narrow = PageCurlGeometry.cylinderRadius(progress: 0.5, span: 0.1)
         XCTAssertLessThanOrEqual(narrow, 0.1 * 0.45 + 0.0001)
 
-        XCTAssertEqual(PageCurlGeometry.tiltRadians(touchY: PageCurlGeometry.tapTouchY), 0, accuracy: 0.0001)
+        // A tap lifts the bottom corner. A finger at mid-page stays vertical.
+        let tapTilt = PageCurlGeometry.tiltRadians(touchY: PageCurlGeometry.tapTouchY)
+        XCTAssertGreaterThan(tapTilt, 0.25)
+        XCTAssertLessThan(tapTilt, PageCurlGeometry.maxTilt)
+        XCTAssertEqual(PageCurlGeometry.tiltRadians(touchY: 0.5), 0, accuracy: 0.0001)
         XCTAssertEqual(PageCurlGeometry.tiltRadians(touchY: 0), -PageCurlGeometry.maxTilt, accuracy: 0.0001)
         XCTAssertEqual(PageCurlGeometry.tiltRadians(touchY: 1), PageCurlGeometry.maxTilt, accuracy: 0.0001)
         XCTAssertEqual(PageCurlGeometry.tiltRadians(touchY: -2), -PageCurlGeometry.maxTilt, accuracy: 0.0001)
@@ -174,16 +179,16 @@ class PageCurlGeometryTests: XCTestCase {
         let oled = PageCurlGeometry.backsidePaper(background: PageCurlRGB(r: 0, g: 0, b: 0))
         XCTAssertGreaterThan(oled.r, 0.05)
         XCTAssertLessThan(oled.r, 0.10)
-        XCTAssertEqual(oled.mix, 0.78, accuracy: 0.0001)
+        XCTAssertEqual(oled.mix, PageCurlGeometry.backsideMix, accuracy: 0.0001)
         XCTAssertLessThan(oled.specular, 0.2)
 
         let light = PageCurlGeometry.backsidePaper(background: PageCurlRGB(r: 1, g: 1, b: 1))
-        XCTAssertEqual(light.mix, 0.78, accuracy: 0.0001)
+        XCTAssertEqual(light.mix, PageCurlGeometry.backsideMix, accuracy: 0.0001)
         XCTAssertLessThan(light.r, 1)
         XCTAssertLessThan(light.b, light.r)
 
         let sepia = PageCurlGeometry.backsidePaper(background: PageCurlRGB(r: 0.984, g: 0.941, b: 0.851))
-        XCTAssertEqual(sepia.mix, 0.78, accuracy: 0.0001)
+        XCTAssertEqual(sepia.mix, PageCurlGeometry.backsideMix, accuracy: 0.0001)
         XCTAssertGreaterThan(sepia.r, sepia.b)
     }
 

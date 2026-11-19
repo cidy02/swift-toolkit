@@ -25,7 +25,7 @@ final class PageCurlView: UIView {
     private var peelSign: CGFloat = 1
     private var touchY: CGFloat = PageCurlGeometry.tapTouchY
     private var realVerso = false
-    private var paper = PageCurlPaper(r: 0.93, g: 0.9, b: 0.84, mix: 0.78, specular: 0.3)
+    private var paper = PageCurlPaper(r: 0.93, g: 0.9, b: 0.84, mix: PageCurlGeometry.backsideMix, specular: 0.3)
     private var progress: CGFloat = 0
 
     override init(frame: CGRect) {
