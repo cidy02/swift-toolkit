@@ -534,12 +534,11 @@ final class PaginationView: UIView, Loggable {
         defer {
             // A reload already owns the new spread. Restoring this offset
             // would move that spread, or write flags it just cleared.
-            guard generation == reloadGeneration else {
-                return
+            if generation == reloadGeneration {
+                neighbor.setSuppressingProgressionUpdates(false)
+                scrollView.contentOffset = CGPoint(x: xOffsetForIndex(currentIndex), y: saved.y)
+                isAnimatingContentOffset = false
             }
-            neighbor.setSuppressingProgressionUpdates(false)
-            scrollView.contentOffset = CGPoint(x: xOffsetForIndex(currentIndex), y: saved.y)
-            isAnimatingContentOffset = false
         }
         scrollView.contentOffset = CGPoint(x: xOffsetForIndex(index), y: saved.y)
         layoutIfNeeded()
