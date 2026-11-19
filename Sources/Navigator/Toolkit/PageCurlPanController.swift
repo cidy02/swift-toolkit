@@ -85,6 +85,12 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
         view.addGestureRecognizer(recognizer)
     }
 
+    /// True while a finger curl is preparing or tracking. A commit spring that
+    /// has already started is not a drag: its release decision stands.
+    var dragInFlight: Bool {
+        phase == .preparing || phase == .armed
+    }
+
     /// Rotation or Reduce Motion landed in the middle of a drag. The page goes back.
     /// A prepare still in flight reverts itself when it sees `aborted`: finishing
     /// here as well would drop the cover before the hidden scroll had been undone.
@@ -95,6 +101,42 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
         Task { @MainActor in
             await self.finish(commit: false, velocity: 0)
         }
+    }
+
+    /// Posture changed under the finger. Revert the peek and wait until the
+    /// cover is gone, so the reflow anchor is the page the reader was on.
+    private var abortContinuation: CheckedContinuation<Void, Never>?
+
+    func abortDrag() async {
+        switch phase {
+        case .idle:
+            return
+        case .preparing, .armed:
+            aborted = true
+            prepareTask?.cancel()
+            await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                abortContinuation = cont
+                if phase == .armed {
+                    Task { @MainActor in
+                        await self.finish(commit: false, velocity: 0)
+                    }
+                }
+            }
+        case .finishing:
+            await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                if phase == .idle {
+                    cont.resume()
+                } else {
+                    abortContinuation = cont
+                }
+            }
+        }
+    }
+
+    private func resumeAbortWaiter() {
+        let continuation = abortContinuation
+        abortContinuation = nil
+        continuation?.resume()
     }
 
     func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
@@ -329,6 +371,7 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
         metalArmed = false
         pendingRelease = nil
         aborted = false
+        resumeAbortWaiter()
     }
 
     private func failBeforeReveal() async {
@@ -342,6 +385,7 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
         phase = .idle
         aborted = false
         pendingRelease = nil
+        resumeAbortWaiter()
     }
 
     private func fadeOut(_ view: UIView) async {

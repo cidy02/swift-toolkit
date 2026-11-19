@@ -110,6 +110,174 @@ class PageCurlGeometryTests: XCTestCase {
         )
     }
 
+    /// Rows of the posture matrix. A horizontal fold is not a spine. One
+    /// rendered column stays an edge curl, which is what an AX size does
+    /// when the stylesheet collapses to a single column.
+    func testSpineResolveFollowsRenderedColumnsAndAVerticalFold() {
+        let viewport = CGRect(x: 0, y: 0, width: 900, height: 600)
+        let vertical = PageCurlDivisionSample(
+            frame: CGRect(x: 393, y: 0, width: 60, height: 600), isActive: true
+        )
+        let horizontal = PageCurlDivisionSample(
+            frame: CGRect(x: 0, y: 280, width: 900, height: 40), isActive: true
+        )
+        let inactive = PageCurlDivisionSample(frame: vertical.frame, isActive: false)
+        let crease = PageCurlDivisionSample(
+            frame: CGRect(x: 420, y: 0, width: 0, height: 600), isActive: true
+        )
+
+        XCTAssertEqual(
+            PageCurlSpine.resolve(renderedColumns: 1, rtl: false, regions: [vertical], viewport: viewport),
+            .leading
+        )
+        XCTAssertEqual(
+            PageCurlSpine.resolve(renderedColumns: 1, rtl: true, regions: [vertical], viewport: viewport),
+            .trailing
+        )
+        XCTAssertEqual(
+            PageCurlSpine.resolve(renderedColumns: 0, rtl: false, regions: [vertical], viewport: viewport),
+            .leading
+        )
+        XCTAssertEqual(
+            PageCurlSpine.resolve(renderedColumns: 2, rtl: false, regions: [], viewport: viewport),
+            .center(normalizedX: 0.5)
+        )
+        XCTAssertEqual(
+            PageCurlSpine.resolve(renderedColumns: 2, rtl: true, regions: [inactive], viewport: viewport),
+            .center(normalizedX: 0.5)
+        )
+        // Tabletop. The fold is ignored, so two columns stay centred and one
+        // column stays an edge. Kudos forces the one-column case.
+        XCTAssertEqual(
+            PageCurlSpine.resolve(renderedColumns: 2, rtl: false, regions: [horizontal], viewport: viewport),
+            .center(normalizedX: 0.5)
+        )
+        XCTAssertEqual(
+            PageCurlSpine.resolve(renderedColumns: 1, rtl: true, regions: [horizontal], viewport: viewport),
+            .trailing
+        )
+
+        assertCenter(
+            PageCurlSpine.resolve(renderedColumns: 2, rtl: false, regions: [vertical], viewport: viewport),
+            423.0 / 900.0
+        )
+        assertCenter(
+            PageCurlSpine.resolve(renderedColumns: 2, rtl: true, regions: [vertical], viewport: viewport),
+            423.0 / 900.0
+        )
+        assertCenter(
+            PageCurlSpine.resolve(renderedColumns: 2, rtl: false, regions: [crease], viewport: viewport),
+            420.0 / 900.0
+        )
+
+        let outside = PageCurlDivisionSample(
+            frame: CGRect(x: 1000, y: 0, width: 40, height: 600), isActive: true
+        )
+        XCTAssertEqual(
+            PageCurlSpine.resolve(renderedColumns: 2, rtl: false, regions: [outside], viewport: viewport),
+            .center(normalizedX: 0.5)
+        )
+    }
+
+    func testColumnGapCoversTheCreaseAndAnOffCentreFold() {
+        let viewport = CGRect(x: 0, y: 0, width: 900, height: 600)
+        XCTAssertEqual(
+            PageCurlGeometry.columnGapClearingFold(defaultGap: 0, foldFrame: nil, viewport: viewport),
+            0
+        )
+        XCTAssertEqual(
+            PageCurlGeometry.columnGapClearingFold(defaultGap: 12, foldFrame: nil, viewport: viewport),
+            12
+        )
+        XCTAssertEqual(
+            PageCurlGeometry.columnGapClearingFold(
+                defaultGap: 0,
+                foldFrame: CGRect(x: 426, y: 0, width: 48, height: 600),
+                viewport: viewport
+            ),
+            48
+        )
+        // Fold at 393...453. A centred gap of 60 still leaves text under the
+        // hinge, so the gap widens to 114.
+        XCTAssertEqual(
+            PageCurlGeometry.columnGapClearingFold(
+                defaultGap: 0,
+                foldFrame: CGRect(x: 393, y: 0, width: 60, height: 600),
+                viewport: viewport
+            ),
+            114
+        )
+        XCTAssertEqual(
+            PageCurlGeometry.columnGapClearingFold(
+                defaultGap: 20,
+                foldFrame: CGRect(x: 445, y: 0, width: 10, height: 600),
+                viewport: viewport
+            ),
+            20
+        )
+        XCTAssertEqual(
+            PageCurlGeometry.columnGapClearingFold(
+                defaultGap: 20,
+                foldFrame: CGRect(x: 430, y: 0, width: 40, height: 600),
+                viewport: viewport
+            ),
+            40
+        )
+        XCTAssertEqual(
+            PageCurlGeometry.columnGapClearingFold(
+                defaultGap: 8,
+                foldFrame: CGRect(x: 450, y: 0, width: 0, height: 600),
+                viewport: viewport
+            ),
+            8
+        )
+    }
+
+    func testActiveVerticalDivisionDropsTabletopInactiveAndTheLoser() {
+        let viewport = CGRect(x: 0, y: 0, width: 900, height: 600)
+        XCTAssertNil(PageCurlGeometry.activeVerticalDivision(
+            regions: [PageCurlDivisionSample(
+                frame: CGRect(x: 0, y: 280, width: 900, height: 40), isActive: true
+            )],
+            viewport: viewport
+        ))
+        XCTAssertNil(PageCurlGeometry.activeVerticalDivision(
+            regions: [PageCurlDivisionSample(
+                frame: CGRect(x: 430, y: 0, width: 40, height: 600), isActive: false
+            )],
+            viewport: viewport
+        ))
+        let narrow = CGRect(x: 430, y: 0, width: 20, height: 600)
+        let wide = CGRect(x: 400, y: 0, width: 80, height: 600)
+        XCTAssertEqual(
+            PageCurlGeometry.activeVerticalDivision(
+                regions: [
+                    PageCurlDivisionSample(frame: narrow, isActive: true),
+                    PageCurlDivisionSample(frame: wide, isActive: true)
+                ],
+                viewport: viewport
+            ),
+            wide
+        )
+        XCTAssertNil(PageCurlGeometry.normalizedDivisionX(
+            of: CGRect(x: 10, y: 0, width: 10, height: 10),
+            in: CGRect(x: 0, y: 0, width: 1, height: 600)
+        ))
+    }
+
+    private func assertCenter(
+        _ spine: PageCurlSpine,
+        _ x: CGFloat,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        guard case .center = spine else {
+            XCTFail("expected a centre spine, got \(spine)", file: file, line: line)
+            return
+        }
+        XCTAssertEqual(spine.normalizedX, x, accuracy: 0.0001, file: file, line: line)
+    }
+
     func testAnimationSpineKeepsTheBindingOnTheWayBack() {
         XCTAssertEqual(
             PageCurlGeometry.animationSpine(renderedColumns: 1, rtl: false, forward: true, divisionNormalizedX: nil),

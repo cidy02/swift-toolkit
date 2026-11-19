@@ -68,6 +68,10 @@ protocol PaginationViewDelegate: AnyObject {
 
     /// Returns the number of positions (as in `Publication.positionList`) in the page view at given index.
     func paginationView(_ paginationView: PaginationView, positionCountAtIndex index: Int) -> Int
+
+    /// The active vertical fold moved, appeared, or went away. `normalizedX`
+    /// is nil for a horizontal fold and for no fold at all.
+    func paginationView(_ paginationView: PaginationView, divisionDidChange sample: FoldPostureSample)
 }
 
 final class PaginationView: UIView, Loggable {
@@ -133,6 +137,14 @@ final class PaginationView: UIView, Loggable {
     /// Composited behind a transition snapshot. The pagination view itself is clear.
     var transitionBackgroundColor: UIColor = .white
 
+    /// Live vertical fold, as a fraction of this view's width. Nil when the
+    /// device is flat, closed, or folded horizontally. The curl reads this;
+    /// it does not observe the hinge itself.
+    private(set) var divisionNormalizedX: CGFloat?
+    private(set) var divisionFrame: CGRect?
+    private let foldPosture = FoldPostureObserver()
+    private var foldPostureInstalled = false
+
     /// While a turn is preparing, progression events from the page being
     /// moved to are held and flushed once when the turn ends.
     private var suppressProgressionDuringLoad = false
@@ -183,6 +195,9 @@ final class PaginationView: UIView, Loggable {
     }
 
     override func layoutSubviews() {
+        installFoldPostureIfNeeded()
+        foldPosture.refresh()
+
         guard !loadedViews.isEmpty else {
             scrollView.contentSize = bounds.size
             return
@@ -215,6 +230,9 @@ final class PaginationView: UIView, Loggable {
 
     override func didMoveToWindow() {
         super.didMoveToWindow()
+        if window != nil {
+            installFoldPostureIfNeeded()
+        }
 
         if window == nil {
             cancelActiveCurl()
@@ -223,6 +241,22 @@ final class PaginationView: UIView, Loggable {
         } else {
             loadPages()
         }
+    }
+
+    private func installFoldPostureIfNeeded() {
+        guard !foldPostureInstalled else {
+            return
+        }
+        foldPostureInstalled = true
+        foldPosture.onChange = { [weak self] sample in
+            guard let self else {
+                return
+            }
+            self.divisionNormalizedX = sample.normalizedX
+            self.divisionFrame = sample.division
+            self.delegate?.paginationView(self, divisionDidChange: sample)
+        }
+        foldPosture.attach(to: self)
     }
 
     /// Returns the x offset to the page view with given index in the scroll view.
@@ -568,12 +602,12 @@ final class PaginationView: UIView, Loggable {
         }
         let rtl = readingProgression == .rtl
         let forward = index > currentIndex
-        let spine = PageCurlGeometry.animationSpine(
+        let spine = PageCurlSpine.resolve(
             renderedColumns: columns,
             rtl: rtl,
-            forward: forward,
-            divisionNormalizedX: nil
+            divisionNormalizedX: divisionNormalizedX
         )
+        log(.info, "curl-spine columns=\(columns) division=\(divisionNormalizedX.map { String(format: "%.3f", $0) } ?? "nil") spine=\(spine) forward=\(forward)")
         let curl = PageCurlView(frame: bounds)
         curl.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         curl.showCover(outgoing, background: background)
@@ -819,5 +853,19 @@ extension PaginationView: UIScrollViewDelegate {
 
         let newIndex = Int(round(currentOffset / scrollView.frame.width))
         setCurrentIndex(newIndex)
+    }
+}
+
+extension UIView {
+    /// The pagination view's live fold, or nil when this view is not inside one.
+    var pageCurlDivisionNormalizedX: CGFloat? {
+        var view: UIView? = self
+        while let current = view {
+            if let pagination = current as? PaginationView {
+                return pagination.divisionNormalizedX
+            }
+            view = current.superview
+        }
+        return nil
     }
 }

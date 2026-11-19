@@ -513,9 +513,70 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     override open func viewWillTransition(to size: CGSize, with coordinator: UIViewControllerTransitionCoordinator) {
         super.viewWillTransition(to: size, with: coordinator)
 
+        let dragging = curlPan?.dragInFlight == true
+        if dragging {
+            Task { @MainActor in
+                await self.curlPan?.abortDrag()
+                self.reflowPosition.scheduleRestore()
+            }
+        }
+        holdReadingPositionForSizeChange()
+
         if isActive {
             viewModel.viewSizeWillChange(size)
         }
+
+        coordinator.animate(alongsideTransition: nil) { [weak self] _ in
+            guard let self, !dragging else {
+                return
+            }
+            self.reflowPosition.scheduleRestore()
+        }
+    }
+
+    /// The probe starts before this returns. WebKit still has the old column
+    /// layout. A drag uses the element saved while idle: the DOM is the peek.
+    private func holdReadingPositionForSizeChange() {
+        guard let spread = paginationView?.currentView as? EPUBSpreadView,
+              spread.isSpreadReadyForPresentation
+        else {
+            return
+        }
+        let dragging = curlPan?.dragInFlight == true
+        if dragging {
+            reflowPosition.hold(
+                on: spread,
+                locator: reflowPosition.settledVisibleLocator ?? currentLocation
+            )
+            return
+        }
+        reflowPosition.hold(on: spread, fallback: currentLocation) { [weak spread] done in
+            spread?.startVisibleLocatorProbe(done)
+        }
+    }
+
+    /// CSS that changes columns or the fold gap. The locator is taken before
+    /// the script runs, while the old columns are still on screen.
+    private func holdReadingPositionBeforeCSSRelayout(of view: EPUBSpreadView) async {
+        guard view === paginationView?.currentView, view.isSpreadReadyForPresentation else {
+            return
+        }
+        if reflowPosition.isHolding {
+            return
+        }
+        if curlPan?.dragInFlight == true {
+            reflowPosition.hold(
+                on: view,
+                locator: reflowPosition.settledVisibleLocator ?? currentLocation
+            )
+            await curlPan?.abortDrag()
+            return
+        }
+        let visible = await view.findFirstVisibleElementLocator()
+        guard view === paginationView?.currentView, !reflowPosition.isHolding else {
+            return
+        }
+        reflowPosition.hold(on: view, locator: visible ?? currentLocation)
     }
 
     @discardableResult
@@ -526,7 +587,30 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             log(.debug, "-> on \(event)")
         }
 
-        return state.transition(event)
+        let accepted = state.transition(event)
+        if accepted, anchorNavigation(for: event).cancelsPendingRestore {
+            reflowPosition.cancelForNavigation()
+        }
+        return accepted
+    }
+
+    private func anchorNavigation(for event: Event) -> ReflowAnchorNavigation {
+        switch event {
+        case .load:
+            return .load
+        case .loaded:
+            return .loaded
+        case .jump:
+            return .jump
+        case .jumped:
+            return .jumped
+        case .move:
+            return .move
+        case .interactiveMove:
+            return .interactiveMove
+        case .moved:
+            return .moved
+        }
     }
 
     /// Mapping between reading order hrefs and the table of contents title.
@@ -595,6 +679,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
     private var paginationView: PaginationView?
     private var curlPan: PageCurlPanController?
+    private let reflowPosition = ReflowPositionKeeper()
 
     private func makePaginationView(hasPositions: Bool) -> PaginationView {
         let view = PaginationView(
@@ -771,6 +856,11 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         {
             notifiedCurrentLocation = location
             delegate.navigator(self, locationDidChange: location)
+        }
+        if state == .idle {
+            reflowPosition.noteSettledLocation(
+                on: paginationView?.currentView as? EPUBSpreadView
+            )
         }
     }
 
@@ -1071,12 +1161,18 @@ extension EPUBNavigatorViewController: EPUBNavigatorViewModelDelegate {
             let relayouts = script.contains("readium.setCSSProperties(")
 
             func run(_ view: EPUBSpreadView, href: AnyURL? = nil) async {
+                if relayouts {
+                    await self.holdReadingPositionBeforeCSSRelayout(of: view)
+                }
                 await view.evaluateScript(script, inHREF: href)
                 if relayouts {
                     // The script task is not on the main actor. The flag lives
                     // on the spread view, which is.
                     await MainActor.run {
                         view.settlePresentationAfterRelayout()
+                        if view === self.paginationView?.currentView {
+                            self.reflowPosition.scheduleRestore()
+                        }
                     }
                 }
             }
@@ -1396,6 +1492,46 @@ extension EPUBNavigatorViewController: PaginationViewDelegate {
     func paginationView(_ paginationView: PaginationView, positionCountAtIndex index: Int) -> Int {
         spreads[index].positionCount(in: readingOrder, positionsByReadingOrder: positionsByReadingOrder)
     }
+
+    func paginationView(_ paginationView: PaginationView, divisionDidChange sample: FoldPostureSample) {
+        let gap = PageCurlGeometry.columnGapClearingFold(
+            defaultGap: 0,
+            foldFrame: sample.division,
+            viewport: paginationView.bounds
+        )
+        let x = sample.normalizedX.map { String(format: "%.3f", $0) } ?? "nil"
+        log(.info, "fold-posture x=\(x) width=\(String(format: "%.1f", sample.width)) gap=\(String(format: "%.1f", gap)) bounds=\(paginationView.bounds.size)")
+        Task { @MainActor in
+            await self.applyFoldColumnGap(gap)
+        }
+    }
+
+    /// Applies the crease gap, and keeps the visible element when the gap
+    /// actually changes. A spine-only move (the fold slides, the width does
+    /// not) updates `divisionNormalizedX` and leaves the columns alone.
+    private func applyFoldColumnGap(_ gap: CGFloat) async {
+        let dragging = curlPan?.dragInFlight == true
+        if dragging {
+            await curlPan?.abortDrag()
+        }
+        let points: CGFloat? = gap > 0.5 ? gap : nil
+        guard viewModel.foldColumnGapWouldChange(points) else {
+            return
+        }
+        if let spread = paginationView?.currentView as? EPUBSpreadView,
+           spread.isSpreadReadyForPresentation,
+           !reflowPosition.isHolding
+        {
+            let visible = dragging
+                ? (reflowPosition.settledVisibleLocator ?? currentLocation)
+                : (await spread.findFirstVisibleElementLocator() ?? currentLocation)
+            reflowPosition.hold(on: spread, locator: visible)
+        }
+        guard viewModel.applyFoldColumnGap(points) else {
+            return
+        }
+        reflowPosition.scheduleRestore()
+    }
 }
 
 extension EPUBNavigatorViewController: PageCurlPanDelegate {
@@ -1456,12 +1592,13 @@ extension EPUBNavigatorViewController: PageCurlPanDelegate {
         let rtl = viewModel.readingProgression == .rtl
         let forward = direction == .forward
         let columns = await spread.renderedColumnCount()
-        let spine = PageCurlGeometry.animationSpine(
+        let divisionX = paginationView?.divisionNormalizedX
+        let spine = PageCurlSpine.resolve(
             renderedColumns: columns,
             rtl: rtl,
-            forward: forward,
-            divisionNormalizedX: nil
+            divisionNormalizedX: divisionX
         )
+        log(.info, "curl-spine columns=\(columns) division=\(divisionX.map { String(format: "%.3f", $0) } ?? "nil") spine=\(spine) forward=\(forward)")
         let peel = PageCurlGeometry.peelSign(spine: spine, rtl: rtl, forward: forward)
         let spreadDirection = spreadDirection(for: direction)
 

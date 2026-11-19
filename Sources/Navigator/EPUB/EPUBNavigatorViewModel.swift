@@ -394,6 +394,47 @@ enum EPUBScriptScope {
         }
     }
 
+    /// `nil` clears a gap this observer applied. The stylesheet default is 0,
+    /// and omitting the variable would leave the previous inline width in place.
+    private var appliedFoldGap: String?
+
+    func foldColumnGapWouldChange(_ points: CGFloat?) -> Bool {
+        foldGapToken(points) != appliedFoldGap
+    }
+
+    /// Sends `--RS__colGap` when the crease changes. Returns false when the
+    /// value is the one already applied, including the never-applied flat case.
+    @discardableResult
+    func applyFoldColumnGap(_ points: CGFloat?) -> Bool {
+        guard let token = foldGapToken(points), token != appliedFoldGap else {
+            return false
+        }
+        appliedFoldGap = token
+        if let points, points.isFinite, points > 0.5 {
+            css.rsProperties.colGap = CSSPxLength(Double(points))
+        } else {
+            css.rsProperties.colGap = CSSPxLength(0)
+        }
+        let payload = "{\"--RS__colGap\":\"\(token)\"}"
+        delegate?.epubNavigatorViewModel(
+            self,
+            runScript: "readium.setCSSProperties(\(payload));",
+            in: .loadedResources
+        )
+        return true
+    }
+
+    /// Empty when there is nothing to send: no fold, and none was applied.
+    private func foldGapToken(_ points: CGFloat?) -> String? {
+        if let points, points.isFinite, points > 0.5 {
+            return String(format: "%.5fpx", points)
+        }
+        guard appliedFoldGap != nil else {
+            return nil
+        }
+        return "0.00000px"
+    }
+
     // MARK: - Accessibility
 
     private var isVoiceOverRunning = UIAccessibility.isVoiceOverRunning

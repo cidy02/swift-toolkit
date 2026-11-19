@@ -27,6 +27,53 @@ enum PageCurlSpine: Equatable {
             return normalizedX
         }
     }
+
+    /// One rendered column is an edge curl, even if a fold x is passed.
+    /// Two columns use that x, or the centre when the device is flat.
+    static func resolve(
+        renderedColumns: Int,
+        rtl: Bool,
+        divisionNormalizedX: CGFloat?
+    ) -> PageCurlSpine {
+        PageCurlGeometry.resolveSpine(
+            renderedColumns: renderedColumns,
+            rtl: rtl,
+            divisionNormalizedX: divisionNormalizedX
+        )
+    }
+
+    /// Same decision from the live reserved regions. A horizontal fold is not
+    /// a division here, so it cannot pin the spine.
+    static func resolve(
+        renderedColumns: Int,
+        rtl: Bool,
+        regions: [PageCurlDivisionSample],
+        viewport: CGRect
+    ) -> PageCurlSpine {
+        let frame = PageCurlGeometry.activeVerticalDivision(regions: regions, viewport: viewport)
+        let x = frame.flatMap { PageCurlGeometry.normalizedDivisionX(of: $0, in: viewport) }
+        return resolve(renderedColumns: renderedColumns, rtl: rtl, divisionNormalizedX: x)
+    }
+}
+
+extension PageCurlSpine: CustomStringConvertible {
+    var description: String {
+        switch self {
+        case .leading:
+            return "leading"
+        case .trailing:
+            return "trailing"
+        case let .center(normalizedX):
+            return String(format: "center %.3f", normalizedX)
+        }
+    }
+}
+
+/// One `.division` region as Readium sees it. `frame` is in the viewport's
+/// coordinates. Inactive and horizontal regions are not a book split.
+struct PageCurlDivisionSample: Equatable {
+    var frame: CGRect
+    var isActive: Bool
 }
 
 /// Paper colour mixed into a one-page underside. `mix` is how far the mirrored
@@ -170,6 +217,77 @@ enum PageCurlGeometry {
             return 0.5
         }
         return min(divisionRange.upperBound, max(divisionRange.lowerBound, x))
+    }
+
+    /// The active vertical fold, or nil. Height >= width matches the pane
+    /// split Kudos already uses. A wider-than-tall region is tabletop.
+    /// A zero-width crease still counts: its midX is the hinge.
+    static func activeVerticalDivision(
+        regions: [PageCurlDivisionSample],
+        viewport: CGRect
+    ) -> CGRect? {
+        guard viewport.width > 1, viewport.height > 1 else {
+            return nil
+        }
+        var best: CGRect?
+        var bestArea: CGFloat = 0
+        for region in regions where region.isActive {
+            let frame = region.frame
+            guard frame.height >= frame.width, frame.height > 0, frame.midX.isFinite else {
+                continue
+            }
+            guard frame.maxY > viewport.minY, frame.minY < viewport.maxY else {
+                continue
+            }
+            guard frame.midX >= viewport.minX, frame.midX <= viewport.maxX else {
+                continue
+            }
+            let overlapHeight = min(frame.maxY, viewport.maxY) - max(frame.minY, viewport.minY)
+            let area = max(frame.width, 0.01) * overlapHeight
+            if area > bestArea {
+                bestArea = area
+                best = frame
+            }
+        }
+        return best
+    }
+
+    /// Fold midX as a fraction of the viewport width. 0 is the left edge.
+    /// Clamping happens in `resolveSpine`, not here.
+    static func normalizedDivisionX(of frame: CGRect, in viewport: CGRect) -> CGFloat? {
+        guard viewport.width > 1, frame.midX.isFinite else {
+            return nil
+        }
+        return (frame.midX - viewport.minX) / viewport.width
+    }
+
+    /// Column gap that keeps text out of the crease. CSS centres the gap, so
+    /// an off-centre fold needs a wider gap than the fold itself or the inner
+    /// edge of a column still sits under the hinge. No fold keeps `defaultGap`.
+    static func columnGapClearingFold(
+        defaultGap: CGFloat,
+        foldFrame: CGRect?,
+        viewport: CGRect
+    ) -> CGFloat {
+        let base = (defaultGap.isFinite && defaultGap > 0) ? defaultGap : 0
+        guard
+            let fold = foldFrame,
+            viewport.width > 1,
+            fold.width.isFinite,
+            fold.width > 0,
+            fold.minX.isFinite,
+            fold.maxX.isFinite
+        else {
+            return base
+        }
+        let left = max(0, fold.minX - viewport.minX)
+        let right = min(viewport.width, fold.maxX - viewport.minX)
+        guard right > left else {
+            return base
+        }
+        let coverLeft = viewport.width - 2 * left
+        let coverRight = 2 * right - viewport.width
+        return max(base, fold.width, coverLeft, coverRight)
     }
 
     /// How far a tilted fold leads the page edge, in `along` units (view widths).

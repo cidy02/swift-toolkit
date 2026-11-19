@@ -653,17 +653,31 @@ class EPUBSpreadView: UIView, Loggable, PageView {
 
     func findFirstVisibleElementLocator() async -> Locator? {
         let result = await evaluateScript("readium.findFirstVisibleLocator()")
-        do {
-            let link = spread.first.link
+        return visibleLocator(from: try? result.get())
+    }
 
+    /// Starts the probe before the caller returns, so a size transition has
+    /// not yet resized the web view when WebKit runs the script.
+    func startVisibleLocatorProbe(_ completion: @escaping (Locator?) -> Void) {
+        webView.evaluateJavaScript("readium.findFirstVisibleLocator()") { [weak self] result, _ in
+            let parsed = result
+            Task { @MainActor in
+                completion(self?.visibleLocator(from: parsed))
+            }
+        }
+    }
+
+    private func visibleLocator(from result: Any?) -> Locator? {
+        do {
             guard
-                let json = try JSONValue(result.get()),
+                let result,
+                let json = JSONValue(result),
                 let locator = try Locator(json: json)
             else {
                 return nil
             }
+            let link = spread.first.link
             return locator.copy(href: link.url(), mediaType: link.mediaType ?? .xhtml)
-
         } catch {
             log(.error, error)
             return nil

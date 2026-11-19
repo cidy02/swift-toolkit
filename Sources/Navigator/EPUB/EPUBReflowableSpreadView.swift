@@ -274,12 +274,13 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         }
         let rtl = viewModel.readingProgression == .rtl
         let forward = isForward(direction)
-        let spine = PageCurlGeometry.animationSpine(
+        let divisionX = pageCurlDivisionNormalizedX
+        let spine = PageCurlSpine.resolve(
             renderedColumns: columns,
             rtl: rtl,
-            forward: forward,
-            divisionNormalizedX: nil
+            divisionNormalizedX: divisionX
         )
+        log(.info, "curl-spine columns=\(columns) division=\(divisionX.map { String(format: "%.3f", $0) } ?? "nil") spine=\(spine) forward=\(forward)")
         let curlView = PageCurlView(frame: bounds)
         curlView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         curlView.showCover(outgoing, background: background)
