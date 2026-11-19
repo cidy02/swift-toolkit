@@ -25,6 +25,9 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
     private var progressionChangedWhileSuppressed = false
     /// Column step applied for a finger curl. Cancel scrolls it back.
     private var curlDelta: CGFloat = 0
+    /// JS `scrollX` the commit must land on. A flick can scroll under the
+    /// cover and have WebKit put the column back when the touch ends.
+    private var curlTargetX: CGFloat?
     /// A cancel restores the previous column, then a late scroll message can
     /// still arrive. Drop progression events until this time so the peek does
     /// not become a location, including on the last page of a work.
@@ -288,8 +291,23 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
             return nil
         }
         curlDelta = delta
+        // Nil when the column position cannot be read. The curl still runs;
+        // a bad read must not veto a turn that `scrollBy` already made.
+        let target = await columnScrollX().map { $0 + delta }
+        curlTargetX = target
         setSuppressingProgressionUpdates(true)
         await scrollByAwaitingPaint(delta)
+        if let target {
+            if let now = await columnScrollX(), abs(now - target) > 2 {
+                await scrollToAwaitingPaint(target)
+            }
+            // The column never moved (clamped, or WebKit put it back). Curling
+            // here would photograph the page that is already showing.
+            if let landed = await columnScrollX(), abs(landed - target) > 2 {
+                await revertCurlIncoming()
+                return nil
+            }
+        }
         guard let image = await PageCurlSnapshotter.capture(of: self, backgroundColor: background) else {
             await revertCurlIncoming()
             return nil
@@ -300,15 +318,24 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
     /// Puts the column back and drops the peeked progression. No location event.
     func revertCurlIncoming() async {
         let delta = curlDelta
+        let target = curlTargetX
         curlDelta = 0
-        if delta != 0 {
+        curlTargetX = nil
+        if let target {
+            await scrollToAwaitingPaint(target - delta)
+        } else if delta != 0 {
             await scrollByAwaitingPaint(-delta)
         }
         discardSuppressedProgression()
     }
 
-    /// The column is already the one the finger committed to. Emit that once.
-    func commitCurlIncoming() {
+    /// The column is the one the finger committed to. Put it there again in
+    /// case the touch-end restored the old scroll, then emit that once.
+    func commitCurlIncoming() async {
+        if let target = curlTargetX {
+            await scrollToAwaitingPaint(target)
+        }
+        curlTargetX = nil
         curlDelta = 0
         setSuppressingProgressionUpdates(false)
     }
@@ -394,7 +421,34 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         case timedOut
     }
 
+    /// `window.scrollX`. RTL is negative; `pageDelta` is in that same space.
+    /// Nil when the page did not answer, so the caller can leave the column alone.
+    private func columnScrollX() async -> CGFloat? {
+        let result = await evaluateScript(
+            "(function(){ var s = document.scrollingElement || document.documentElement; var x = window.scrollX; if (typeof x !== 'number' || !isFinite(x)) return null; if (x === 0 && s && typeof s.scrollLeft === 'number' && isFinite(s.scrollLeft)) x = s.scrollLeft; return x; })()"
+        )
+        guard case let .success(value) = result else {
+            return nil
+        }
+        if let number = value as? NSNumber {
+            let x = CGFloat(number.doubleValue)
+            return x.isFinite ? x : nil
+        }
+        if let text = value as? String, let parsed = Double(text), parsed.isFinite {
+            return CGFloat(parsed)
+        }
+        return nil
+    }
+
+    private func scrollToAwaitingPaint(_ x: CGFloat) async {
+        await scrollAwaitingPaint("window.scrollTo({ left: x, behavior: 'instant' });", x: x)
+    }
+
     private func scrollByAwaitingPaint(_ offsetX: CGFloat) async {
+        await scrollAwaitingPaint("window.scrollBy({ left: x, behavior: 'instant' });", x: offsetX)
+    }
+
+    private func scrollAwaitingPaint(_ scrollCall: String, x: CGFloat) async {
         // Same retain as `ReadyResume.awaitFirst`. A weak box here never
         // resumes, so the fade cover stays up and the column looks unturned.
         let result: PaintScroll = await ReadyResume.awaitFirst { box in
@@ -407,14 +461,14 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
                     _ = try await self.webView.callAsyncJavaScript(
                         """
                         document.documentElement.dataset.readiumTransitioning = '1';
-                        window.scrollBy({ left: offsetX, behavior: 'instant' });
+                        \(scrollCall)
                         return await new Promise((resolve) => {
                           requestAnimationFrame(() => {
                             requestAnimationFrame(() => resolve(true));
                           });
                         });
                         """,
-                        arguments: ["offsetX": offsetX],
+                        arguments: ["x": x],
                         in: nil,
                         contentWorld: .page
                     )
@@ -427,7 +481,8 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         // A timeout must not scroll a second time: the script may already have
         // moved by one page, and a fallback `scrollBy` would skip the next one.
         if result == .failed {
-            await evaluateScript("window.scrollBy({ left: \(offsetX), behavior: 'instant' });")
+            let call = scrollCall.replacingOccurrences(of: "left: x", with: "left: \(x)")
+            await evaluateScript(call)
         }
     }
 

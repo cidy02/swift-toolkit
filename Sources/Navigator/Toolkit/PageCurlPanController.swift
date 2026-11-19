@@ -58,6 +58,10 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
     private var metalArmed = false
     private var revealed = false
     private var velocities: [CGFloat] = []
+    /// Highest progress while the finger was down. `.ended` sometimes reports
+    /// a zero translation, which would cancel a flick that had already crossed.
+    private var trackedProgress: CGFloat = 0
+    private var endConsumed = false
     private var prepareTask: Task<Void, Never>?
     /// Set when the finger lifts before the incoming page is ready.
     private var pendingRelease: (commit: Bool, velocity: CGFloat)?
@@ -139,6 +143,8 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
         metalArmed = false
         withinResource = false
         velocities = []
+        trackedProgress = 0
+        endConsumed = false
         pendingRelease = nil
         let direction = direction
         prepareTask = Task { @MainActor [weak self] in
@@ -222,8 +228,9 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
         if velocities.count > 3 {
             velocities.removeFirst(velocities.count - 3)
         }
-        guard phase == .armed, metalArmed, let curlView else { return }
         let finger = fingerState(of: gesture, in: host)
+        trackedProgress = max(trackedProgress, finger.progress)
+        guard phase == .armed, metalArmed, let curlView else { return }
         curlView.track(progress: finger.progress, touchY: finger.touchY)
     }
 
@@ -238,7 +245,13 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
         }
         let velocity = PageCurlPanStateMachine.smoothedVelocity(velocities)
         let width = gesture.view?.bounds.width ?? 1
-        let progress = gesture.view.map { fingerState(of: gesture, in: $0).progress } ?? 0
+        let live = gesture.view.map { fingerState(of: gesture, in: $0).progress } ?? 0
+        let progress = releaseProgress(
+            live: live,
+            cancelled: cancelled,
+            turnVelocity: velocity,
+            width: width
+        )
         let decision = PageCurlPanStateMachine.release(
             progress: progress,
             turnVelocity: velocity,
@@ -250,12 +263,35 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
         case .preparing:
             pendingRelease = (commit, velocity)
         case .armed:
+            // `.ended` then `.cancelled` must not start a second finish that
+            // reverts a turn the first one is about to commit.
+            guard !endConsumed else { return }
+            endConsumed = true
             Task { @MainActor in
                 await self.finish(commit: commit, velocity: velocity)
             }
         case .idle, .finishing:
             break
         }
+    }
+
+    /// A flick's `.ended` sample can report a zero translation after the leaf
+    /// has already crossed. A drag that came back to the start has no forward
+    /// velocity, so that release still cancels.
+    private func releaseProgress(
+        live: CGFloat,
+        cancelled: Bool,
+        turnVelocity: CGFloat,
+        width: CGFloat
+    ) -> CGFloat {
+        if cancelled {
+            return live
+        }
+        let crossed = trackedProgress > PageCurlPanStateMachine.distanceCommit
+        if live < 0.02, crossed, turnVelocity > 0, width > 1 {
+            return trackedProgress
+        }
+        return live
     }
 
     private func finish(commit: Bool, velocity: CGFloat) async {

@@ -1486,7 +1486,7 @@ extension EPUBNavigatorViewController: PageCurlPanDelegate {
 
     func curlPanCommit(direction: PageCurlTurnDirection, withinResource: Bool) async {
         if withinResource {
-            (paginationView?.currentView as? EPUBReflowableSpreadView)?.commitCurlIncoming()
+            await (paginationView?.currentView as? EPUBReflowableSpreadView)?.commitCurlIncoming()
             return
         }
         await paginationView?.commitCurlNeighbor(forward: direction == .forward)
