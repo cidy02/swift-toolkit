@@ -93,17 +93,27 @@ struct PageCurlRGB: Equatable {
     var b: CGFloat
 }
 
+/// The fold for one grab. `point` lies on the perpendicular bisector of the
+/// segment from the held point to the finger. `normal` is the unit direction
+/// of that segment (held point → finger). `axis` is the bisector shifted by
+/// `radius` along `normal`: the cylinder's crest. `clamped` means the bisector
+/// was pushed back so it does not cross the spine.
+struct PageCurlGrabFold: Equatable {
+    var point: CGPoint
+    var normal: CGPoint
+    var axis: CGPoint
+    var radius: CGFloat
+    var clamped: Bool
+}
+
 /// Pure curl decisions. The shader reads the numbers; it does not decide them
 /// and it has no clock.
 enum PageCurlGeometry {
     /// Tap-curl length. A finger drag does not use this.
     static let tapDuration: TimeInterval = 0.38
-    /// Bottom corner on a tap. 0.84 is about 16° from vertical
-    /// (`tiltRadians` at `maxTilt` is the finger's extreme, about ±24°).
-    /// A drag replaces this with the finger's `touchY`. Mid-page 0.5 stays vertical.
-    static let tapTouchY: CGFloat = 0.84
-    /// The axis stays attached to the spine. About ±24°.
-    static let maxTilt: CGFloat = 0.42
+    /// Where a tap's corner finishes, as a fraction of the page height from the top.
+    /// The corner starts at the bottom and rises as it crosses.
+    static let tapLift: CGFloat = 0.36
     /// Peak cylinder radius as a fraction of view width, at progress 0.5.
     /// The roll on screen is `2 * radius` wide, so 0.10 is a fifth of the page
     /// at mid-turn. 0.07 read as a thin band rather than a paper roll.
@@ -137,13 +147,131 @@ enum PageCurlGeometry {
         return peak * envelope
     }
 
-    /// `touchY` is 0 at the top and 1 at the bottom. Mid-page is a vertical axis.
-    static func tiltRadians(touchY: CGFloat) -> CGFloat {
-        guard touchY.isFinite else {
-            return 0
+    static func mix(_ a: CGPoint, _ b: CGPoint, _ t: CGFloat) -> CGPoint {
+        let u = t.isFinite ? t : 0
+        return CGPoint(x: a.x + (b.x - a.x) * u, y: a.y + (b.y - a.y) * u)
+    }
+
+    /// Touch-down, projected onto the outer edge of the leaf at that height.
+    /// A grab near the bottom holds the bottom corner; mid-edge holds the edge;
+    /// near the top holds the top corner. `touchUV` is 0...1, origin top-left.
+    /// The result is isotropic: x in view widths, y in view widths from the top.
+    static func heldPoint(
+        touchUV: CGPoint,
+        spineX: CGFloat,
+        peelSign: CGFloat,
+        span: CGFloat,
+        aspect: CGFloat
+    ) -> CGPoint {
+        let safeAspect = max(aspect.isFinite ? aspect : 1, 0.05)
+        let yUV = min(1, max(0, touchUV.y.isFinite ? touchUV.y : 1))
+        let sign: CGFloat = peelSign >= 0 ? 1 : -1
+        let leaf = max(span.isFinite ? span : 1, 0.05)
+        let spine = spineX.isFinite ? spineX : 0
+        return CGPoint(x: spine + sign * leaf, y: yUV / safeAspect)
+    }
+
+    /// Current finger, same isotropic space as `heldPoint`. Not clamped: the
+    /// finger can leave the page, and the fold follows it.
+    static func fingerPoint(touchUV: CGPoint, aspect: CGFloat) -> CGPoint {
+        let safeAspect = max(aspect.isFinite ? aspect : 1, 0.05)
+        let x = touchUV.x.isFinite ? touchUV.x : 0
+        let y = touchUV.y.isFinite ? touchUV.y : 0
+        return CGPoint(x: x, y: y / safeAspect)
+    }
+
+    /// Synthetic grab for a tap. P0 is the lower outer corner. P moves toward
+    /// the mirror of that corner across the spine, and up, so the fold is the
+    /// diagonal a corner peel makes. Progress 0 is flat (P = P0).
+    static func tapGrab(
+        progress: CGFloat,
+        spineX: CGFloat,
+        peelSign: CGFloat,
+        span: CGFloat,
+        pageHeight: CGFloat
+    ) -> (p0: CGPoint, p: CGPoint) {
+        let sign: CGFloat = peelSign >= 0 ? 1 : -1
+        let leaf = max(span.isFinite ? span : 1, 0.05)
+        let height = max(pageHeight.isFinite ? pageHeight : 1, 0.05)
+        let spine = spineX.isFinite ? spineX : 0
+        let p0 = CGPoint(x: spine + sign * leaf, y: height)
+        let landing = CGPoint(x: spine - sign * leaf, y: height * tapLift)
+        let p = mix(p0, landing, clampProgress(progress))
+        return (p0, p)
+    }
+
+    /// Where the held point should finish on a commit, continuing the drag's
+    /// own direction until it has crossed the spine. A straight drag stays at
+    /// its height. A corner drag keeps its diagonal.
+    static func commitLanding(
+        p0: CGPoint,
+        p: CGPoint,
+        spineX: CGFloat,
+        peelSign: CGFloat,
+        span: CGFloat,
+        pageHeight: CGFloat
+    ) -> CGPoint {
+        let sign: CGFloat = peelSign >= 0 ? 1 : -1
+        let leaf = max(span.isFinite ? span : 1, 0.05)
+        let spine = spineX.isFinite ? spineX : 0
+        let across = spine - sign * leaf
+        let height = max(pageHeight.isFinite ? pageHeight : 1, 0.05)
+        let xDelta = p.x - p0.x
+        let travelX = across - p0.x
+        if !xDelta.isFinite || !travelX.isFinite || abs(xDelta) < 0.02 || abs(travelX) < 0.02 {
+            return CGPoint(x: across, y: height * tapLift)
         }
-        let y = min(1, max(0, touchY))
-        return (y - 0.5) * (maxTilt * 2)
+        let scale = travelX / xDelta
+        var y = p0.y + (p.y - p0.y) * scale
+        if !y.isFinite {
+            y = height * tapLift
+        }
+        let pad = height * 0.35
+        y = min(height + pad, max(-pad, y))
+        return CGPoint(x: across, y: y)
+    }
+
+    /// Perpendicular bisector of P0→P, then pushed so the spine segment stays
+    /// on the unturned side. The cylinder axis is that line offset by `radius`
+    /// toward the finger. Nil when the finger has not moved.
+    static func grabFold(
+        p0: CGPoint,
+        p: CGPoint,
+        radius: CGFloat,
+        spineX: CGFloat,
+        pageHeight: CGFloat
+    ) -> PageCurlGrabFold? {
+        let dx = p.x - p0.x
+        let dy = p.y - p0.y
+        guard dx.isFinite, dy.isFinite else {
+            return nil
+        }
+        let len = (dx * dx + dy * dy).squareRoot()
+        guard len > 0.0008 else {
+            return nil
+        }
+        let nx = dx / len
+        let ny = dy / len
+        var mx = (p0.x + p.x) * 0.5
+        var my = (p0.y + p.y) * 0.5
+        let height = pageHeight.isFinite ? pageHeight : 1
+        let spine = spineX.isFinite ? spineX : 0
+        let sTop = (spine - mx) * nx + (0 - my) * ny
+        let sBot = (spine - mx) * nx + (height - my) * ny
+        let minS = min(sTop, sBot)
+        let clamped = minS < 0
+        if clamped {
+            mx += nx * minS
+            my += ny * minS
+        }
+        let r = max(radius.isFinite ? radius : 0, 0)
+        return PageCurlGrabFold(
+            point: CGPoint(x: mx, y: my),
+            normal: CGPoint(x: nx, y: ny),
+            axis: CGPoint(x: mx + nx * r, y: my + ny * r),
+            radius: r,
+            clamped: clamped
+        )
     }
 
     /// Binding for the page as it sits, ignoring which way this turn peels.
@@ -318,64 +446,6 @@ enum PageCurlGeometry {
     :root[style*="--RS__foldInset"] body { -webkit-box-decoration-break: clone !important; box-decoration-break: clone !important; padding-left: max(var(--RS__pageGutter, 0px) * var(--USER__pageMargins, 1), var(--RS__foldInset)) !important; padding-right: max(var(--RS__pageGutter, 0px) * var(--USER__pageMargins, 1), var(--RS__foldInset)) !important; }
     """
 
-    /// How far a tilted fold leads the page edge, in `along` units (view widths).
-    /// `aspect` is view width / height, the same value the shader stores.
-    /// The leading corner is one `overhang` ahead of the centre fold line.
-    static func tiltOverhang(tilt: CGFloat, aspect: CGFloat) -> CGFloat {
-        guard tilt.isFinite else {
-            return 0
-        }
-        let safeAspect = max(aspect.isFinite ? aspect : 1, 0.05)
-        return abs(tan(tilt)) * (0.5 / safeAspect)
-    }
-
-    /// Width past the spine that a two-page turn still has to cross.
-    /// A one-page leaf has none: its far edge is the spine.
-    static func farSpan(twoPage: Bool, span: CGFloat) -> CGFloat {
-        guard twoPage, span.isFinite else {
-            return 0
-        }
-        return max(0, 1 - span)
-    }
-
-    /// Centre of the fold in `along` units. Starts at `span + overhang`, past
-    /// the leading corner, and ends at `-far - overhang - curlWidth`, past the
-    /// trailing corner, so neither corner pops on or off in one frame.
-    /// `curlWidth` is `2 * cylinderRadius` (the roll's width on screen).
-    static func foldCenter(
-        progress: CGFloat,
-        span: CGFloat,
-        overhang: CGFloat,
-        curlWidth: CGFloat,
-        far: CGFloat
-    ) -> CGFloat {
-        let p = clampProgress(progress)
-        let leaf = max(span.isFinite ? span : 1, 0.05)
-        let lead = max(overhang.isFinite ? overhang : 0, 0)
-        let roll = max(curlWidth.isFinite ? curlWidth : 0, 0)
-        let beyond = max(far.isFinite ? far : 0, 0)
-        let travel = leaf + beyond + 2 * lead + roll
-        return (leaf + lead) - p * travel
-    }
-
-    /// Fold line at one row. `normalizedY` is 0 at the top and 1 at the bottom.
-    /// Positive tilt drops the line toward the spine at the bottom.
-    static func foldLine(
-        fold: CGFloat,
-        tilt: CGFloat,
-        normalizedY: CGFloat,
-        aspect: CGFloat
-    ) -> CGFloat {
-        guard fold.isFinite else {
-            return 0
-        }
-        let safeAspect = max(aspect.isFinite ? aspect : 1, 0.05)
-        let y = min(1, max(0, normalizedY.isFinite ? normalizedY : 0.5))
-        let yOff = (y - 0.5) / safeAspect
-        let angle = tilt.isFinite ? tilt : 0
-        return fold - tan(angle) * yOff
-    }
-
     /// Columns actually used. CSS `column-count` stays at the requested count
     /// when the widths do not fit; `column-width` is what WebKit honoured.
     /// A non-positive `columnWidth` means `auto` (trust the CSS count).
@@ -471,13 +541,6 @@ enum PageCurlGeometry {
         return drift
     }
 
-    /// Tilt the shader should use. A reversed one-page uncurl runs progress
-    /// backwards, so the same tilt sign would lift the opposite corner.
-    static func displayedTilt(touchY: CGFloat, reversed: Bool) -> CGFloat {
-        let raw = tiltRadians(touchY: touchY)
-        return reversed ? -raw : raw
-    }
-
     /// Verso position in `along` units. Two pages scale the leaf onto the far
     /// half so an off-centre spine does not sample past that half.
     static func versoAlong(orig: CGFloat, span: CGFloat, twoPage: Bool) -> CGFloat {
@@ -489,8 +552,9 @@ enum PageCurlGeometry {
         return -orig * (far / leaf)
     }
 
-    /// Which bitmap a pixel samples. The shader's roll branch matches this.
-    /// `x` is unclamped: a value outside 0...1 is a hole, not a clamped edge.
+    /// Which bitmap a pixel samples. The shader's flap branch matches this.
+    /// `x` is unclamped. The shader clamps it when sampling; a flap pixel is
+    /// never a hole onto the next page.
     struct SpreadSample: Equatable {
         enum Sheet: Equatable {
             case outgoing
@@ -500,9 +564,10 @@ enum PageCurlGeometry {
         enum Region: Equatable {
             case flatOutgoing
             case flatIncoming
-            case rollFront
+            /// Cylinder band: the back, between the fold and the axis's far side.
             case rollBack
-            case offLeaf
+            /// Flat back of the leaf, from the cylinder out to the moved edge.
+            case flatBack
         }
 
         var sheet: Sheet
@@ -510,6 +575,10 @@ enum PageCurlGeometry {
         var region: Region
     }
 
+    /// `p0` and `p` are isotropic (x in view widths, y in view widths from the
+    /// top), the same space as `grabFold`. `radius` is the cylinder radius in
+    /// that space. One page's back samples the outgoing sheet at the reflected
+    /// point (the mirror). Two pages sample the incoming facing half, not mirrored.
     static func spreadSample(
         uvX: CGFloat,
         uvY: CGFloat,
@@ -519,7 +588,9 @@ enum PageCurlGeometry {
         span: CGFloat,
         twoPage: Bool,
         realVerso: Bool,
-        tilt: CGFloat,
+        p0: CGPoint,
+        p: CGPoint,
+        radius: CGFloat,
         aspect: CGFloat
     ) -> SpreadSample {
         let u = min(1, max(0, uvX.isFinite ? uvX : 0))
@@ -538,54 +609,69 @@ enum PageCurlGeometry {
         if shown >= 0.999 {
             return sample(.incoming, u, .flatIncoming)
         }
-        let leafSpan = max(span.isFinite ? span : 0.05, 0.05)
-        let radius = cylinderRadius(progress: shown, span: leafSpan)
-        if radius < 0.0001 {
+        // A vanishing cylinder is a hard crease. Stay flat until the roll exists.
+        if radius.isFinite, radius < 0.004 {
             return shown > 0.5
                 ? sample(.incoming, u, .flatIncoming)
                 : sample(.outgoing, u, .flatOutgoing)
         }
+        let safeAspect = max(aspect.isFinite ? aspect : 1, 0.05)
+        let pageH = 1 / safeAspect
+        let leafSpan = max(span.isFinite ? span : 0.05, 0.05)
         let sign: CGFloat = peelSign >= 0 ? 1 : -1
-        let along = (u - spineX) * sign
-        let centre = foldCenter(
-            progress: shown,
-            span: leafSpan,
-            overhang: tiltOverhang(tilt: tilt, aspect: aspect),
-            curlWidth: radius * 2,
-            far: farSpan(twoPage: twoPage, span: leafSpan)
+        let iso = CGPoint(x: u, y: v / safeAspect)
+        guard let fold = grabFold(
+            p0: p0,
+            p: p,
+            radius: radius,
+            spineX: spineX,
+            pageHeight: pageH
+        ) else {
+            return shown > 0.5
+                ? sample(.incoming, u, .flatIncoming)
+                : sample(.outgoing, u, .flatOutgoing)
+        }
+        let s = (iso.x - fold.point.x) * fold.normal.x + (iso.y - fold.point.y) * fold.normal.y
+        let pre = CGPoint(
+            x: iso.x - 2 * s * fold.normal.x,
+            y: iso.y - 2 * s * fold.normal.y
         )
-        let line = foldLine(fold: centre, tilt: tilt, normalizedY: v, aspect: aspect)
-        let dist = along - line
-        if dist <= 0 {
+        func inLeaf(_ q: CGPoint) -> Bool {
+            let along = (q.x - spineX) * sign
+            if along < -0.004 || along > leafSpan + 0.004 {
+                return false
+            }
+            if q.y < -0.004 || q.y > pageH + 0.004 {
+                return false
+            }
+            return true
+        }
+        // The flap is the reflection of the peeled part of the leaf. It lies on
+        // the finger's side of the fold, over the page, out to the moved edge.
+        if s > 0, inLeaf(pre) {
+            let sheet: SpreadSample.Sheet = realVerso ? .incoming : .outgoing
+            let x: CGFloat
+            if realVerso {
+                let along = (pre.x - spineX) * sign
+                x = spineX + sign * versoAlong(orig: along, span: leafSpan, twoPage: twoPage)
+            } else {
+                x = pre.x
+            }
+            let region: SpreadSample.Region = s < fold.radius * 2 ? .rollBack : .flatBack
+            return sample(sheet, x, region)
+        }
+        if inLeaf(iso), s >= 0 {
             return sample(.outgoing, u, .flatOutgoing)
         }
-        let curlWidth = 2 * radius
-        if dist >= curlWidth {
-            return sample(.incoming, u, .flatIncoming)
+        // The other page of a spread stays put. The fold is not allowed to
+        // cross the spine, so this half is not peeled.
+        if twoPage {
+            let along = (iso.x - spineX) * sign
+            if along < -0.004, iso.x >= -0.02, iso.x <= 1.02, iso.y >= -0.02, iso.y <= pageH + 0.02 {
+                return sample(.outgoing, u, .flatOutgoing)
+            }
         }
-        let t = dist / curlWidth
-        let orig = line + t * .pi * radius
-        if orig > leafSpan {
-            return sample(.incoming, u, .offLeaf)
-        }
-        func leafX(_ leaf: CGFloat) -> CGFloat {
-            spineX + sign * leaf
-        }
-        // The leaf has crossed the spine. Lay the verso down on the far half.
-        // The static half stays flat behind it, and the near incoming half is
-        // not wrapped onto the back of the roll.
-        if twoPage, orig < 0 {
-            let region: SpreadSample.Region = t < 0.5 ? .rollFront : .rollBack
-            return sample(.incoming, leafX(orig), region)
-        }
-        if t < 0.5 {
-            return sample(.outgoing, leafX(orig), .rollFront)
-        }
-        let backLeaf = realVerso
-            ? versoAlong(orig: orig, span: leafSpan, twoPage: twoPage)
-            : (leafSpan - orig)
-        let sheet: SpreadSample.Sheet = realVerso ? .incoming : .outgoing
-        return sample(sheet, leafX(backLeaf), .rollBack)
+        return sample(.incoming, u, .flatIncoming)
     }
 
     /// What actually plays. The policy is the gate: Reduce Motion, VoiceOver,
@@ -622,12 +708,17 @@ enum PageCurlGeometry {
 }
 
 /// Matches `CurlUniforms` in the shader string. Field order is the contract.
+/// `p0` / `p` are isotropic page points: x in view widths, y in view widths
+/// from the top. The shader rebuilds the bisector from them.
 struct PageCurlUniforms {
     var progress: Float = 0
     var spineX: Float = 0
     var peelSign: Float = 1
     var radius: Float = 0
-    var tilt: Float = 0
+    var p0x: Float = 1
+    var p0y: Float = 1
+    var px: Float = 1
+    var py: Float = 1
     var span: Float = 1
     var realVerso: Float = 0
     var specular: Float = 0.3
@@ -636,8 +727,4 @@ struct PageCurlUniforms {
     var paperB: Float = 1
     var paperMix: Float = 0.96
     var aspect: Float = 1
-    var twoPage: Float = 0
-    /// Centre fold in `along` units. See `PageCurlGeometry.foldCenter`.
-    var fold: Float = 0
-    var pad1: Float = 0
 }

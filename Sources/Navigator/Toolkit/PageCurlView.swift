@@ -8,8 +8,9 @@ import Metal
 import MetalKit
 import UIKit
 
-/// Progress-driven cylinder curl. A tap runs 0→1 on a display link. A finger
-/// sets `progress` and `touchY` itself. Nothing in here times the shader.
+/// Progress-driven cylinder curl. A tap runs 0→1 on a display link, along a
+/// synthetic grab from the lower corner. A finger sets `progress` and the
+/// grab points itself. Nothing in here times the shader.
 @MainActor
 final class PageCurlView: UIView {
     private let coverView = UIImageView()
@@ -26,11 +27,18 @@ final class PageCurlView: UIView {
 
     private var spine: PageCurlSpine = .leading
     private var peelSign: CGFloat = 1
-    private var touchY: CGFloat = PageCurlGeometry.tapTouchY
     private var realVerso = false
     private var reversed = false
     private var paper = PageCurlPaper(r: 0.96, g: 0.96, b: 0.96, mix: PageCurlGeometry.backsideMix, specular: 0.3)
     private var progress: CGFloat = 0
+    /// Tap follows `tapGrab`. A finger uses the points below.
+    private var fingerDriven = false
+    /// Touch-down and the current finger, in view UV (origin top-left).
+    private var grabUV = CGPoint(x: 1, y: 1)
+    private var fingerUV = CGPoint(x: 1, y: 1)
+    /// Isotropic finger positions captured when the spring starts.
+    private var springPFrom = CGPoint(x: 1, y: 1)
+    private var springPTo = CGPoint(x: 1, y: 1)
 
     /// Finger position while a drag is in flight. The display link reads it.
     private var fingerProgress: CGFloat = 0
@@ -172,7 +180,7 @@ final class PageCurlView: UIView {
         self.peelSign = peelSign
         self.realVerso = realVerso
         self.reversed = reversed
-        self.touchY = PageCurlGeometry.tapTouchY
+        fingerDriven = false
         progress = 0
 
         guard isAttached else {
@@ -237,7 +245,8 @@ final class PageCurlView: UIView {
         realVerso: Bool,
         reversed: Bool = false,
         progress: CGFloat,
-        touchY: CGFloat
+        grabUV: CGPoint,
+        fingerUV: CGPoint
     ) async -> Bool {
         finishTap()
         endInteractive()
@@ -245,7 +254,9 @@ final class PageCurlView: UIView {
         self.peelSign = peelSign
         self.realVerso = realVerso
         self.reversed = reversed
-        self.touchY = touchY
+        fingerDriven = true
+        self.grabUV = grabUV
+        self.fingerUV = fingerUV
         fingerProgress = PageCurlGeometry.clampProgress(progress)
         self.progress = 0
         interactivePhase = .catchUp
@@ -281,9 +292,11 @@ final class PageCurlView: UIView {
         return true
     }
 
-    func track(progress: CGFloat, touchY: CGFloat) {
+    func track(progress: CGFloat, fingerUV: CGPoint) {
         fingerProgress = PageCurlGeometry.clampProgress(progress)
-        self.touchY = touchY
+        if fingerUV.x.isFinite, fingerUV.y.isFinite {
+            self.fingerUV = fingerUV
+        }
     }
 
     /// Runs the critically damped spring from the live progress. `progressVelocity`
@@ -300,6 +313,26 @@ final class PageCurlView: UIView {
         springTarget = target
         springOmega = PageCurlPanStateMachine.omega(progressVelocity: velocity)
         springStart = CACurrentMediaTime()
+        let aspect = pageAspect()
+        let leaf = PageCurlGeometry.span(spine: spine, peelSign: peelSign)
+        let pageH = 1 / max(aspect, 0.05)
+        let grab = liveGrab(span: leaf, aspect: aspect)
+        springPFrom = grab.p
+        let landing = PageCurlGeometry.commitLanding(
+            p0: grab.p0,
+            p: grab.p,
+            spineX: spine.normalizedX,
+            peelSign: peelSign,
+            span: leaf,
+            pageHeight: pageH
+        )
+        // A reversed drag is the forward curl run backwards: committing it
+        // closes onto the previous page (P returns to the held point).
+        if reversed {
+            springPTo = target >= 0.5 ? grab.p0 : landing
+        } else {
+            springPTo = target >= 0.5 ? landing : grab.p0
+        }
         interactivePhase = .spring
         if abs(progress - target) < 0.004, abs(velocity) < 0.02 {
             progress = target
@@ -369,27 +402,17 @@ final class PageCurlView: UIView {
         let span = PageCurlGeometry.span(spine: spine, peelSign: peelSign)
         let shown = shownProgress
         let radius = PageCurlGeometry.cylinderRadius(progress: shown, span: span)
-        let size = metal.drawableSize
-        let aspect = size.height > 0 ? Float(size.width / size.height) : 1
-        let twoPage: Bool = {
-            if case .center = spine { return true }
-            return false
-        }()
-        let tilt = PageCurlGeometry.displayedTilt(touchY: touchY, reversed: reversed)
-        let overhang = PageCurlGeometry.tiltOverhang(tilt: tilt, aspect: CGFloat(aspect))
-        let fold = PageCurlGeometry.foldCenter(
-            progress: shown,
-            span: span,
-            overhang: overhang,
-            curlWidth: radius * 2,
-            far: PageCurlGeometry.farSpan(twoPage: twoPage, span: span)
-        )
+        let aspect = pageAspect(of: metal)
+        let grab = liveGrab(span: span, aspect: aspect)
         return PageCurlUniforms(
             progress: Float(shown),
             spineX: Float(spine.normalizedX),
             peelSign: Float(peelSign),
             radius: Float(radius),
-            tilt: Float(tilt),
+            p0x: Float(grab.p0.x),
+            p0y: Float(grab.p0.y),
+            px: Float(grab.p.x),
+            py: Float(grab.p.y),
             span: Float(span),
             realVerso: realVerso ? 1 : 0,
             specular: Float(paper.specular),
@@ -397,10 +420,80 @@ final class PageCurlView: UIView {
             paperG: Float(paper.g),
             paperB: Float(paper.b),
             paperMix: Float(paper.mix),
-            aspect: aspect,
-            twoPage: twoPage ? 1 : 0,
-            fold: Float(fold)
+            aspect: Float(aspect)
         )
+    }
+
+    /// Drawable aspect when the layer has a size, otherwise the view's.
+    /// The grab and the shader must share this, or the fold shears.
+    private func pageAspect(of metal: MTKView) -> CGFloat {
+        let size = metal.drawableSize
+        if size.height > 1, size.width > 1 {
+            return size.width / size.height
+        }
+        return pageAspect()
+    }
+
+    private func pageAspect() -> CGFloat {
+        if bounds.height > 1, bounds.width > 1 {
+            return bounds.width / bounds.height
+        }
+        return 1
+    }
+
+    /// P0 is the outer edge at the grab height. The finger's movement is applied
+    /// to that point, so the material point travels with the finger and a touch
+    /// that starts inset from the edge does not fold until the finger moves.
+    /// A reversed drag runs the same path backwards with `shownProgress`.
+    private func liveGrab(span: CGFloat, aspect: CGFloat) -> (p0: CGPoint, p: CGPoint) {
+        let spineX = spine.normalizedX
+        let pageH = 1 / max(aspect, 0.05)
+        if !fingerDriven {
+            return PageCurlGeometry.tapGrab(
+                progress: shownProgress,
+                spineX: spineX,
+                peelSign: peelSign,
+                span: span,
+                pageHeight: pageH
+            )
+        }
+        let p0 = PageCurlGeometry.heldPoint(
+            touchUV: grabUV,
+            spineX: spineX,
+            peelSign: peelSign,
+            span: span,
+            aspect: aspect
+        )
+        if interactivePhase == .spring {
+            let denom = springTarget - springFrom
+            let u: CGFloat
+            if abs(denom) < 0.0001 {
+                u = 1
+            } else {
+                u = min(1, max(0, (progress - springFrom) / denom))
+            }
+            return (p0, PageCurlGeometry.mix(springPFrom, springPTo, u))
+        }
+        let origin = PageCurlGeometry.fingerPoint(touchUV: grabUV, aspect: aspect)
+        let finger = PageCurlGeometry.fingerPoint(touchUV: fingerUV, aspect: aspect)
+        var aim = CGPoint(x: p0.x + (finger.x - origin.x), y: p0.y + (finger.y - origin.y))
+        if interactivePhase == .catchUp {
+            let denom = max(fingerProgress, 0.0001)
+            let u = min(1, max(0, progress / denom))
+            aim = PageCurlGeometry.mix(p0, aim, u)
+        }
+        guard reversed else {
+            return (p0, aim)
+        }
+        let landing = PageCurlGeometry.commitLanding(
+            p0: p0,
+            p: aim,
+            spineX: spineX,
+            peelSign: peelSign,
+            span: span,
+            pageHeight: pageH
+        )
+        return (p0, PageCurlGeometry.mix(p0, landing, shownProgress))
     }
 
     /// Visual progress. A reversed one-page turn runs the forward curl from

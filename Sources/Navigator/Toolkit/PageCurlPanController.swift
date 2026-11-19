@@ -65,16 +65,18 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
     /// uses this. It is not the high-water mark: dragging back under the line
     /// and then lifting must cancel.
     private var lastProgress: CGFloat = 0
-    /// Latest touch while the gesture was still `.began` or `.changed`.
-    /// `.possible` reports the origin, which peels a flick from the top corner.
-    private var lastTouchY: CGFloat = PageCurlGeometry.tapTouchY
+    /// Touch-down, in the host view. The held point is this height on the
+    /// peeling edge. `.possible` reports the origin, so a settled gesture
+    /// keeps the last point from `.began` / `.changed` / `.ended`.
+    private var grabStart = CGPoint(x: 0, y: 0)
+    private var lastFinger = CGPoint(x: 0, y: 0)
     /// Reading direction for this drag. Sampled once so a move does not rebuild
     /// the pan context on every touch.
     private var rtl = false
     private var endConsumed = false
     private var prepareTask: Task<Void, Never>?
     /// Set when the finger lifts before the incoming page is ready.
-    private var pendingRelease: (commit: Bool, velocity: CGFloat, touchY: CGFloat)?
+    private var pendingRelease: (commit: Bool, velocity: CGFloat, finger: CGPoint)?
     private var aborted = false
 
     override init() {
@@ -210,14 +212,15 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
         withinResource = false
         velocities = []
         lastProgress = 0
-        lastTouchY = PageCurlGeometry.tapTouchY
         endConsumed = false
         pendingRelease = nil
         if let host = gesture.view {
             rtl = delegate.curlPanContext(in: host).rtl
             let finger = fingerState(of: gesture, in: host)
+            let translation = gesture.translation(in: host)
+            grabStart = CGPoint(x: finger.point.x - translation.x, y: finger.point.y - translation.y)
+            lastFinger = finger.point
             lastProgress = finger.progress
-            lastTouchY = finger.touchY
         }
         let direction = direction
         prepareTask = Task { @MainActor [weak self] in
@@ -272,13 +275,9 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
         let sampled = gestureLive ? fingerState(of: gesture, in: host) : nil
         if let sampled {
             lastProgress = sampled.progress
-            lastTouchY = sampled.touchY
+            lastFinger = sampled.point
         }
-        let touchY = PageCurlPanStateMachine.touchYForArm(
-            gestureSettled: sampled == nil,
-            liveTouchY: sampled?.touchY ?? 0,
-            storedTouchY: pendingRelease?.touchY ?? lastTouchY
-        )
+        let fingerPoint = sampled?.point ?? pendingRelease?.finger ?? lastFinger
         let progress = sampled?.progress ?? lastProgress
         let armed = await curl.beginInteractive(
             outgoing: frame.outgoing,
@@ -288,7 +287,8 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
             realVerso: frame.realVerso,
             reversed: frame.reversed,
             progress: progress,
-            touchY: touchY
+            grabUV: uv(grabStart, in: host),
+            fingerUV: uv(fingerPoint, in: host)
         )
         metalArmed = armed
         // Detach during the upload leaves `beginInteractive` false. Staying
@@ -301,10 +301,10 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
         if gesture.state == .began || gesture.state == .changed {
             let now = fingerState(of: gesture, in: host)
             lastProgress = now.progress
-            lastTouchY = now.touchY
-            curl.track(progress: now.progress, touchY: now.touchY)
+            lastFinger = now.point
+            curl.track(progress: now.progress, fingerUV: uv(now.point, in: host))
         } else {
-            curl.track(progress: lastProgress, touchY: touchY)
+            curl.track(progress: lastProgress, fingerUV: uv(fingerPoint, in: host))
         }
         if let pending = pendingRelease {
             pendingRelease = nil
@@ -329,9 +329,9 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
         }
         let finger = fingerState(of: gesture, in: host)
         lastProgress = finger.progress
-        lastTouchY = finger.touchY
+        lastFinger = finger.point
         guard phase == .armed, metalArmed, let curlView else { return }
-        curlView.track(progress: finger.progress, touchY: finger.touchY)
+        curlView.track(progress: finger.progress, fingerUV: uv(finger.point, in: host))
     }
 
     private func end(_ gesture: UIPanGestureRecognizer, cancelled: Bool) {
@@ -351,7 +351,7 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
                 if finger.progress > 0 {
                     lastProgress = finger.progress
                 }
-                lastTouchY = finger.touchY
+                lastFinger = finger.point
             }
         }
         let velocity = PageCurlPanStateMachine.smoothedVelocity(velocities)
@@ -368,7 +368,7 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
         let commit = decision == .commit
         switch phase {
         case .preparing:
-            pendingRelease = (commit, velocity, lastTouchY)
+            pendingRelease = (commit, velocity, lastFinger)
         case .armed:
             // `.ended` then `.cancelled` must not start a second finish that
             // reverts a turn the first one is about to commit.
@@ -452,7 +452,7 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
         )
     }
 
-    private func fingerState(of pan: UIPanGestureRecognizer, in view: UIView) -> (progress: CGFloat, touchY: CGFloat) {
+    private func fingerState(of pan: UIPanGestureRecognizer, in view: UIView) -> (progress: CGFloat, point: CGPoint) {
         let translation = pan.translation(in: view)
         let location = pan.location(in: view)
         return (
@@ -462,7 +462,16 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
                 forward: direction == .forward,
                 rtl: rtl
             ),
-            PageCurlPanStateMachine.touchY(locationY: location.y, height: view.bounds.height)
+            location
         )
+    }
+
+    private func uv(_ point: CGPoint, in view: UIView) -> CGPoint {
+        let width = view.bounds.width
+        let height = view.bounds.height
+        guard width > 1, height > 1, point.x.isFinite, point.y.isFinite else {
+            return CGPoint(x: 1, y: 1)
+        }
+        return CGPoint(x: point.x / width, y: point.y / height)
     }
 }

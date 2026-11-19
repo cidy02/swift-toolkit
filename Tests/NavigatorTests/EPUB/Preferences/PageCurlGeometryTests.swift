@@ -57,17 +57,6 @@ class PageCurlGeometryTests: XCTestCase {
         // A narrow leaf does not grow a cylinder wider than itself.
         let narrow = PageCurlGeometry.cylinderRadius(progress: 0.5, span: 0.1)
         XCTAssertLessThanOrEqual(narrow, 0.1 * 0.45 + 0.0001)
-
-        // A tap lifts the bottom corner. A finger at mid-page stays vertical.
-        let tapTilt = PageCurlGeometry.tiltRadians(touchY: PageCurlGeometry.tapTouchY)
-        XCTAssertGreaterThan(tapTilt, 0.25)
-        XCTAssertLessThan(tapTilt, PageCurlGeometry.maxTilt)
-        XCTAssertEqual(PageCurlGeometry.tiltRadians(touchY: 0.5), 0, accuracy: 0.0001)
-        XCTAssertEqual(PageCurlGeometry.tiltRadians(touchY: 0), -PageCurlGeometry.maxTilt, accuracy: 0.0001)
-        XCTAssertEqual(PageCurlGeometry.tiltRadians(touchY: 1), PageCurlGeometry.maxTilt, accuracy: 0.0001)
-        XCTAssertEqual(PageCurlGeometry.tiltRadians(touchY: -2), -PageCurlGeometry.maxTilt, accuracy: 0.0001)
-        XCTAssertEqual(PageCurlGeometry.tiltRadians(touchY: 4), PageCurlGeometry.maxTilt, accuracy: 0.0001)
-        XCTAssertEqual(PageCurlGeometry.tiltRadians(touchY: .nan), 0)
     }
 
     func testSpineResolutionForOnePageTwoPageAndTheFold() {
@@ -405,114 +394,261 @@ class PageCurlGeometryTests: XCTestCase {
         XCTAssertEqual(aboveDark.r, 0.30 * 0.96, accuracy: 0.001)
     }
 
-    func testTiltedFoldDoesNotPopACorner() {
-        // Portrait phone, tap at the bottom corner. The old fold (`span * (1 - progress)`)
-        // put ~32% of the bottom edge on the incoming page at progress 0.002.
-        let aspect = 390.0 / 844.0
-        let tilt = PageCurlGeometry.tiltRadians(touchY: PageCurlGeometry.tapTouchY)
-        let span: CGFloat = 1
-        let overhang = PageCurlGeometry.tiltOverhang(tilt: tilt, aspect: aspect)
-        XCTAssertGreaterThan(overhang, 0.25)
+    func testGrabAtACornerPeelsDiagonallyAndMidEdgeStaysVertical() {
+        let height: CGFloat = 2
+        // Mid-edge, straight across: the normal is horizontal, so the fold is vertical.
+        let mid = tryGrab(
+            p0: CGPoint(x: 1, y: 1),
+            p: CGPoint(x: 0.45, y: 1),
+            radius: 0.08,
+            spineX: 0,
+            pageHeight: height
+        )
+        XCTAssertEqual(mid.normal.y, 0, accuracy: 0.0001)
+        XCTAssertEqual(mid.normal.x, -1, accuracy: 0.0001)
+        XCTAssertFalse(mid.clamped)
 
-        func popped(progress: CGFloat, atBottom: Bool) -> CGFloat {
-            let radius = PageCurlGeometry.cylinderRadius(progress: progress, span: span)
-            let fold = PageCurlGeometry.foldCenter(
-                progress: progress,
-                span: span,
-                overhang: overhang,
-                curlWidth: radius * 2,
-                far: 0
-            )
-            let line = PageCurlGeometry.foldLine(
-                fold: fold,
-                tilt: tilt,
-                normalizedY: atBottom ? 1 : 0,
-                aspect: aspect
-            )
-            if atBottom {
-                return max(0, span - line)
-            }
-            return max(0, line)
+        // Bottom corner, dragged up and in.
+        let bottom = tryGrab(
+            p0: CGPoint(x: 1, y: height),
+            p: CGPoint(x: 0.45, y: 1.2),
+            radius: 0.08,
+            spineX: 0,
+            pageHeight: height
+        )
+        XCTAssertLessThan(bottom.normal.y, -0.25)
+
+        // Top corner peels the other way.
+        let top = tryGrab(
+            p0: CGPoint(x: 1, y: 0),
+            p: CGPoint(x: 0.45, y: 0.8),
+            radius: 0.08,
+            spineX: 0,
+            pageHeight: height
+        )
+        XCTAssertGreaterThan(top.normal.y, 0.25)
+        XCTAssertGreaterThan(abs(bottom.normal.y - top.normal.y), 0.5)
+
+        // The same grab, then the finger moves up: the fold rotates.
+        let low = tryGrab(
+            p0: CGPoint(x: 1, y: 1.4),
+            p: CGPoint(x: 0.5, y: 1.5),
+            radius: 0.05,
+            spineX: 0,
+            pageHeight: height
+        )
+        let high = tryGrab(
+            p0: CGPoint(x: 1, y: 1.4),
+            p: CGPoint(x: 0.5, y: 0.3),
+            radius: 0.05,
+            spineX: 0,
+            pageHeight: height
+        )
+        XCTAssertGreaterThan(abs(low.normal.y - high.normal.y), 0.4)
+    }
+
+    func testFoldAxisIsTheBisectorOffsetByTheRadius() {
+        let p0 = CGPoint(x: 1, y: 1.2)
+        let p = CGPoint(x: 0.4, y: 1.2)
+        let radius: CGFloat = 0.08
+        let fold = tryGrab(p0: p0, p: p, radius: radius, spineX: 0, pageHeight: 2)
+        XCTAssertFalse(fold.clamped)
+        XCTAssertEqual(fold.point.x, (p0.x + p.x) / 2, accuracy: 0.0001)
+        XCTAssertEqual(fold.point.y, (p0.y + p.y) / 2, accuracy: 0.0001)
+        XCTAssertEqual(fold.axis.x, fold.point.x + fold.normal.x * radius, accuracy: 0.0001)
+        XCTAssertEqual(fold.axis.y, fold.point.y + fold.normal.y * radius, accuracy: 0.0001)
+        let offset = hypot(fold.axis.x - fold.point.x, fold.axis.y - fold.point.y)
+        XCTAssertEqual(offset, radius, accuracy: 0.0001)
+        // The axis sits toward the finger, not back toward the held point.
+        let towardFinger = (p.x - p0.x) * fold.normal.x + (p.y - p0.y) * fold.normal.y
+        XCTAssertGreaterThan(towardFinger, 0)
+        XCTAssertLessThan(fold.axis.x, fold.point.x)
+    }
+
+    func testSpineEdgeNeverDetaches() {
+        // This drag's unclamped bisector crosses the spine.
+        let fold = tryGrab(
+            p0: CGPoint(x: 1, y: 2),
+            p: CGPoint(x: -0.5, y: 0),
+            radius: 0.05,
+            spineX: 0,
+            pageHeight: 2
+        )
+        XCTAssertTrue(fold.clamped)
+        func signed(_ y: CGFloat) -> CGFloat {
+            (0 - fold.point.x) * fold.normal.x + (y - fold.point.y) * fold.normal.y
         }
+        XCTAssertGreaterThanOrEqual(signed(0), -0.0001)
+        XCTAssertGreaterThanOrEqual(signed(2), -0.0001)
 
-        XCTAssertEqual(popped(progress: 0, atBottom: true), 0, accuracy: 0.0001)
-        XCTAssertLessThan(popped(progress: 0.002, atBottom: true), 0.02)
-        XCTAssertEqual(popped(progress: 1, atBottom: false), 0, accuracy: 0.0001)
-        XCTAssertLessThan(popped(progress: 0.998, atBottom: false), 0.02)
+        // Two pages: the centre spine stays attached too.
+        let spread = tryGrab(
+            p0: CGPoint(x: 1, y: 1.6),
+            p: CGPoint(x: 0.1, y: 0.2),
+            radius: 0.04,
+            spineX: 0.5,
+            pageHeight: 2
+        )
+        func spreadSigned(_ y: CGFloat) -> CGFloat {
+            (0.5 - spread.point.x) * spread.normal.x + (y - spread.point.y) * spread.normal.y
+        }
+        XCTAssertGreaterThanOrEqual(spreadSigned(0), -0.0001)
+        XCTAssertGreaterThanOrEqual(spreadSigned(2), -0.0001)
     }
 
-    func testTwoPageFoldCrossesTheFarHalf() {
-        let span: CGFloat = 0.5
-        let midRadius = PageCurlGeometry.cylinderRadius(progress: 0.5, span: span)
-        let mid = PageCurlGeometry.foldCenter(
-            progress: 0.5,
-            span: span,
-            overhang: 0,
-            curlWidth: midRadius * 2,
-            far: PageCurlGeometry.farSpan(twoPage: true, span: span)
+    func testTapPathStartsAtTheLowerCornerAndRises() {
+        let flat = PageCurlGeometry.tapGrab(
+            progress: 0, spineX: 0, peelSign: 1, span: 1, pageHeight: 2
         )
-        // Halfway, the fold has crossed the spine. The far half is not frozen.
-        XCTAssertLessThan(mid, 0)
+        XCTAssertEqual(flat.p0.x, 1, accuracy: 0.0001)
+        XCTAssertEqual(flat.p0.y, 2, accuracy: 0.0001)
+        XCTAssertEqual(flat.p.x, flat.p0.x, accuracy: 0.0001)
+        XCTAssertEqual(flat.p.y, flat.p0.y, accuracy: 0.0001)
+        XCTAssertNil(PageCurlGeometry.grabFold(
+            p0: flat.p0, p: flat.p, radius: 0.05, spineX: 0, pageHeight: 2
+        ))
 
-        let endRadius = PageCurlGeometry.cylinderRadius(progress: 0.998, span: span)
-        let end = PageCurlGeometry.foldCenter(
-            progress: 0.998,
-            span: span,
-            overhang: 0,
-            curlWidth: endRadius * 2,
-            far: 0.5
+        let mid = PageCurlGeometry.tapGrab(
+            progress: 0.5, spineX: 0, peelSign: 1, span: 1, pageHeight: 2
         )
-        XCTAssertLessThan(end, -0.4)
-        XCTAssertEqual(PageCurlGeometry.farSpan(twoPage: false, span: 1), 0)
+        XCTAssertEqual(mid.p0.x, 1, accuracy: 0.0001)
+        XCTAssertEqual(mid.p0.y, 2, accuracy: 0.0001)
+        XCTAssertLessThan(mid.p.x, mid.p0.x)
+        XCTAssertLessThan(mid.p.y, mid.p0.y)
+        let fold = tryGrab(p0: mid.p0, p: mid.p, radius: 0.05, spineX: 0, pageHeight: 2)
+        XCTAssertLessThan(fold.normal.y, -0.05)
+
+        // A tiny step does not put the top of the page on the incoming side.
+        let barely = PageCurlGeometry.tapGrab(
+            progress: 0.002, spineX: 0, peelSign: 1, span: 1, pageHeight: 2
+        )
+        let top = sample(
+            uvX: 0.5, uvY: 0.05, progress: 0.002,
+            spineX: 0, peelSign: 1, span: 1,
+            twoPage: false, realVerso: false,
+            p0: barely.p0, p: barely.p, radius: 0.01, aspect: 0.5
+        )
+        XCTAssertEqual(top.region, .flatOutgoing)
     }
 
-    func testTwoPageRollSamplesTheTurningLeaf() {
+    func testRTLGrabMirrorsTheLTRGrab() {
+        let ltr = PageCurlGeometry.tapGrab(
+            progress: 0.4, spineX: 0, peelSign: 1, span: 1, pageHeight: 2
+        )
+        let rtl = PageCurlGeometry.tapGrab(
+            progress: 0.4, spineX: 1, peelSign: -1, span: 1, pageHeight: 2
+        )
+        XCTAssertEqual(rtl.p0.x, 0, accuracy: 0.0001)
+        XCTAssertEqual(rtl.p0.y, ltr.p0.y, accuracy: 0.0001)
+        XCTAssertEqual(rtl.p.x, 1 - ltr.p.x, accuracy: 0.0001)
+        XCTAssertEqual(rtl.p.y, ltr.p.y, accuracy: 0.0001)
+        let left = tryGrab(p0: ltr.p0, p: ltr.p, radius: 0.05, spineX: 0, pageHeight: 2)
+        let right = tryGrab(p0: rtl.p0, p: rtl.p, radius: 0.05, spineX: 1, pageHeight: 2)
+        XCTAssertEqual(right.normal.x, -left.normal.x, accuracy: 0.0001)
+        XCTAssertEqual(right.normal.y, left.normal.y, accuracy: 0.0001)
+
+        let held = PageCurlGeometry.heldPoint(
+            touchUV: CGPoint(x: 0.1, y: 0.5),
+            spineX: 1, peelSign: -1, span: 1, aspect: 0.5
+        )
+        XCTAssertEqual(held.x, 0, accuracy: 0.0001)
+        XCTAssertEqual(held.y, 0.5 / 0.5, accuracy: 0.0001)
+    }
+
+    func testOnePageBackIsOpaqueAndTheNextPageStartsPastTheFold() {
+        // Straight drag from the right edge to x = 0.4. Bisector at x = 0.7.
+        let p0 = CGPoint(x: 1, y: 0.5)
+        let p = CGPoint(x: 0.4, y: 0.5)
+        let radius: CGFloat = 0.05
+        // Between the finger and the fold, past the cylinder: the flat back.
+        let back = sample(
+            uvX: 0.55, uvY: 0.5, progress: 0.4,
+            spineX: 0, peelSign: 1, span: 1,
+            twoPage: false, realVerso: false,
+            p0: p0, p: p, radius: radius, aspect: 1
+        )
+        XCTAssertEqual(back.region, .flatBack)
+        XCTAssertEqual(back.sheet, .outgoing)
+        XCTAssertEqual(back.x, 0.85, accuracy: 0.02)
+        // On the cylinder, still the back, not the page underneath.
+        let roll = sample(
+            uvX: 0.66, uvY: 0.5, progress: 0.4,
+            spineX: 0, peelSign: 1, span: 1,
+            twoPage: false, realVerso: false,
+            p0: p0, p: p, radius: radius, aspect: 1
+        )
+        XCTAssertEqual(roll.region, .rollBack)
+        XCTAssertEqual(roll.sheet, .outgoing)
+        // Right of the fold: the next page, uncovered.
+        let next = sample(
+            uvX: 0.9, uvY: 0.5, progress: 0.4,
+            spineX: 0, peelSign: 1, span: 1,
+            twoPage: false, realVerso: false,
+            p0: p0, p: p, radius: radius, aspect: 1
+        )
+        XCTAssertEqual(next.region, .flatIncoming)
+        XCTAssertEqual(next.sheet, .incoming)
+        // Spine side of the finger: the outgoing page, still flat.
+        let front = sample(
+            uvX: 0.2, uvY: 0.5, progress: 0.4,
+            spineX: 0, peelSign: 1, span: 1,
+            twoPage: false, realVerso: false,
+            p0: p0, p: p, radius: radius, aspect: 1
+        )
+        XCTAssertEqual(front.region, .flatOutgoing)
+        XCTAssertEqual(front.sheet, .outgoing)
+    }
+
+    func testTwoPageBackIsTheFacingHalfAndTheStaticPageStays() {
+        // Right-hand leaf, straight drag. Bisector at x = 0.81. Radius 0.04,
+        // so x = 0.70 is the flat back and x = 0.78 is still on the cylinder.
         let spine: CGFloat = 0.5
         let span: CGFloat = 0.5
+        let p0 = CGPoint(x: 1, y: 0.7)
+        let p = CGPoint(x: 0.62, y: 0.7)
+        let radius: CGFloat = 0.04
 
-        // Still on the near half. The front is the outgoing right page.
-        // The back is the incoming left page, not the incoming right page.
-        let nearFront = rollSample(progress: 0.25, t: 0.25, spine: spine, span: span)
-        XCTAssertEqual(nearFront.region, .rollFront)
-        XCTAssertEqual(nearFront.sheet, .outgoing)
-        XCTAssertGreaterThan(nearFront.x, spine)
-
-        let nearBack = rollSample(progress: 0.25, t: 0.75, spine: spine, span: span)
-        XCTAssertEqual(nearBack.region, .rollBack)
-        XCTAssertEqual(nearBack.sheet, .incoming)
-        XCTAssertLessThan(nearBack.x, spine)
-
-        // The fold has crossed the spine. Both faces of the roll lay the
-        // verso (incoming left) down. They do not peel the static left page
-        // or paint the incoming right page on the back.
-        let farFront = rollSample(progress: 0.75, t: 0.25, spine: spine, span: span)
-        XCTAssertEqual(farFront.region, .rollFront)
-        XCTAssertEqual(farFront.sheet, .incoming)
-        XCTAssertLessThan(farFront.x, spine)
-        XCTAssertGreaterThanOrEqual(farFront.x, 0)
-
-        let farBack = rollSample(progress: 0.75, t: 0.75, spine: spine, span: span)
-        XCTAssertEqual(farBack.region, .rollBack)
-        XCTAssertEqual(farBack.sheet, .incoming)
-        XCTAssertLessThan(farBack.x, spine)
-        XCTAssertGreaterThanOrEqual(farBack.x, 0)
-
-        let staticLeft = PageCurlGeometry.spreadSample(
-            uvX: 0, uvY: 0.5, progress: 0.75,
+        let flat = sample(
+            uvX: 0.70, uvY: 0.7, progress: 0.4,
             spineX: spine, peelSign: 1, span: span,
-            twoPage: true, realVerso: true, tilt: 0, aspect: 1
+            twoPage: true, realVerso: true,
+            p0: p0, p: p, radius: radius, aspect: 1
+        )
+        XCTAssertEqual(flat.region, .flatBack)
+        XCTAssertEqual(flat.sheet, .incoming)
+        XCTAssertLessThan(flat.x, spine)
+        XCTAssertGreaterThanOrEqual(flat.x, 0)
+        // Not the mirror of the outgoing right page (that would be the outgoing sheet).
+        XCTAssertNotEqual(flat.sheet, .outgoing)
+
+        let roll = sample(
+            uvX: 0.78, uvY: 0.7, progress: 0.4,
+            spineX: spine, peelSign: 1, span: span,
+            twoPage: true, realVerso: true,
+            p0: p0, p: p, radius: radius, aspect: 1
+        )
+        XCTAssertEqual(roll.region, .rollBack)
+        XCTAssertEqual(roll.sheet, .incoming)
+        XCTAssertLessThan(roll.x, spine)
+
+        let staticLeft = sample(
+            uvX: 0.2, uvY: 0.7, progress: 0.4,
+            spineX: spine, peelSign: 1, span: span,
+            twoPage: true, realVerso: true,
+            p0: p0, p: p, radius: radius, aspect: 1
         )
         XCTAssertEqual(staticLeft.region, .flatOutgoing)
         XCTAssertEqual(staticLeft.sheet, .outgoing)
 
-        let revealedRight = PageCurlGeometry.spreadSample(
-            uvX: 0.9, uvY: 0.5, progress: 0.75,
+        let revealed = sample(
+            uvX: 0.95, uvY: 0.7, progress: 0.4,
             spineX: spine, peelSign: 1, span: span,
-            twoPage: true, realVerso: true, tilt: 0, aspect: 1
+            twoPage: true, realVerso: true,
+            p0: p0, p: p, radius: radius, aspect: 1
         )
-        XCTAssertEqual(revealedRight.region, .flatIncoming)
-        XCTAssertEqual(revealedRight.sheet, .incoming)
-        XCTAssertGreaterThan(revealedRight.x, spine)
+        XCTAssertEqual(revealed.region, .flatIncoming)
+        XCTAssertEqual(revealed.sheet, .incoming)
+        XCTAssertGreaterThan(revealed.x, spine)
     }
 
     func testAsymmetricVersoStaysInsideTheFarHalf() {
@@ -526,12 +662,21 @@ class PageCurlGeometryTests: XCTestCase {
         XCTAssertLessThan(spine - 0.50, 0)
     }
 
-    func testReversedTiltFlipsTheCorner() {
-        let bottom = PageCurlGeometry.tiltRadians(touchY: 0.9)
-        XCTAssertGreaterThan(bottom, 0)
-        XCTAssertEqual(PageCurlGeometry.displayedTilt(touchY: 0.9, reversed: false), bottom, accuracy: 0.0001)
-        XCTAssertEqual(PageCurlGeometry.displayedTilt(touchY: 0.9, reversed: true), -bottom, accuracy: 0.0001)
-        XCTAssertEqual(PageCurlGeometry.displayedTilt(touchY: 0.5, reversed: true), 0, accuracy: 0.0001)
+    func testCommitLandingKeepsAStraightDragLevel() {
+        let p0 = CGPoint(x: 1, y: 1.2)
+        let p = CGPoint(x: 0.6, y: 1.2)
+        let landing = PageCurlGeometry.commitLanding(
+            p0: p0, p: p, spineX: 0, peelSign: 1, span: 1, pageHeight: 2
+        )
+        XCTAssertEqual(landing.x, -1, accuracy: 0.0001)
+        XCTAssertEqual(landing.y, 1.2, accuracy: 0.0001)
+        let corner = PageCurlGeometry.commitLanding(
+            p0: CGPoint(x: 1, y: 2),
+            p: CGPoint(x: 0.5, y: 1.4),
+            spineX: 0, peelSign: 1, span: 1, pageHeight: 2
+        )
+        XCTAssertEqual(corner.x, -1, accuracy: 0.0001)
+        XCTAssertLessThan(corner.y, 2)
     }
 
     func testColumnCorrectionScrollsToTheAbsoluteTarget() {
@@ -544,39 +689,52 @@ class PageCurlGeometryTests: XCTestCase {
         XCTAssertEqual(PageCurlGeometry.curlColumnCorrection(offset: 1170, target: 783), -387, accuracy: 0.001)
     }
 
-    func testShaderLaysTheVersoOnceTheFoldCrosses() {
+    func testShaderDrawsAnOpaqueBackFromTheGrab() {
         let source = PageCurlShader.source
-        XCTAssertTrue(source.contains("u.twoPage > 0.5 && orig < 0.0"))
         XCTAssertTrue(source.contains("versoAlong"))
         XCTAssertTrue(source.contains("PageCurlGeometry.spreadSample"))
+        XCTAssertTrue(source.contains("paperBack"))
+        XCTAssertFalse(source.contains("return float4(inC, 1.0)"))
+        XCTAssertFalse(source.contains("u.tilt"))
     }
 
-    private func rollSample(
+    private func tryGrab(
+        p0: CGPoint,
+        p: CGPoint,
+        radius: CGFloat,
+        spineX: CGFloat,
+        pageHeight: CGFloat
+    ) -> PageCurlGrabFold {
+        guard let fold = PageCurlGeometry.grabFold(
+            p0: p0, p: p, radius: radius, spineX: spineX, pageHeight: pageHeight
+        ) else {
+            XCTFail("expected a fold")
+            return PageCurlGrabFold(
+                point: .zero, normal: CGPoint(x: 1, y: 0), axis: .zero, radius: 0, clamped: false
+            )
+        }
+        return fold
+    }
+
+    private func sample(
+        uvX: CGFloat,
+        uvY: CGFloat,
         progress: CGFloat,
-        t: CGFloat,
-        spine: CGFloat,
-        span: CGFloat
+        spineX: CGFloat,
+        peelSign: CGFloat,
+        span: CGFloat,
+        twoPage: Bool,
+        realVerso: Bool,
+        p0: CGPoint,
+        p: CGPoint,
+        radius: CGFloat,
+        aspect: CGFloat
     ) -> PageCurlGeometry.SpreadSample {
-        let radius = PageCurlGeometry.cylinderRadius(progress: progress, span: span)
-        let fold = PageCurlGeometry.foldCenter(
-            progress: progress,
-            span: span,
-            overhang: 0,
-            curlWidth: radius * 2,
-            far: PageCurlGeometry.farSpan(twoPage: true, span: span)
-        )
-        let along = fold + t * radius * 2
-        return PageCurlGeometry.spreadSample(
-            uvX: spine + along,
-            uvY: 0.5,
-            progress: progress,
-            spineX: spine,
-            peelSign: 1,
-            span: span,
-            twoPage: true,
-            realVerso: true,
-            tilt: 0,
-            aspect: 1
+        PageCurlGeometry.spreadSample(
+            uvX: uvX, uvY: uvY, progress: progress,
+            spineX: spineX, peelSign: peelSign, span: span,
+            twoPage: twoPage, realVerso: realVerso,
+            p0: p0, p: p, radius: radius, aspect: aspect
         )
     }
 
