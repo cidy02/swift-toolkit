@@ -357,8 +357,8 @@ class PageCurlGeometryTests: XCTestCase {
         XCTAssertEqual(PageCurlGeometry.rendered(request(animated: false, resourceDistance: 3)), .none)
     }
 
-    /// The back is the page's own colour in every theme (Apple: black on a
-    /// black page), with no OLED lift and no grey card.
+    /// The back is the page's own colour in every theme (black on a black
+    /// page), with no OLED lift and no grey card.
     func testBacksidePaperIsThePageColourInEveryTheme() {
         let themes: [(String, PageCurlRGB)] = [
             ("OLED", PageCurlRGB(r: 0, g: 0, b: 0)),

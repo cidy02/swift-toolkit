@@ -222,7 +222,9 @@ final class PageCurlView: UIView {
         )
         guard isAttached, presented else {
             renderer.releaseTextures()
-            guard isAttached else {
+            // Stopped (frozen, resigned): no fade either. A draw that failed on
+            // its own still fades.
+            guard isAttached, lifecycleStops == stops else {
                 return
             }
             await fadeFallback(to: incoming, duration: duration)
@@ -297,7 +299,7 @@ final class PageCurlView: UIView {
             in: metalView,
             reversed: reversed
         )
-        guard isAttached, presented else {
+        guard isAttached, presented, lifecycleStops == stops else {
             renderer.releaseTextures()
             interactivePhase = .none
             return false
@@ -418,6 +420,8 @@ final class PageCurlView: UIView {
     /// started from) for a host that has to move the web view back under it
     /// before it takes this view down.
     func freezeOnCover(showing image: UIImage? = nil) {
+        // A turn still awaiting its textures or first frame must not start.
+        lifecycleStops &+= 1
         if let image {
             coverView.image = image
         }
@@ -433,8 +437,8 @@ final class PageCurlView: UIView {
         renderer?.releaseTextures()
     }
 
-    /// Bumped by every resign-active or background. A turn awaiting its
-    /// texture upload when it changes does not start.
+    /// Bumped by every resign-active, background and `freezeOnCover`. A turn
+    /// awaiting its textures or its first frame when it changes does not start.
     private var lifecycleStops = 0
 
     private var isAttached: Bool {
@@ -1060,7 +1064,7 @@ private final class PageCurlRenderer {
 
     /// Starts uploading `images` now. `prepare` picks the textures up by bitmap.
     static func preload(_ images: [UIImage]) {
-        guard UIApplication.shared.applicationState != .background,
+        guard UIApplication.shared.applicationState == .active,
               let device = cachedDevice ?? MTLCreateSystemDefaultDevice(),
               let loader = resources(for: device)?.loader
         else {
@@ -1070,6 +1074,9 @@ private final class PageCurlRenderer {
             preloads.append((image, startUpload(image, loader: loader)))
         }
         if preloads.count > preloadLimit {
+            for evicted in preloads.prefix(preloads.count - preloadLimit) {
+                evicted.task.cancel()
+            }
             preloads.removeFirst(preloads.count - preloadLimit)
         }
     }

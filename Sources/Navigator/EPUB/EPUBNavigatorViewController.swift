@@ -456,6 +456,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         // A drag in flight must revert. Leaving it resumes in the background
         // and submits Metal work the GPU will abort.
         curlPan?.abort(keepingCover: true)
+        (paginationView?.currentView as? EPUBSpreadView)?.stopActiveCurlForLifecycle()
         invalidateCurlPrerender("resign-active")
     }
 
@@ -1694,23 +1695,22 @@ extension EPUBNavigatorViewController: PaginationViewDelegate {
         let points: CGFloat? = gap > 0.5 ? gap : nil
         let cancelledOn = paginationView?.currentView as? EPUBSpreadView
         cancelInFlightPageCurls()
-        // The tap curl cancelled above kept its suppression for a hold this
-        // call may not take: give it back, on whichever spread it was.
-        func bail() {
-            if let cancelledOn, cancelledOn !== paginationView?.currentView {
-                cancelledOn.releaseCurlCancelSuppression()
+        // The tap curl cancelled above kept its suppression for a hold. Every
+        // way out that does not take the hold gives it back, on whichever
+        // spread it was (a spread not ready for presentation skips the hold).
+        var tookHold = false
+        defer {
+            if !tookHold {
+                if let cancelledOn, cancelledOn !== paginationView?.currentView {
+                    cancelledOn.releaseCurlCancelSuppression()
+                }
+                releaseCurlSuppressionIfIdle()
             }
-            releaseCurlSuppressionIfIdle()
         }
         if curlPan?.turnInFlight == true {
             await curlPan?.abortDrag()
         }
-        guard foldGapRequests.isLatest(request) else {
-            bail()
-            return
-        }
-        guard viewModel.noteFoldClearance(points) else {
-            bail()
+        guard foldGapRequests.isLatest(request), viewModel.noteFoldClearance(points) else {
             return
         }
         invalidateCurlPrerender("fold")
@@ -1727,17 +1727,17 @@ extension EPUBNavigatorViewController: PaginationViewDelegate {
                 if spread !== paginationView?.currentView {
                     spread.releaseCurlCancelSuppression()
                 }
-                bail()
                 return
             }
             let locator = visible ?? reflowPosition.resolvedAnchor(on: spread, fallback: currentLocation)
             reflowPosition.hold(on: spread, locator: locator)
+            tookHold = true
         }
-        guard viewModel.applyFoldColumnGap(points) else {
+        viewModel.applyFoldColumnGap(points)
+        // Only our own hold: a rotation's hold restores when its transition ends.
+        if tookHold {
             reflowPosition.scheduleRestore()
-            return
         }
-        reflowPosition.scheduleRestore()
     }
 
     /// Tap curls and the pagination's neighbour curl. A posture change used
@@ -1823,9 +1823,9 @@ extension EPUBNavigatorViewController: PageCurlPanDelegate {
             ) else {
                 return nil
             }
-            // The touch ended, the bitmaps went stale, or the app is leaving:
-            // no upload, and nothing for the preloads to keep.
-            guard !Task.isCancelled, UIApplication.shared.applicationState != .background else {
+            // The touch ended, the bitmaps went stale, or the app is resigning
+            // or gone: no upload, and nothing for the preloads to keep.
+            guard !Task.isCancelled, UIApplication.shared.applicationState == .active else {
                 return nil
             }
             PageCurlLatency.mark("touch-outgoing")
@@ -1855,10 +1855,15 @@ extension EPUBNavigatorViewController: PageCurlPanDelegate {
         guard let spread = paginationView?.currentView as? EPUBSpreadView else {
             return nil
         }
+        // Left in `curlTouchDownShot` while it is awaited, so an invalidation
+        // (resign active, memory) can still cancel it before it uploads.
         let pending = curlTouchDownShot
-        curlTouchDownShot = nil
+        let pendingShot = await pending?.value
+        if let pending, curlTouchDownShot == pending {
+            curlTouchDownShot = nil
+        }
         // The touch-down shot is this page if nothing moved or changed since.
-        if let pending, let shot = await pending.value, shot.key == curlPageKey(for: spread) {
+        if let shot = pendingShot, shot.key == curlPageKey(for: spread) {
             curlDragOutgoing = shot
             return (shot.image, shot.background)
         }

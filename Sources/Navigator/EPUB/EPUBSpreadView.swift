@@ -635,6 +635,10 @@ class EPUBSpreadView: UIView, Loggable, PageView {
     /// has none here; the pagination view owns the cross-resource curl.
     func cancelActiveCurl() {}
 
+    /// The app is resigning active: stop a tap curl without handing its
+    /// progression suppression to a reflow hold (there is none).
+    func stopActiveCurlForLifecycle() {}
+
     /// See `EPUBReflowableSpreadView`. The fixed-layout spread has no curl cover.
     func releaseCurlCancelSuppression() {}
 

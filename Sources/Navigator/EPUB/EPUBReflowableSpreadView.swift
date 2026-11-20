@@ -98,6 +98,10 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         stopActiveCurl()
     }
 
+    override func stopActiveCurlForLifecycle() {
+        stopActiveCurl()
+    }
+
     /// Takes the leaf down. During the render past the landing the web view
     /// may be a column further on: the still cover shows the landing page
     /// until `curl(by:)` has stepped back and removes it.
@@ -406,6 +410,14 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
                     background: background,
                     covered: running
                 )
+            }
+            // Resigned active since the curl began (the cover's own observer
+            // already fired): no GPU turn. The cover shows the landing page
+            // while the render past it steps back.
+            guard UIApplication.shared.applicationState == .active else {
+                stopActiveCurl()
+                _ = await beyond.value
+                return
             }
             await curlView.runTap(
                 outgoing: outgoing,

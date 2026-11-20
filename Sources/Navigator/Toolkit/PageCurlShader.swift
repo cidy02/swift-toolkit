@@ -117,12 +117,6 @@ enum PageCurlShader {
         if (u.progress >= 0.999) {
             return float4(sampleTex(incoming, uv), 1.0);
         }
-        // A vanishing cylinder is a hard crease across the page. Stay flat.
-        if (u.radius < 0.004) {
-            float3 flat = u.progress > 0.5 ? sampleTex(incoming, uv) : outC;
-            return float4(flat, 1.0);
-        }
-
         float aspect = max(u.aspect, 0.05);
         float pageH = 1.0 / aspect;
         float span = max(u.span, 0.05);
@@ -144,7 +138,9 @@ enum PageCurlShader {
         float R = max(u.radius, 0.0);
         float2 axis = (p0 + finger) * 0.5 + N * (R * 1.57079633);
         float w = dot(axis - iso, N);
-        float sinT = clamp(w / R, 0.0, 1.0);
+        // R 0 is a crease: no roll, the back is the mirror (PageCurlGeometry.rollArc).
+        bool rolls = R >= 0.0001;
+        float sinT = rolls ? clamp(w / R, 0.0, 1.0) : 0.0;
         float theta = asin(sinT);
         // Darker only where the sheet turns edge-on (PageCurlGeometry.rollShade).
         float rollShade = w >= 0.0 ? 1.0 - \#(crestDarkening) * sinT * sinT : 1.0;
@@ -168,7 +164,7 @@ enum PageCurlShader {
             }
         }
         // Front, squeezing onto the near side of the roll.
-        if (w >= 0.0 && w <= R) {
+        if (rolls && w >= 0.0 && w <= R) {
             float2 q = iso - N * (R * theta - w);
             if (inLeaf(q, u.spineX, sign, span, pageH)) {
                 float3 front = sampleTex(outgoing, paperUV(q, aspect));

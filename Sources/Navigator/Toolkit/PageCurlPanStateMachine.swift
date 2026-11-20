@@ -246,16 +246,14 @@ enum PageCurlPanStateMachine {
         return !cancelled && location != .zero
     }
 
-    /// Progress the release decision should see. A flick's `.ended` sample can
-    /// report a zero translation; use the last `.changed` progress. A drag that
-    /// came back near the start must not be replaced by an earlier high-water mark.
-    static func progressAtRelease(live: CGFloat, lastProgress: CGFloat) -> CGFloat {
-        let liveValue = live.isFinite ? live : 0
-        let last = lastProgress.isFinite ? lastProgress : 0
-        if liveValue == 0, last > 0.02 {
-            return last
+    /// Progress the release decision should see: the release's own sample
+    /// when its location is the finger (`releaseLocationIsLive`), even when
+    /// that is 0 (lifted back at the start), else the last tracked one.
+    static func progressAtRelease(live: CGFloat?, lastProgress: CGFloat) -> CGFloat {
+        if let live, live.isFinite {
+            return live
         }
-        return liveValue
+        return lastProgress.isFinite ? lastProgress : 0
     }
 
     /// Where the drag started. The pan begins late (it waits for the text
@@ -332,5 +330,87 @@ enum PageCurlPanStateMachine {
 
     private static func finite(_ value: CGFloat) -> CGFloat {
         value.isFinite ? value : 0
+    }
+}
+
+/// The finger as the pan last saw it, and the release decision made from it.
+/// The controller feeds it UIKit's samples; tests feed it a path.
+struct PageCurlReleaseTracker {
+    var forward = true
+    var rtl = false
+    /// Latest tracked progress. Not the high-water mark: dragging back under
+    /// the line and then lifting must cancel.
+    var lastProgress: CGFloat = 0
+    var lastFinger = CGPoint(x: 0, y: 0)
+    private(set) var velocities: [CGFloat] = []
+
+    struct Release: Equatable {
+        var decision: PageCurlPanRelease
+        var progress: CGFloat
+        /// Nil when the release's location was not the finger.
+        var live: CGFloat?
+        var velocity: CGFloat
+        var atFarEdge: Bool
+    }
+
+    mutating func start(progress: CGFloat, finger: CGPoint) {
+        velocities = []
+        lastProgress = progress
+        lastFinger = finger
+    }
+
+    /// A `.changed` sample. `velocityX` is the recognizer's, in points/s.
+    mutating func move(progress: CGFloat, finger: CGPoint, velocityX: CGFloat) {
+        appendVelocity(velocityX)
+        lastProgress = progress
+        lastFinger = finger
+    }
+
+    /// `.ended` (`cancelled` false) or `.cancelled` / `.failed`. `progress` is
+    /// what `location` would mean; it is used only when the location is the
+    /// finger. `aborted` (our own teardown) always cancels.
+    mutating func release(
+        cancelled: Bool,
+        numberOfTouches: Int,
+        location: CGPoint,
+        progress: CGFloat,
+        velocityX: CGFloat,
+        width: CGFloat,
+        aborted: Bool = false
+    ) -> Release {
+        var live: CGFloat?
+        if PageCurlPanStateMachine.releaseLocationIsLive(
+            cancelled: cancelled,
+            numberOfTouches: numberOfTouches,
+            location: location
+        ) {
+            appendVelocity(velocityX)
+            live = PageCurlGeometry.clampProgress(progress)
+            lastProgress = live ?? lastProgress
+            lastFinger = location
+        }
+        let velocity = PageCurlPanStateMachine.smoothedVelocity(velocities)
+        let value = PageCurlPanStateMachine.progressAtRelease(live: live, lastProgress: lastProgress)
+        let atFarEdge = PageCurlPanStateMachine.isAtFarEdge(
+            locationX: lastFinger.x,
+            width: width,
+            forward: forward,
+            rtl: rtl
+        )
+        let decision: PageCurlPanRelease = aborted ? .cancel : PageCurlPanStateMachine.release(
+            progress: value,
+            turnVelocity: velocity,
+            width: width,
+            cancelled: cancelled,
+            atFarEdge: atFarEdge
+        )
+        return Release(decision: decision, progress: value, live: live, velocity: velocity, atFarEdge: atFarEdge)
+    }
+
+    private mutating func appendVelocity(_ velocityX: CGFloat) {
+        velocities.append(PageCurlPanStateMachine.turnVelocity(velocityX: velocityX, forward: forward, rtl: rtl))
+        if velocities.count > 3 {
+            velocities.removeFirst(velocities.count - 3)
+        }
     }
 }

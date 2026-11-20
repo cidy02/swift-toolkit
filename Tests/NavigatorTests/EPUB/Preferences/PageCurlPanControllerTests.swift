@@ -18,6 +18,7 @@ class PageCurlPanControllerTests: XCTestCase {
     private final class Delegate: PageCurlPanDelegate {
         var touchDowns = 0
         var sequencesEnded = 0
+        var accepts = false
 
         func curlPanContext(in view: UIView) -> PageCurlPanContext {
             PageCurlPanContext(
@@ -34,7 +35,7 @@ class PageCurlPanControllerTests: XCTestCase {
         func curlPanHostView() -> UIView? { nil }
         func curlPanTouchDown() { touchDowns += 1 }
         func curlPanTouchSequenceEnded() { sequencesEnded += 1 }
-        func curlPanDidBegin(direction: PageCurlTurnDirection) -> Bool { false }
+        func curlPanDidBegin(direction: PageCurlTurnDirection) -> Bool { accepts }
         func curlPanCaptureOutgoing() async -> (image: UIImage, background: UIColor)? { nil }
         func curlPanRevealIncoming(
             direction: PageCurlTurnDirection,
@@ -57,5 +58,18 @@ class PageCurlPanControllerTests: XCTestCase {
         controller.recognizer.reset()
         XCTAssertEqual(delegate.sequencesEnded, 2)
         XCTAssertFalse(controller.turnInFlight)
+    }
+
+    /// A drag that began owns the touch-down shot: the reset at the end of its
+    /// touch sequence must not drop it while the turn is in flight.
+    func testAResetDuringADragIsNotReported() {
+        let controller = PageCurlPanController()
+        let delegate = Delegate()
+        delegate.accepts = true
+        controller.delegate = delegate
+        controller.begin(controller.recognizer)
+        XCTAssertTrue(controller.turnInFlight)
+        controller.recognizer.reset()
+        XCTAssertEqual(delegate.sequencesEnded, 0)
     }
 }

@@ -214,7 +214,7 @@ class PageCurlPanStateMachineTests: XCTestCase {
         XCTAssertTrue(PageCurlPanStateMachine.isAtFarEdge(locationX: 0, width: w, forward: true, rtl: false))
         // The last tracked finger: x 340 after a 20 pt peek.
         let lastProgress = PageCurlPanStateMachine.progress(translationX: 340 - 360, width: w, forward: true, rtl: false)
-        let progress = PageCurlPanStateMachine.progressAtRelease(live: 0, lastProgress: lastProgress)
+        let progress = PageCurlPanStateMachine.progressAtRelease(live: nil, lastProgress: lastProgress)
         let edge = PageCurlPanStateMachine.isAtFarEdge(locationX: 340, width: w, forward: true, rtl: false)
         XCTAssertEqual(
             PageCurlPanStateMachine.release(progress: progress, turnVelocity: 0, width: w, cancelled: true, atFarEdge: edge),
@@ -434,28 +434,11 @@ class PageCurlPanStateMachineTests: XCTestCase {
         XCTAssertEqual(PageCurlPanStateMachine.smoothedVelocity([]), 0, accuracy: 0.001)
     }
 
-    func testReleaseUsesTheLastProgressNotTheHighWaterMark() {
-        // A flick's `.ended` sample can report a zero translation.
-        XCTAssertEqual(
-            PageCurlPanStateMachine.progressAtRelease(live: 0, lastProgress: 0.42),
-            0.42,
-            accuracy: 0.0001
-        )
-        XCTAssertEqual(
-            PageCurlPanStateMachine.release(
-                progress: PageCurlPanStateMachine.progressAtRelease(live: 0, lastProgress: 0.42),
-                turnVelocity: 2,
-                width: 390,
-                cancelled: false
-            ),
-            .commit
-        )
-        // Dragged past the line, then back. The zero sample must not restore 0.50.
-        XCTAssertEqual(
-            PageCurlPanStateMachine.progressAtRelease(live: 0, lastProgress: 0.01),
-            0,
-            accuracy: 0.0001
-        )
+    func testReleaseUsesTheLiveLiftOrTheLastTrackedProgress() {
+        // No usable location (a zero-touch cancel): the last tracked progress.
+        XCTAssertEqual(PageCurlPanStateMachine.progressAtRelease(live: nil, lastProgress: 0.42), 0.42, accuracy: 0.0001)
+        // A live lift is used as it is, even 0: the finger came back to its start.
+        XCTAssertEqual(PageCurlPanStateMachine.progressAtRelease(live: 0, lastProgress: 0.42), 0, accuracy: 0.0001)
         XCTAssertEqual(
             PageCurlPanStateMachine.release(
                 progress: PageCurlPanStateMachine.progressAtRelease(live: 0.01, lastProgress: 0.50),
@@ -463,6 +446,60 @@ class PageCurlPanStateMachineTests: XCTestCase {
                 width: 390,
                 cancelled: false
             ),
+            .cancel
+        )
+    }
+
+    /// The pan's own release path (`PageCurlReleaseTracker`, which the
+    /// controller feeds): out past the commit line, back to the right edge
+    /// 150 pt lower, lifted. A live `.ended` at the start reads 0, so it
+    /// cancels. It used to keep the last progress above 0 (0.37) and commit.
+    func testDragOutAndBackToTheStartEdgeCancelsThroughTheReleasePath() {
+        let w: CGFloat = 402
+        func progress(_ x: CGFloat) -> CGFloat {
+            PageCurlPanStateMachine.progress(translationX: x - 380, width: w, forward: true, rtl: false)
+        }
+        for liftX in [CGFloat(380), 385, 397] {
+            var tracker = PageCurlReleaseTracker()
+            tracker.start(progress: 0, finger: CGPoint(x: 380, y: 437))
+            for x in stride(from: CGFloat(370), through: 230, by: -10) {
+                tracker.move(progress: progress(x), finger: CGPoint(x: x, y: 437), velocityX: -500)
+            }
+            XCTAssertGreaterThan(tracker.lastProgress, 0.35)
+            for k in 1 ... 15 {
+                let x = 230 + (liftX - 230) * CGFloat(k) / 15
+                tracker.move(progress: progress(x), finger: CGPoint(x: x, y: 437 + 10 * CGFloat(k)), velocityX: 400)
+            }
+            let release = tracker.release(
+                cancelled: false, numberOfTouches: 0, location: CGPoint(x: liftX, y: 587),
+                progress: progress(liftX), velocityX: 0, width: w
+            )
+            XCTAssertEqual(release.decision, .cancel, "lifted at \(liftX)")
+            XCTAssertEqual(release.progress, 0, accuracy: 0.000_1, "lifted at \(liftX)")
+        }
+        // A quick pull-back whose `.ended` jumps straight from past the line: still the lift point.
+        var quick = PageCurlReleaseTracker()
+        quick.start(progress: 0, finger: CGPoint(x: 380, y: 437))
+        quick.move(progress: progress(230), finger: CGPoint(x: 230, y: 437), velocityX: -800)
+        let back = quick.release(
+            cancelled: false, numberOfTouches: 0, location: CGPoint(x: 385, y: 450),
+            progress: progress(385), velocityX: 2000, width: w
+        )
+        XCTAssertEqual(back.decision, .cancel)
+        // The far-edge rule still holds through the same path.
+        var edge = PageCurlReleaseTracker()
+        edge.start(progress: 0, finger: CGPoint(x: 200, y: 437))
+        edge.move(progress: 0.45, finger: CGPoint(x: 20, y: 437), velocityX: -60)
+        XCTAssertEqual(
+            edge.release(cancelled: true, numberOfTouches: 0, location: .zero, progress: 0.9, velocityX: 0, width: w).decision,
+            .commit
+        )
+        // A zero-touch cancel near the start keeps the last tracked finger: no commit from (0, 0).
+        var peek = PageCurlReleaseTracker()
+        peek.start(progress: 0, finger: CGPoint(x: 360, y: 437))
+        peek.move(progress: 0.05, finger: CGPoint(x: 340, y: 437), velocityX: -100)
+        XCTAssertEqual(
+            peek.release(cancelled: true, numberOfTouches: 0, location: .zero, progress: 0.9, velocityX: 0, width: w).decision,
             .cancel
         )
     }

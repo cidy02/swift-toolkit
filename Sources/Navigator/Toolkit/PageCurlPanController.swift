@@ -69,11 +69,12 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
     private var curlView: PageCurlView?
     private var metalArmed = false
     private var revealed = false
-    private var velocities: [CGFloat] = []
-    /// Latest `.changed` progress. A release that reports a zero translation
-    /// uses this. It is not the high-water mark: dragging back under the line
-    /// and then lifting must cancel.
-    private var lastProgress: CGFloat = 0
+    /// Last tracked finger, velocities and the release decision.
+    private var tracker = PageCurlReleaseTracker()
+    private var lastProgress: CGFloat {
+        get { tracker.lastProgress }
+        set { tracker.lastProgress = newValue }
+    }
     /// Touch-down, in the host view. The held point is this height on the
     /// peeling edge. `.possible` reports the origin, so a settled gesture
     /// keeps the last point from `.began` / `.changed` / `.ended`.
@@ -83,7 +84,10 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
     private var touchDown: CGPoint?
     private weak var touchDownTouch: UITouch?
     private var sawAnotherTouch = false
-    private var lastFinger = CGPoint(x: 0, y: 0)
+    private var lastFinger: CGPoint {
+        get { tracker.lastFinger }
+        set { tracker.lastFinger = newValue }
+    }
     /// Reading direction for this drag. Sampled once so a move does not rebuild
     /// the pan context on every touch.
     private var rtl = false
@@ -264,7 +268,8 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
         }
     }
 
-    private func begin(_ gesture: UIPanGestureRecognizer) {
+    /// `.began`. Internal for tests: UIKit does not let a test set a recognizer's state.
+    func begin(_ gesture: UIPanGestureRecognizer) {
         guard let delegate, delegate.curlPanDidBegin(direction: direction) else {
             phase = .idle
             return
@@ -274,12 +279,13 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
         revealed = false
         metalArmed = false
         withinResource = false
-        velocities = []
-        lastProgress = 0
+        tracker.start(progress: 0, finger: lastFinger)
         endConsumed = false
         pendingRelease = nil
         if let host = gesture.view {
             rtl = delegate.curlPanContext(in: host).rtl
+            tracker.forward = direction == .forward
+            tracker.rtl = rtl
             grabStart = PageCurlPanStateMachine.grabOrigin(
                 touchDown: currentTouchDown(),
                 location: gesture.location(in: host),
@@ -398,18 +404,8 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
 
     private func move(_ gesture: UIPanGestureRecognizer) {
         guard let host = gesture.view else { return }
-        let turn = PageCurlPanStateMachine.turnVelocity(
-            velocityX: gesture.velocity(in: host).x,
-            forward: direction == .forward,
-            rtl: rtl
-        )
-        velocities.append(turn)
-        if velocities.count > 3 {
-            velocities.removeFirst(velocities.count - 3)
-        }
         let finger = fingerState(of: gesture, in: host)
-        lastProgress = finger.progress
-        lastFinger = finger.point
+        tracker.move(progress: finger.progress, finger: finger.point, velocityX: gesture.velocity(in: host).x)
         PageCurlLatency.finger(x: finger.point.x)
         guard phase == .armed, metalArmed, let curlView else { return }
         curlView.track(progress: finger.progress, fingerUV: uv(finger.point, in: host))
@@ -420,46 +416,32 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
         // The location is still valid here. After this returns, UIKit resets
         // the gesture to `.possible` and a later sample reads the origin.
         // A cancel with no touch left reports the view's origin, not the
-        // finger: keep the last tracked position and velocity then.
-        var live: CGFloat = 0
+        // finger: the tracker keeps the last tracked position and velocity
+        // then. A live lift is used as it is, even back at the start (0).
         var touches = 0
+        var location = CGPoint.zero
+        var there: CGFloat = 0
+        var velocityX: CGFloat = 0
         if let host = gesture.view, gesture.state != .possible {
             touches = gesture.numberOfTouches
-            let location = gesture.location(in: host)
-            if PageCurlPanStateMachine.releaseLocationIsLive(
-                cancelled: cancelled,
-                numberOfTouches: touches,
-                location: location
-            ) {
-                velocities.append(PageCurlPanStateMachine.turnVelocity(
-                    velocityX: gesture.velocity(in: host).x,
-                    forward: direction == .forward,
-                    rtl: rtl
-                ))
-                let finger = fingerState(of: gesture, in: host)
-                live = finger.progress
-                if finger.progress > 0 {
-                    lastProgress = finger.progress
-                }
-                lastFinger = finger.point
-            }
+            location = gesture.location(in: host)
+            there = fingerState(of: gesture, in: host).progress
+            velocityX = gesture.velocity(in: host).x
         }
-        let velocity = PageCurlPanStateMachine.smoothedVelocity(velocities)
-        let width = gesture.view?.bounds.width ?? 1
-        let progress = PageCurlPanStateMachine.progressAtRelease(live: live, lastProgress: lastProgress)
-        let atFarEdge = PageCurlPanStateMachine.isAtFarEdge(
-            locationX: lastFinger.x,
-            width: width,
-            forward: direction == .forward,
-            rtl: rtl
-        )
-        let decision: PageCurlPanRelease = aborted ? .cancel : PageCurlPanStateMachine.release(
-            progress: progress,
-            turnVelocity: velocity,
-            width: width,
+        let result = tracker.release(
             cancelled: cancelled,
-            atFarEdge: atFarEdge
+            numberOfTouches: touches,
+            location: location,
+            progress: there,
+            velocityX: velocityX,
+            width: gesture.view?.bounds.width ?? 1,
+            aborted: aborted
         )
+        let decision = result.decision
+        let velocity = result.velocity
+        let progress = result.progress
+        let atFarEdge = result.atFarEdge
+        let live = result.live ?? -1
         let commit = decision == .commit
         PageCurlLatency.mark("released", "commit=\(commit) phase=\(phase)")
         PageCurlDebug.log(String(

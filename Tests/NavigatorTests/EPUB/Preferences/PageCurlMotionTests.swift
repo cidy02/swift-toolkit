@@ -161,7 +161,62 @@ class PageCurlMotionTests: XCTestCase {
         assertSmooth(frames, live: start + 0.05 ... 0.92, "corner commit")
     }
 
-    /// The owner's gesture (iPhone, 2026-11-20): down at the right edge mid-height, out to 40% of the
+    /// A forward drag on `page` from `start` to `end` (UV), frame by frame, as the view tracks it.
+    private func dragFrames(_ page: Page, from start: CGPoint, to end: CGPoint, steps: Int = 40) -> [(progress: CGFloat, keys: [UInt16])] {
+        let p0 = PageCurlGeometry.heldPoint(
+            touchUV: start, spineX: page.spineX, peelSign: page.peelSign, span: page.span, aspect: page.aspect
+        )
+        let origin = PageCurlGeometry.fingerPoint(touchUV: start, aspect: page.aspect)
+        return (0 ... steps).map { i in
+            let t = CGFloat(i) / CGFloat(steps)
+            let uv = CGPoint(x: start.x + (end.x - start.x) * t, y: start.y + (end.y - start.y) * t)
+            let finger = PageCurlGeometry.fingerPoint(touchUV: uv, aspect: page.aspect)
+            let aim = PageCurlGeometry.fingerAim(
+                p0: p0, origin: origin, finger: finger, spineX: page.spineX, peelSign: page.peelSign,
+                span: page.span, pageHeight: page.height
+            )
+            let progress = PageCurlPanStateMachine.progress(
+                translationX: (uv.x - start.x) * 1000, width: 1000, forward: true, rtl: page.peelSign < 0
+            )
+            return (progress, frame(page, progress: progress, p0: p0, p: aim))
+        }
+    }
+
+    private func worstStep(_ frames: [(progress: CGFloat, keys: [UInt16])]) -> (CGFloat, CGFloat) {
+        var worst: (CGFloat, CGFloat) = (0, 0)
+        for i in 1 ..< frames.count {
+            let delta = changed(frames[i - 1].keys, frames[i].keys)
+            if delta > worst.0 {
+                worst = (delta, frames[i].progress)
+            }
+        }
+        return worst
+    }
+
+    /// Two pages, diagonal and corner drags whose held point is pulled back
+    /// within the spine's reach: the fold pivots on a spine end, which leaves
+    /// no room for a roll. That used to drop the radius under the shader's
+    /// "flat" cut-off, so the half-turned spread snapped to the whole old
+    /// spread, then cut to the whole new one at progress 0.5.
+    func testTwoPageDiagonalDragsNeverSnapFlat() {
+        let cases: [(Page, CGPoint, CGPoint, String)] = [
+            (.iPadTwo, CGPoint(x: 0.95, y: 0.90), CGPoint(x: 0.59, y: 0.60), "iPad corner up-left"),
+            (.iPadTwo, CGPoint(x: 0.95, y: 0.90), CGPoint(x: 0.02, y: 0.55), "iPad corner to the edge"),
+            (.duoTwo, CGPoint(x: 0.95, y: 0.50), CGPoint(x: 0.60, y: 0.07), "Duo mid-edge up-left"),
+            (.duoTwo, CGPoint(x: 0.95, y: 0.85), CGPoint(x: 0.05, y: 0.30), "Duo corner to the edge"),
+            (.iPadTwo, CGPoint(x: 0.45, y: 0.50), CGPoint(x: 0.0, y: 0.50), "iPad from left of the spine"),
+        ]
+        for (page, start, end, label) in cases {
+            let frames = dragFrames(page, from: start, to: end)
+            let worst = worstStep(frames)
+            XCTAssertLessThanOrEqual(worst.0, 0.12, "\(label): \(Int(worst.0 * 100))% changed in one frame at progress \(worst.1)")
+        }
+        // At the left edge from left of the spine, the spread is turned, not the old one.
+        let atEdge = dragFrames(.iPadTwo, from: CGPoint(x: 0.45, y: 0.5), to: CGPoint(x: 0, y: 0.5)).last!.keys
+        XCTAssertGreaterThan(CGFloat(atEdge.filter { $0 == 1 }.count) / CGFloat(atEdge.count), 0.9)
+    }
+
+    /// Down at the right edge mid-height, out to 40% of the
     /// width, then back to 5 pt from the right edge 150 pt lower, held, released. The curl follows the
     /// finger's travel away from the edge, so it shrinks to flat on the way back; the vertical offset
     /// only tilts it. The release (a cancel) springs from what is on screen, with no frame that cuts.
@@ -196,36 +251,49 @@ class PageCurlMotionTests: XCTestCase {
             let s = state(161 + (392 - 161) * t, 437 + 150 * t)
             frames.append((s.progress, frame(page, progress: s.progress, p0: p0, p: s.p)))
         }
-        let back = state(392, 587)
         XCTAssertLessThan(leafShare(frames.last!.keys), 0.03, "back at the edge, 150 pt lower: flat")
-        // The cancel spring, as `PageCurlView.finishInteractive` runs it: from the progress and the
-        // held point on screen (kept in reach), along the quadratic to P0.
-        let from = back.progress
-        let pFrom = PageCurlGeometry.attachedHeldPoint(p0: p0, p: back.p, spineX: page.spineX, pageHeight: page.height)
-        let control = PageCurlGeometry.mix(pFrom, p0, 0.5)
-        XCTAssertEqual(
-            frame(page, progress: from, p0: p0, p: PageCurlGeometry.springGrab(from: pFrom, control: control, to: p0, u: 0)),
-            frames.last!.keys,
-            "the spring's first frame is the frame on screen"
-        )
-        for i in 1 ... 12 {
-            let progress = PageCurlPanStateMachine.springProgress(
-                elapsed: Double(i) / 60, from: from, velocity: 0, target: 0,
-                omega: PageCurlPanStateMachine.omega(progressVelocity: 0)
-            )
-            let u = from > 0.0001 ? min(1, max(0, (progress - from) / (0 - from))) : 1
-            let q = PageCurlGeometry.springGrab(from: pFrom, control: control, to: p0, u: u)
-            frames.append((progress, frame(page, progress: progress, p0: p0, p: q)))
-        }
-        var worst: (CGFloat, Int) = (0, 0)
-        for i in 1 ..< frames.count {
-            let delta = changed(frames[i - 1].keys, frames[i].keys)
-            if delta > worst.0 {
-                worst = (delta, i)
+        XCTAssertGreaterThan(leafShare(frames.last!.keys), 0, "still a sliver, not a cut")
+        XCTAssertLessThanOrEqual(worstStep(frames).0, 0.12, "the way back has no jump")
+
+        // The cancel spring, as `PageCurlView.finishInteractive` runs it: from the progress and the held
+        // point on screen (kept in reach), along the quadratic to P0, landing as the view does. Released
+        // on the way back (a curl on screen) and at the edge.
+        for (x, y) in [(CGFloat(373), CGFloat(572)), (392, 587)] {
+            let release = state(x, y)
+            let onScreen = frame(page, progress: release.progress, p0: p0, p: release.p)
+            if x < 380 {
+                XCTAssertGreaterThan(leafShare(onScreen), 0.02, "released at \(x): a curl on screen")
             }
+            let from = release.progress
+            let pFrom = PageCurlGeometry.attachedHeldPoint(p0: p0, p: release.p, spineX: page.spineX, pageHeight: page.height)
+            let control = PageCurlGeometry.mix(pFrom, p0, 0.5)
+            var spring: [(progress: CGFloat, keys: [UInt16])] = [(from, onScreen)]
+            var landed = false
+            var i = 0
+            while !landed {
+                i += 1
+                let elapsed = Double(i) / 60
+                var progress = PageCurlPanStateMachine.springProgress(
+                    elapsed: elapsed, from: from, velocity: 0, target: 0,
+                    omega: PageCurlPanStateMachine.omega(progressVelocity: 0)
+                )
+                if abs(progress) < 0.004 || elapsed > 0.7 {
+                    progress = 0
+                    landed = true
+                }
+                let u = from > 0.000_1 ? min(1, max(0, (progress - from) / (0 - from))) : 1
+                let q = PageCurlGeometry.springGrab(from: pFrom, control: control, to: p0, u: u)
+                spring.append((progress, frame(page, progress: progress, p0: p0, p: q)))
+            }
+            XCTAssertEqual(
+                frame(page, progress: from, p0: p0, p: PageCurlGeometry.springGrab(from: pFrom, control: control, to: p0, u: 0)),
+                onScreen,
+                "released at \(x): the spring's first frame is the frame on screen"
+            )
+            let worst = worstStep(spring)
+            XCTAssertLessThanOrEqual(worst.0, 0.12, "released at \(x): \(Int(worst.0 * 100))% changed in one spring frame")
+            XCTAssertTrue(spring.last!.keys.allSatisfy { $0 == 0 }, "released at \(x): the cancel lands flat")
         }
-        XCTAssertLessThanOrEqual(worst.0, 0.12, "\(Int(worst.0 * 100))% of the screen changed in one frame at frame \(worst.1)")
-        XCTAssertTrue(frames.last!.keys.allSatisfy { $0 == 0 }, "the cancel lands flat")
     }
 
     /// The vertical offset only tilts the fold. A finger anywhere on the start edge is a flat leaf.
@@ -255,6 +323,27 @@ class PageCurlMotionTests: XCTestCase {
             spineX: 0, peelSign: 1, span: 1, pageHeight: 2.0
         )
         XCTAssertEqual(corner.y, 1.717, accuracy: 0.005) // the finger's 0.3, less the far-edge fade
+        // A thumb on the bottom corner, above the home indicator (y 780 of 874 on a 402 pt phone):
+        // 40 pt in and 40 pt up is already a 45° lift.
+        let w: CGFloat = 402
+        let thumb = PageCurlGeometry.fingerAim(
+            p0: CGPoint(x: 1, y: 780 / w), origin: CGPoint(x: 390 / w, y: 780 / w),
+            finger: CGPoint(x: 350 / w, y: 740 / w), spineX: 0, peelSign: 1, span: 1, pageHeight: 874 / w
+        )
+        XCTAssertEqual((780 / w - thumb.y) * w, 40, accuracy: 1.5)
+        // Mid-edge, 100 pt in and 100 pt up: most of the tilt is kept.
+        let mid = PageCurlGeometry.fingerAim(
+            p0: CGPoint(x: 1, y: 437 / w), origin: CGPoint(x: 390 / w, y: 437 / w),
+            finger: CGPoint(x: 290 / w, y: 337 / w), spineX: 0, peelSign: 1, span: 1, pageHeight: 874 / w
+        )
+        XCTAssertGreaterThan((437 / w - mid.y) * w, 60)
+        // Starting at the far edge (no lead): still never behind P0, still flat at the start.
+        let farEdge = PageCurlGeometry.fingerAim(
+            p0: CGPoint(x: 1, y: 1), origin: CGPoint(x: 0.005, y: 1), finger: CGPoint(x: 0.02, y: 1.3),
+            spineX: 0, peelSign: 1, span: 1, pageHeight: 2
+        )
+        XCTAssertEqual(farEdge.x, 1, accuracy: 0.000_1)
+        XCTAssertEqual(farEdge.y, 1, accuracy: 0.000_1)
     }
 
     /// A flick released before the leaf caught the finger springs through the

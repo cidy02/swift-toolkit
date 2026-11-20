@@ -244,9 +244,14 @@ enum PageCurlGeometry {
 
     /// The finger's vertical offset tilts the fold; it does not curl the leaf
     /// on its own. P's offset from P0 is held within this many times its
-    /// travel away from the edge (45°), and within the travel squared over
-    /// the edge left ahead of the fold (`fingerAim`).
+    /// travel away from the edge (45°)...
     static let maxFingerTilt: CGFloat = 1
+    /// ...and within `tiltEdgeReach` · travel² over the edge left ahead of
+    /// the fold. The least that still closes the leaf flat when the finger
+    /// comes back to its edge at another height: 3 lets a thumb corner grab
+    /// reach 45° within about 30 pt and a mid-edge diagonal within about a
+    /// third of the width (402 pt phone).
+    static let tiltEdgeReach: CGFloat = 3
 
     /// Held point for a finger drag that peels the leaf (not a reversed one).
     /// Early on it is P0 moved by the finger's travel, so the leaf is at the
@@ -271,33 +276,37 @@ enum PageCurlGeometry {
         let sign: CGFloat = peelSign >= 0 ? 1 : -1
         let limitX: CGFloat = sign > 0 ? 0 : 1
         let available = (origin.x - limitX) * sign
-        guard available > 0.01 else {
-            return follow
+        // No room to lead when the drag starts at the far edge; the limits
+        // below still apply.
+        var x = follow.x
+        var lead: CGFloat = 0
+        if available > 0.01 {
+            let travel = (origin.x - finger.x) * sign
+            let t = min(1, max(0, travel / available))
+            lead = pow(t, edgeLeadPower)
+            let landing = commitLanding(p0: p0, spineX: spineX, peelSign: peelSign, span: span)
+            let followAtEdge = p0.x - sign * available
+            // Only ever ahead of the finger. On a spine off the middle the plain
+            // follow can pass the landing before the finger reaches the edge;
+            // leading "back" to it would hold the leaf behind the finger.
+            let shortfall = min(0, (landing.x - followAtEdge) * sign) * sign
+            x = follow.x + shortfall * lead
         }
-        let travel = (origin.x - finger.x) * sign
-        let t = min(1, max(0, travel / available))
-        let lead = pow(t, edgeLeadPower)
-        let landing = commitLanding(p0: p0, spineX: spineX, peelSign: peelSign, span: span)
-        let followAtEdge = p0.x - sign * available
-        // Only ever ahead of the finger. On a spine off the middle the plain
-        // follow can pass the landing before the finger reaches the edge;
-        // leading "back" to it would hold the leaf behind the finger.
-        let shortfall = min(0, (landing.x - followAtEdge) * sign) * sign
         // Never behind P0: a finger back past where it started is a flat leaf.
-        let x = sign * min((follow.x + shortfall * lead) * sign, p0.x * sign)
+        x = sign * min(x * sign, p0.x * sign)
         // The curl is the travel away from the edge. The vertical offset tilts
         // the fold within that; on its own (finger back on the start edge, at
-        // another height) it used to fold a corner across the page while the
-        // progress, and so the release spring, was at zero.
-        // A tilted fold runs on along the edge toward the end it tilts to (the
-        // top when the finger went down), lifting all of that edge: keep the
-        // tilt within travel / that length, so the lift there stays about the
-        // travel. At a corner there is no edge ahead, and the 45° cap holds.
+        // another height) it folded a corner across the page while the
+        // progress, and so the release spring, was at zero. A tilted fold also
+        // runs on along the edge toward the end it tilts to (the top when the
+        // finger went down), lifting that edge: the tilt is held within
+        // `tiltEdgeReach` · travel / that length. At a corner there is no edge
+        // ahead, and only the 45° cap holds.
         let reach = (p0.x - x) * sign
         let dy = follow.y + (p0.y - follow.y) * lead - p0.y
         let height = max(pageHeight.isFinite ? pageHeight : 1, 0.05)
         let ahead = max(dy > 0 ? p0.y : height - p0.y, 0)
-        let ratio = ahead > reach / maxFingerTilt ? reach / ahead : maxFingerTilt
+        let ratio = min(maxFingerTilt, ahead > 0 ? tiltEdgeReach * reach / ahead : maxFingerTilt)
         let limit = ratio * reach
         return CGPoint(x: x, y: p0.y + min(limit, max(-limit, dy)))
     }
@@ -806,12 +815,10 @@ enum PageCurlGeometry {
         if shown >= 0.999 {
             return sample(.incoming, u, .flatIncoming)
         }
-        // A vanishing cylinder is a hard crease. Stay flat until the roll exists.
-        if radius.isFinite, radius < 0.004 {
-            return shown > 0.5
-                ? sample(.incoming, u, .flatIncoming)
-                : sample(.outgoing, u, .flatOutgoing)
-        }
+        // No flat cut-off for a small radius: a vanishing cylinder is a crease
+        // (the flat fold), the same picture the roll shrinks into. The cut-off
+        // snapped a half-turned spread to the whole old or new one whenever the
+        // radius was cut at the spine (`spineSafeRadius`).
         let safeAspect = max(aspect.isFinite ? aspect : 1, 0.05)
         let pageH = 1 / safeAspect
         let leafSpan = max(span.isFinite ? span : 0.05, 0.05)
@@ -905,7 +912,11 @@ enum PageCurlGeometry {
         if w < 0 {
             return (.pi * r - w, nil)
         }
-        let theta = asin(min(1, w / max(r, 1e-9)))
+        // A crease (as the shader: no roll under 0.0001).
+        guard r >= 0.000_1 else {
+            return (.pi * r, nil)
+        }
+        let theta = asin(min(1, w / r))
         return (r * (.pi - theta), r * theta)
     }
 
@@ -914,7 +925,7 @@ enum PageCurlGeometry {
     /// The same for the front and the back, so both meet at the crest.
     static func rollShade(w: CGFloat, radius: CGFloat) -> CGFloat {
         let r = radius.isFinite ? radius : 0
-        guard r > 0, w.isFinite, w >= 0 else {
+        guard r >= 0.000_1, w.isFinite, w >= 0 else {
             return 1
         }
         let sinTheta = min(1, w / r)
@@ -929,8 +940,8 @@ enum PageCurlGeometry {
     }
 
     /// Underside of a one-page leaf: the theme's own page colour, in every
-    /// theme, with the mirrored text showing through (`backsideMix`). Apple
-    /// Books' back on a black page is black; the type is what makes it read.
+    /// theme, with the mirrored text showing through (`backsideMix`). On a
+    /// black page the back is black; the type is what makes it read.
     /// The old lifted OLED black and the grey Dark card read as a second shape.
     static func backsidePaper(background: PageCurlRGB) -> PageCurlPaper {
         func channel(_ value: CGFloat) -> CGFloat {
