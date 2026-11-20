@@ -665,6 +665,60 @@ class PageCurlGeometryTests: XCTestCase {
         XCTAssertLessThan(spine - 0.50, 0)
     }
 
+    /// Owner, 2026-11-19: a slow drag never got past halfway. The fold keeps
+    /// moving toward the spine all the way to the far edge, and is on it
+    /// there; early on the leaf stays at the finger.
+    func testSlowDragTurnsThePageAllTheWayToTheEdge() {
+        let aspect: CGFloat = 402.0 / 874.0
+        let height = 1 / aspect
+        for (spineX, peelSign, span, originX, edgeX) in [
+            (CGFloat(0), CGFloat(1), CGFloat(1), CGFloat(388.0 / 402), CGFloat(0)),
+            (1, -1, 1, 14.0 / 402, 1),
+        ] {
+            let p0 = PageCurlGeometry.heldPoint(
+                touchUV: CGPoint(x: originX, y: 0.5), spineX: spineX, peelSign: peelSign, span: span, aspect: aspect
+            )
+            let origin = CGPoint(x: originX, y: 0.5 / aspect)
+            var lastFold = CGFloat.infinity
+            var lastProgress: CGFloat = -1
+            for step in 0 ... 40 {
+                let fx = originX + (edgeX - originX) * CGFloat(step) / 40
+                let finger = CGPoint(x: fx, y: origin.y)
+                let aim = PageCurlGeometry.fingerAim(
+                    p0: p0, origin: origin, finger: finger, spineX: spineX, peelSign: peelSign, span: span
+                )
+                let progress = PageCurlPanStateMachine.progress(
+                    translationX: (fx - originX) * 402, width: 402, forward: true, rtl: peelSign < 0
+                )
+                XCTAssertGreaterThanOrEqual(progress, lastProgress)
+                lastProgress = progress
+                guard step > 0 else { continue }
+                let fold = tryGrab(p0: p0, p: aim, radius: 0, spineX: spineX, pageHeight: height)
+                // Distance of the fold from the spine shrinks every step.
+                let fromSpine = abs(fold.point.x - spineX)
+                XCTAssertLessThan(fromSpine, lastFold, "step \(step)")
+                lastFold = fromSpine
+                if step == 10 {
+                    // A quarter of the way: the leaf's edge is within ~7 pt of the finger.
+                    XCTAssertLessThan(abs(aim.x - (p0.x + fx - originX)) * 402, 8)
+                }
+            }
+            XCTAssertLessThan(lastFold, 0.01)
+            XCTAssertGreaterThan(lastProgress, 0.9)
+            XCTAssertEqual(
+                PageCurlPanStateMachine.release(progress: lastProgress, turnVelocity: 0, width: 402, cancelled: false),
+                .commit
+            )
+        }
+        // Two pages: the finger's own travel already reaches the landing; no lead.
+        let p0 = CGPoint(x: 1, y: 0.7)
+        let aim = PageCurlGeometry.fingerAim(
+            p0: p0, origin: CGPoint(x: 0.97, y: 0.7), finger: CGPoint(x: 0, y: 0.7),
+            spineX: 0.5, peelSign: 1, span: 0.5
+        )
+        XCTAssertEqual(aim.x, 0, accuracy: 0.0001)
+    }
+
     func testCommitLandsOnTheMirrorOfTheHeldPoint() {
         let straight = PageCurlGeometry.commitLanding(
             p0: CGPoint(x: 1, y: 1.2), spineX: 0, peelSign: 1, span: 1

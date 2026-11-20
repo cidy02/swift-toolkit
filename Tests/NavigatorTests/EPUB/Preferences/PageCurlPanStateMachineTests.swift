@@ -140,13 +140,57 @@ class PageCurlPanStateMachineTests: XCTestCase {
         XCTAssertEqual(notFinite, CGPoint(x: 10, y: 10))
     }
 
-    func testCancelledReleaseNeverCommits() {
+    /// Owner, 2026-11-19: pages snapped back when the finger neared the edge.
+    /// UIKit ending the pan (`.cancelled`) is not the reader asking for the
+    /// page back: past the commit distance it commits. Short, or moving
+    /// back, it reverts.
+    func testSystemCancelledReleasePastTheThresholdCommits() {
         XCTAssertEqual(
             PageCurlPanStateMachine.release(progress: 0.9, turnVelocity: 2000, width: 390, cancelled: true),
+            .commit
+        )
+        XCTAssertEqual(
+            PageCurlPanStateMachine.release(progress: 0.5, turnVelocity: 0, width: 390, cancelled: true),
+            .commit
+        )
+        XCTAssertEqual(
+            PageCurlPanStateMachine.release(progress: 0.2, turnVelocity: 2000, width: 390, cancelled: true),
             .cancel
         )
         XCTAssertEqual(
-            PageCurlPanStateMachine.release(progress: 1, turnVelocity: 0, width: 390, cancelled: true),
+            PageCurlPanStateMachine.release(progress: 0.9, turnVelocity: -600, width: 390, cancelled: true),
+            .cancel
+        )
+    }
+
+    /// A finger that reached the far edge has carried the page across, even
+    /// from a start near the middle (progress under the commit distance).
+    func testReleaseAtTheFarEdgeCommits() {
+        let w: CGFloat = 402
+        XCTAssertTrue(PageCurlPanStateMachine.isAtFarEdge(locationX: 10, width: w, forward: true, rtl: false))
+        XCTAssertFalse(PageCurlPanStateMachine.isAtFarEdge(locationX: 60, width: w, forward: true, rtl: false))
+        XCTAssertTrue(PageCurlPanStateMachine.isAtFarEdge(locationX: 395, width: w, forward: false, rtl: false))
+        XCTAssertTrue(PageCurlPanStateMachine.isAtFarEdge(locationX: 395, width: w, forward: true, rtl: true))
+        XCTAssertFalse(PageCurlPanStateMachine.isAtFarEdge(locationX: 10, width: w, forward: false, rtl: false))
+        XCTAssertEqual(
+            PageCurlPanStateMachine.release(progress: 0.3, turnVelocity: 0, width: w, cancelled: false, atFarEdge: true),
+            .commit
+        )
+        XCTAssertEqual(
+            PageCurlPanStateMachine.release(progress: 0.3, turnVelocity: 0, width: w, cancelled: true, atFarEdge: true),
+            .commit
+        )
+        XCTAssertEqual(
+            PageCurlPanStateMachine.release(progress: 0.3, turnVelocity: 0, width: w, cancelled: false, atFarEdge: false),
+            .cancel
+        )
+        // Pulled back off the edge on purpose, or a nudge that started there.
+        XCTAssertEqual(
+            PageCurlPanStateMachine.release(progress: 0.3, turnVelocity: -400, width: w, cancelled: false, atFarEdge: true),
+            .cancel
+        )
+        XCTAssertEqual(
+            PageCurlPanStateMachine.release(progress: 0.05, turnVelocity: 0, width: w, cancelled: false, atFarEdge: true),
             .cancel
         )
     }

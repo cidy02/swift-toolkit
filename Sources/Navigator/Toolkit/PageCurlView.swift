@@ -535,14 +535,20 @@ final class PageCurlView: UIView {
                 pageHeight: pageH
             ))
         }
-        return (p0, fingerAim(p0: p0, aspect: aspect))
+        return (p0, fingerAim(p0: p0, aspect: aspect, span: span))
     }
 
-    /// The held point moved by the finger's travel since the touch-down.
-    private func fingerAim(p0: CGPoint, aspect: CGFloat) -> CGPoint {
-        let origin = PageCurlGeometry.fingerPoint(touchUV: grabUV, aspect: aspect)
-        let finger = PageCurlGeometry.fingerPoint(touchUV: fingerUV, aspect: aspect)
-        return CGPoint(x: p0.x + (finger.x - origin.x), y: p0.y + (finger.y - origin.y))
+    /// The held point moved by the finger's travel since the touch-down,
+    /// running ahead to the landing near the far edge (`PageCurlGeometry.fingerAim`).
+    private func fingerAim(p0: CGPoint, aspect: CGFloat, span: CGFloat) -> CGPoint {
+        PageCurlGeometry.fingerAim(
+            p0: p0,
+            origin: PageCurlGeometry.fingerPoint(touchUV: grabUV, aspect: aspect),
+            finger: PageCurlGeometry.fingerPoint(touchUV: fingerUV, aspect: aspect),
+            spineX: spine.normalizedX,
+            peelSign: peelSign,
+            span: span
+        )
     }
 
     /// Visual progress. A reversed one-page turn runs the forward curl from

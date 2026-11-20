@@ -240,6 +240,47 @@ enum PageCurlGeometry {
         return CGPoint(x: spine - sign * leaf, y: p0.y.isFinite ? p0.y : 0)
     }
 
+    /// How sharply the leaf runs ahead of the finger near the far edge
+    /// (`fingerAim`). 3 keeps it within about 7 pt of the finger for the
+    /// first quarter of the travel and about 52 pt at half (402 pt iPhone).
+    static let edgeLeadPower: CGFloat = 3
+
+    /// Held point for a finger drag that peels the leaf (not a reversed one).
+    /// Early on it is P0 moved by the finger's travel, so the leaf is at the
+    /// finger. As the finger nears the far screen edge, P runs ahead to the
+    /// landing (`commitLanding`), so the fold keeps going to the spine: at the
+    /// edge the page is turned, as in Apple Books, instead of stopping halfway
+    /// with the leaf's edge under the finger. The finger's vertical offset
+    /// fades out the same way, so the leaf lands flat. Points are isotropic.
+    static func fingerAim(
+        p0: CGPoint,
+        origin: CGPoint,
+        finger: CGPoint,
+        spineX: CGFloat,
+        peelSign: CGFloat,
+        span: CGFloat
+    ) -> CGPoint {
+        let follow = CGPoint(x: p0.x + (finger.x - origin.x), y: p0.y + (finger.y - origin.y))
+        guard follow.x.isFinite, follow.y.isFinite, origin.x.isFinite else {
+            return follow
+        }
+        let sign: CGFloat = peelSign >= 0 ? 1 : -1
+        let limitX: CGFloat = sign > 0 ? 0 : 1
+        let available = (origin.x - limitX) * sign
+        guard available > 0.01 else {
+            return follow
+        }
+        let travel = (origin.x - finger.x) * sign
+        let t = min(1, max(0, travel / available))
+        let lead = pow(t, edgeLeadPower)
+        let landing = commitLanding(p0: p0, spineX: spineX, peelSign: peelSign, span: span)
+        let followAtEdge = p0.x - sign * available
+        return CGPoint(
+            x: follow.x + (landing.x - followAtEdge) * lead,
+            y: follow.y + (p0.y - follow.y) * lead
+        )
+    }
+
     /// One page going back plays the forward curl from landed to flat.
     /// `shown` is that forward progress (1 at the start of the drag). x runs
     /// from the mirror back to P0; the finger's vertical movement tilts the

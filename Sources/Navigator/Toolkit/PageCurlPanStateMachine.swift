@@ -185,17 +185,44 @@ enum PageCurlPanStateMachine {
         return total / CGFloat(recent.count)
     }
 
-    /// A system cancel never commits, including on the last page.
+    /// A finger released within this of the far screen edge (the side the
+    /// turn moves toward) has carried the page across: it commits.
+    static let farEdgeInset: CGFloat = 24
+    /// Points per second back toward the start that read as "put it back".
+    /// Only this, or a release short of the threshold, reverts a turn.
+    static let backwardIntentVelocity: CGFloat = 150
+
+    static func isAtFarEdge(locationX: CGFloat, width: CGFloat, forward: Bool, rtl: Bool) -> Bool {
+        guard locationX.isFinite, width > 1 else {
+            return false
+        }
+        if turnScreenSign(forward: forward, rtl: rtl) > 0 {
+            return locationX >= width - farEdgeInset
+        }
+        return locationX <= farEdgeInset
+    }
+
+    /// `cancelled` is UIKit ending the pan (`.cancelled` / `.failed`): a system
+    /// gesture, or the touch leaving the screen at its edge. That is not the
+    /// reader asking for the page back, so a drag past the commit distance
+    /// still commits. Our own aborts (reload, background) are not releases;
+    /// the controller cancels those itself. Moving back toward the start
+    /// reverts a cancelled or edge release.
     static func release(
         progress: CGFloat,
         turnVelocity: CGFloat,
         width: CGFloat,
-        cancelled: Bool
+        cancelled: Bool,
+        atFarEdge: Bool = false
     ) -> PageCurlPanRelease {
-        if cancelled {
-            return .cancel
-        }
         let p = PageCurlGeometry.clampProgress(progress)
+        let movingBack = turnVelocity.isFinite && turnVelocity < -backwardIntentVelocity
+        if atFarEdge, p > 0.1, !movingBack {
+            return .commit
+        }
+        if cancelled {
+            return p > distanceCommit && !movingBack ? .commit : .cancel
+        }
         if p > distanceCommit {
             return .commit
         }

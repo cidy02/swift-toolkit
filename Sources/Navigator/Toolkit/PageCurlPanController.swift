@@ -407,17 +407,30 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
         }
         let velocity = PageCurlPanStateMachine.smoothedVelocity(velocities)
         let width = gesture.view?.bounds.width ?? 1
-        let progress = cancelled
-            ? live
-            : PageCurlPanStateMachine.progressAtRelease(live: live, lastProgress: lastProgress)
-        let decision = PageCurlPanStateMachine.release(
+        // A system cancel near the edge can report the origin; the last
+        // `.changed` sample is where the finger really was.
+        let progress = PageCurlPanStateMachine.progressAtRelease(live: live, lastProgress: lastProgress)
+        let atFarEdge = PageCurlPanStateMachine.isAtFarEdge(
+            locationX: lastFinger.x,
+            width: width,
+            forward: direction == .forward,
+            rtl: rtl
+        )
+        let decision: PageCurlPanRelease = aborted ? .cancel : PageCurlPanStateMachine.release(
             progress: progress,
             turnVelocity: velocity,
             width: width,
-            cancelled: cancelled || aborted
+            cancelled: cancelled,
+            atFarEdge: atFarEdge
         )
         let commit = decision == .commit
         PageCurlLatency.mark("released", "commit=\(commit) phase=\(phase)")
+        PageCurlDebug.log(String(
+            format: "curl-release state=%@ live=%.3f last=%.3f progress=%.3f v=%.0f x=%.0f edge=%@ aborted=%@ -> %@",
+            "\(gesture.state.rawValue)\(cancelled ? "(cancelled)" : "")",
+            live, lastProgress, progress, velocity, lastFinger.x,
+            atFarEdge ? "yes" : "no", aborted ? "yes" : "no", commit ? "commit" : "cancel"
+        ))
         switch phase {
         case .preparing:
             pendingRelease = (commit, velocity, lastFinger)
