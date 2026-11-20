@@ -242,6 +242,12 @@ enum PageCurlGeometry {
     /// first quarter of the travel and about 52 pt at half (402 pt iPhone).
     static let edgeLeadPower: CGFloat = 3
 
+    /// The finger's vertical offset tilts the fold; it does not curl the leaf
+    /// on its own. P's offset from P0 is held within this many times its
+    /// travel away from the edge (45°), and within the travel squared over
+    /// the edge left ahead of the fold (`fingerAim`).
+    static let maxFingerTilt: CGFloat = 1
+
     /// Held point for a finger drag that peels the leaf (not a reversed one).
     /// Early on it is P0 moved by the finger's travel, so the leaf is at the
     /// finger. As the finger nears the far screen edge, P runs ahead to the
@@ -255,7 +261,8 @@ enum PageCurlGeometry {
         finger: CGPoint,
         spineX: CGFloat,
         peelSign: CGFloat,
-        span: CGFloat
+        span: CGFloat,
+        pageHeight: CGFloat
     ) -> CGPoint {
         let follow = CGPoint(x: p0.x + (finger.x - origin.x), y: p0.y + (finger.y - origin.y))
         guard follow.x.isFinite, follow.y.isFinite, origin.x.isFinite else {
@@ -276,10 +283,23 @@ enum PageCurlGeometry {
         // follow can pass the landing before the finger reaches the edge;
         // leading "back" to it would hold the leaf behind the finger.
         let shortfall = min(0, (landing.x - followAtEdge) * sign) * sign
-        return CGPoint(
-            x: follow.x + shortfall * lead,
-            y: follow.y + (p0.y - follow.y) * lead
-        )
+        // Never behind P0: a finger back past where it started is a flat leaf.
+        let x = sign * min((follow.x + shortfall * lead) * sign, p0.x * sign)
+        // The curl is the travel away from the edge. The vertical offset tilts
+        // the fold within that; on its own (finger back on the start edge, at
+        // another height) it used to fold a corner across the page while the
+        // progress, and so the release spring, was at zero.
+        // A tilted fold runs on along the edge toward the end it tilts to (the
+        // top when the finger went down), lifting all of that edge: keep the
+        // tilt within travel / that length, so the lift there stays about the
+        // travel. At a corner there is no edge ahead, and the 45° cap holds.
+        let reach = (p0.x - x) * sign
+        let dy = follow.y + (p0.y - follow.y) * lead - p0.y
+        let height = max(pageHeight.isFinite ? pageHeight : 1, 0.05)
+        let ahead = max(dy > 0 ? p0.y : height - p0.y, 0)
+        let ratio = ahead > reach / maxFingerTilt ? reach / ahead : maxFingerTilt
+        let limit = ratio * reach
+        return CGPoint(x: x, y: p0.y + min(limit, max(-limit, dy)))
     }
 
     /// `radius`, cut so the roll stays on the leaf's side of the spine. The

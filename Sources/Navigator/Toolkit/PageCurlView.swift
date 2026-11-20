@@ -594,7 +594,8 @@ final class PageCurlView: UIView {
             finger: PageCurlGeometry.fingerPoint(touchUV: fingerUV, aspect: aspect),
             spineX: spine.normalizedX,
             peelSign: peelSign,
-            span: span
+            span: span,
+            pageHeight: 1 / max(aspect, 0.05)
         )
     }
 

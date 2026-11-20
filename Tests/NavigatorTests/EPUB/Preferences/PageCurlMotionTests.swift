@@ -161,6 +161,102 @@ class PageCurlMotionTests: XCTestCase {
         assertSmooth(frames, live: start + 0.05 ... 0.92, "corner commit")
     }
 
+    /// The owner's gesture (iPhone, 2026-11-20): down at the right edge mid-height, out to 40% of the
+    /// width, then back to 5 pt from the right edge 150 pt lower, held, released. The curl follows the
+    /// finger's travel away from the edge, so it shrinks to flat on the way back; the vertical offset
+    /// only tilts it. The release (a cancel) springs from what is on screen, with no frame that cuts.
+    func testFingerBackAtTheStartEdgeFlattensTheLeafAndTheCancelDoesNotCut() {
+        let page = Page.iPhone
+        let w: CGFloat = 402
+        let origin = CGPoint(x: 397 / w, y: 437 / w)
+        let p0 = PageCurlGeometry.heldPoint(
+            touchUV: CGPoint(x: 397 / w, y: 437.0 / 874), spineX: page.spineX, peelSign: page.peelSign,
+            span: page.span, aspect: page.aspect
+        )
+        func state(_ x: CGFloat, _ y: CGFloat) -> (progress: CGFloat, p: CGPoint) {
+            let finger = CGPoint(x: x / w, y: y / w)
+            let p = PageCurlGeometry.fingerAim(
+                p0: p0, origin: origin, finger: finger, spineX: page.spineX, peelSign: page.peelSign, span: page.span,
+                pageHeight: page.height
+            )
+            let progress = PageCurlPanStateMachine.progress(translationX: x - 397, width: w, forward: true, rtl: false)
+            return (progress, p)
+        }
+        func leafShare(_ keys: [UInt16]) -> CGFloat {
+            CGFloat(keys.filter { $0 != 0 }.count) / CGFloat(keys.count)
+        }
+        var frames: [(progress: CGFloat, keys: [UInt16])] = []
+        for k in 0 ... 30 {
+            let s = state(397 - 236 * CGFloat(k) / 30, 437)
+            frames.append((s.progress, frame(page, progress: s.progress, p0: p0, p: s.p)))
+        }
+        XCTAssertGreaterThan(leafShare(frames.last!.keys), 0.2, "out at 40%: a real curl")
+        for k in 1 ... 40 {
+            let t = CGFloat(k) / 40
+            let s = state(161 + (392 - 161) * t, 437 + 150 * t)
+            frames.append((s.progress, frame(page, progress: s.progress, p0: p0, p: s.p)))
+        }
+        let back = state(392, 587)
+        XCTAssertLessThan(leafShare(frames.last!.keys), 0.03, "back at the edge, 150 pt lower: flat")
+        // The cancel spring, as `PageCurlView.finishInteractive` runs it: from the progress and the
+        // held point on screen (kept in reach), along the quadratic to P0.
+        let from = back.progress
+        let pFrom = PageCurlGeometry.attachedHeldPoint(p0: p0, p: back.p, spineX: page.spineX, pageHeight: page.height)
+        let control = PageCurlGeometry.mix(pFrom, p0, 0.5)
+        XCTAssertEqual(
+            frame(page, progress: from, p0: p0, p: PageCurlGeometry.springGrab(from: pFrom, control: control, to: p0, u: 0)),
+            frames.last!.keys,
+            "the spring's first frame is the frame on screen"
+        )
+        for i in 1 ... 12 {
+            let progress = PageCurlPanStateMachine.springProgress(
+                elapsed: Double(i) / 60, from: from, velocity: 0, target: 0,
+                omega: PageCurlPanStateMachine.omega(progressVelocity: 0)
+            )
+            let u = from > 0.0001 ? min(1, max(0, (progress - from) / (0 - from))) : 1
+            let q = PageCurlGeometry.springGrab(from: pFrom, control: control, to: p0, u: u)
+            frames.append((progress, frame(page, progress: progress, p0: p0, p: q)))
+        }
+        var worst: (CGFloat, Int) = (0, 0)
+        for i in 1 ..< frames.count {
+            let delta = changed(frames[i - 1].keys, frames[i].keys)
+            if delta > worst.0 {
+                worst = (delta, i)
+            }
+        }
+        XCTAssertLessThanOrEqual(worst.0, 0.12, "\(Int(worst.0 * 100))% of the screen changed in one frame at frame \(worst.1)")
+        XCTAssertTrue(frames.last!.keys.allSatisfy { $0 == 0 }, "the cancel lands flat")
+    }
+
+    /// The vertical offset only tilts the fold. A finger anywhere on the start edge is a flat leaf.
+    func testVerticalOffsetAloneDoesNotCurlTheLeaf() {
+        let p0 = CGPoint(x: 1, y: 1.0)
+        for dy in [CGFloat(-0.6), -0.2, 0.2, 0.6] {
+            for back in [CGFloat(0), 0.01] {
+                let aim = PageCurlGeometry.fingerAim(
+                    p0: p0, origin: CGPoint(x: 0.98, y: 1.0), finger: CGPoint(x: 0.98 + back, y: 1.0 + dy),
+                    spineX: 0, peelSign: 1, span: 1, pageHeight: 2.0
+                )
+                XCTAssertEqual(aim.x, p0.x, accuracy: 0.000_1, "dy \(dy) back \(back)")
+                XCTAssertEqual(aim.y, p0.y, accuracy: 0.000_1, "dy \(dy) back \(back)")
+            }
+        }
+        // Out 0.2 and 0.6 down: the tilt is bounded by the travel, the curl is still there.
+        let tilted = PageCurlGeometry.fingerAim(
+            p0: p0, origin: CGPoint(x: 0.98, y: 1.0), finger: CGPoint(x: 0.78, y: 1.6), spineX: 0, peelSign: 1, span: 1,
+            pageHeight: 2.0
+        )
+        XCTAssertLessThan(tilted.x, 0.85)
+        XCTAssertGreaterThan(tilted.y, p0.y)
+        XCTAssertLessThanOrEqual(tilted.y - p0.y, (p0.x - tilted.x) * PageCurlGeometry.maxFingerTilt + 0.000_1)
+        // A bottom-corner grab lifted up and in keeps its corner angle (45° cap only).
+        let corner = PageCurlGeometry.fingerAim(
+            p0: CGPoint(x: 1, y: 2.0), origin: CGPoint(x: 0.97, y: 1.95), finger: CGPoint(x: 0.6, y: 1.65),
+            spineX: 0, peelSign: 1, span: 1, pageHeight: 2.0
+        )
+        XCTAssertEqual(corner.y, 1.717, accuracy: 0.005) // the finger's 0.3, less the far-edge fade
+    }
+
     /// A flick released before the leaf caught the finger springs through the
     /// finger's point, so the corner still rises the way the drag went.
     func testFlickSpringKeepsTheDragAngle() {

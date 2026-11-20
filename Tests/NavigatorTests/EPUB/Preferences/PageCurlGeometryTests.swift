@@ -684,7 +684,7 @@ class PageCurlGeometryTests: XCTestCase {
                 let fx = originX + (edgeX - originX) * CGFloat(step) / 40
                 let finger = CGPoint(x: fx, y: origin.y)
                 let aim = PageCurlGeometry.fingerAim(
-                    p0: p0, origin: origin, finger: finger, spineX: spineX, peelSign: peelSign, span: span
+                    p0: p0, origin: origin, finger: finger, spineX: spineX, peelSign: peelSign, span: span, pageHeight: 2.2
                 )
                 let progress = PageCurlPanStateMachine.progress(
                     translationX: (fx - originX) * 402, width: 402, forward: true, rtl: peelSign < 0
@@ -713,7 +713,7 @@ class PageCurlGeometryTests: XCTestCase {
         let p0 = CGPoint(x: 1, y: 0.7)
         let aim = PageCurlGeometry.fingerAim(
             p0: p0, origin: CGPoint(x: 0.97, y: 0.7), finger: CGPoint(x: 0, y: 0.7),
-            spineX: 0.5, peelSign: 1, span: 0.5
+            spineX: 0.5, peelSign: 1, span: 0.5, pageHeight: 1.4
         )
         XCTAssertEqual(aim.x, 0, accuracy: 0.0001)
     }
@@ -735,7 +735,7 @@ class PageCurlGeometryTests: XCTestCase {
             )
             let finger = CGPoint(x: 0, y: origin.y)
             let p = PageCurlGeometry.fingerAim(
-                p0: p0, origin: origin, finger: finger, spineX: spineX, peelSign: 1, span: span
+                p0: p0, origin: origin, finger: finger, spineX: spineX, peelSign: 1, span: span, pageHeight: height
             )
             let progress = PageCurlPanStateMachine.progress(
                 translationX: -originX * 1032, width: 1032, forward: true, rtl: false
@@ -792,7 +792,7 @@ class PageCurlGeometryTests: XCTestCase {
                 let fx = originX + ((peelSign > 0 ? 0 : 1) - originX) * CGFloat(step) / 20
                 let finger = CGPoint(x: fx, y: origin.y)
                 let aim = PageCurlGeometry.fingerAim(
-                    p0: p0, origin: origin, finger: finger, spineX: spineX, peelSign: peelSign, span: span
+                    p0: p0, origin: origin, finger: finger, spineX: spineX, peelSign: peelSign, span: span, pageHeight: 2.2
                 )
                 let follow = p0.x + (fx - originX)
                 // Ahead means further in the turn's direction (-x for +peel).
