@@ -397,10 +397,12 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         curlTargetOffset = startOffset + delta
         setSuppressingProgressionUpdates(true)
         await scrollByAwaitingPaint(delta)
+        PageCurlLatency.mark("incoming-scrolled")
         guard var image = await PageCurlSnapshotter.capture(of: self, backgroundColor: background) else {
             await revertCurlIncoming()
             return nil
         }
+        PageCurlLatency.mark("incoming-snapshot")
         // `takeSnapshot(afterScreenUpdates:)` drains the run loop. A flick's
         // touch-end lands in that drain and WebKit puts the column back, so
         // the bitmap is the page already showing. Scroll the remaining distance

@@ -51,6 +51,8 @@ final class PageCurlView: UIView {
     private var springTarget: CGFloat = 1
     private var springOmega: CGFloat = PageCurlPanStateMachine.settleOmega
     private var interactiveContinuation: CheckedContinuation<Void, Never>?
+    /// Curl debug only: live frames logged for this drag.
+    private var latencyFrames = 0
 
     private enum InteractivePhase {
         case none
@@ -261,6 +263,7 @@ final class PageCurlView: UIView {
         fingerProgress = PageCurlGeometry.clampProgress(progress)
         self.progress = 0
         interactivePhase = .catchUp
+        latencyFrames = 0
 
         guard isAttached, let renderer, let metalView else {
             interactivePhase = .none
@@ -270,6 +273,7 @@ final class PageCurlView: UIView {
             interactivePhase = .none
             return false
         }
+        PageCurlLatency.mark("textures")
         guard isAttached else {
             renderer.releaseTextures()
             interactivePhase = .none
@@ -286,6 +290,7 @@ final class PageCurlView: UIView {
             interactivePhase = .none
             return false
         }
+        PageCurlLatency.mark("flat-frame-done")
         coverView.isHidden = true
         catchUpStart = CACurrentMediaTime()
         clockIsTap = false
@@ -627,7 +632,66 @@ final class PageCurlView: UIView {
 
     private func drawInteractive() {
         guard let metalView, let renderer else { return }
-        renderer.drawNow(uniforms: uniforms(in: metalView), in: metalView, reversed: reversed)
+        renderer.drawNow(
+            uniforms: uniforms(in: metalView),
+            in: metalView,
+            reversed: reversed,
+            presented: latencyFrameLogger()
+        )
+    }
+
+    /// Curl debug only, the first live frames of a drag: where the leaf is
+    /// against the finger, in points, and how long ago the finger was where
+    /// the leaf now is. Logged again when the GPU has finished the frame.
+    private func latencyFrameLogger() -> ((CFTimeInterval) -> Void)? {
+        guard PageCurlDebug.enabled, latencyFrames < 12,
+              interactivePhase == .catchUp || interactivePhase == .track
+        else {
+            return nil
+        }
+        latencyFrames += 1
+        let frame = latencyFrames
+        let w = bounds.width
+        let span = PageCurlGeometry.span(spine: spine, peelSign: peelSign)
+        let grab = liveGrab(span: span, aspect: pageAspect())
+        let grabX = grabUV.x * w
+        let fingerX = fingerUV.x * w
+        let now = CACurrentMediaTime()
+        var lag = "n/a"
+        if !reversed {
+            let latencyTrail = PageCurlLatency.trail
+            let leafTravel = abs(grab.p.x - grab.p0.x) * w
+            var at = latencyTrail.first?.time ?? now
+            for index in stride(from: latencyTrail.count - 1, through: 0, by: -1) {
+                let sample = latencyTrail[index]
+                let travel = abs(sample.x - grabX)
+                guard travel <= leafTravel + 0.5 else {
+                    continue
+                }
+                at = sample.time
+                if index + 1 < latencyTrail.count {
+                    let next = latencyTrail[index + 1]
+                    let step = abs(next.x - grabX) - travel
+                    if step > 0.01 {
+                        at += (next.time - sample.time) * min(1, max(0, (leafTravel - travel) / step))
+                    }
+                }
+                break
+            }
+            lag = PageCurlLatency.ms(now - at)
+            let leafX = grabX + (grab.p.x - grab.p0.x) * w
+            lag += String(format: "ms gap=%.0fpt finger=%.0f leaf=%.0f", abs(fingerX - leafX), fingerX, leafX)
+        }
+        PageCurlDebug.log(
+            "curl-frame n=\(frame) phase=\(interactivePhase) drawn=+\(PageCurlLatency.sinceTouchDown(now))ms "
+                + "progress=\(String(format: "%.3f", progress)) lag=\(lag)"
+        )
+        return { presentedTime in
+            guard presentedTime > 0 else {
+                return
+            }
+            PageCurlDebug.log("curl-frame n=\(frame) gpu-done=+\(PageCurlLatency.sinceTouchDown(presentedTime))ms")
+        }
     }
 
     private func finishTap() {
@@ -792,8 +856,18 @@ private final class PageCurlRenderer {
         }
     }
 
-    func drawNow(uniforms: PageCurlUniforms, in view: MTKView, reversed: Bool) {
-        guard inFlight < 2, let buffer = encode(uniforms: uniforms, in: view, reversed: reversed) else {
+    func drawNow(
+        uniforms: PageCurlUniforms,
+        in view: MTKView,
+        reversed: Bool,
+        presented: ((CFTimeInterval) -> Void)? = nil
+    ) {
+        guard inFlight < 2,
+              let buffer = encode(uniforms: uniforms, in: view, reversed: reversed, presented: presented)
+        else {
+            if presented != nil {
+                PageCurlDebug.log("curl-frame skipped inFlight=\(inFlight)")
+            }
             return
         }
         track(buffer, resumesWaiter: false)
@@ -946,7 +1020,12 @@ private final class PageCurlRenderer {
     /// never calls `-draw` (the view stays paused), so that property stays
     /// empty after the first accidental grab and the leaf never moves.
     /// `nextDrawable()` is the layer's own drawable, valid from the display link.
-    private func encode(uniforms: PageCurlUniforms, in view: MTKView, reversed: Bool) -> MTLCommandBuffer? {
+    private func encode(
+        uniforms: PageCurlUniforms,
+        in view: MTKView,
+        reversed: Bool,
+        presented: ((CFTimeInterval) -> Void)? = nil
+    ) -> MTLCommandBuffer? {
         guard
             view.window != nil,
             UIApplication.shared.applicationState != .background,
@@ -972,6 +1051,18 @@ private final class PageCurlRenderer {
         encoder.setFragmentBytes(&uniforms, length: MemoryLayout<PageCurlUniforms>.stride, index: 0)
         encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
         encoder.endEncoding()
+        // `addPresentedHandler` is not in the simulator SDK. The GPU end time
+        // is on the same clock; the drawable shows at the next vsync after it.
+        if let presented {
+            buffer.addCompletedHandler { buffer in
+                let time = buffer.gpuEndTime
+                DispatchQueue.main.async {
+                    MainActor.assumeIsolated {
+                        presented(time)
+                    }
+                }
+            }
+        }
         buffer.present(drawable)
         return buffer
     }

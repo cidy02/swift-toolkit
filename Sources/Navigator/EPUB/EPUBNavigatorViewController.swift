@@ -1705,6 +1705,7 @@ extension EPUBNavigatorViewController: PageCurlPanDelegate {
         let rtl = viewModel.readingProgression == .rtl
         let forward = direction == .forward
         let columns = await spread.renderedColumnCount()
+        PageCurlLatency.mark("columns", "n=\(columns)")
         let divisionX = paginationView?.divisionNormalizedX
         let spine = PageCurlSpine.resolve(
             renderedColumns: columns,

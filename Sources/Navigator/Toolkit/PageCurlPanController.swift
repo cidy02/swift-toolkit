@@ -171,6 +171,7 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
             touchDown = touch.location(in: view)
             touchDownTouch = touch
             sawAnotherTouch = false
+            PageCurlLatency.touchDown(at: touch.timestamp, x: touch.location(in: view).x)
         } else if touch !== touchDownTouch {
             sawAnotherTouch = true
         }
@@ -247,6 +248,11 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
             let finger = fingerState(of: gesture, in: host)
             lastFinger = finger.point
             lastProgress = finger.progress
+            PageCurlLatency.finger(x: finger.point.x)
+            PageCurlLatency.mark(
+                "began",
+                String(format: "travel=%.0fpt", finger.point.x - grabStart.x)
+            )
         }
         let direction = direction
         prepareTask = Task { @MainActor [weak self] in
@@ -267,6 +273,7 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
             await failBeforeReveal()
             return
         }
+        PageCurlLatency.mark("outgoing-ready")
         if aborted || Task.isCancelled || host.window == nil {
             await failBeforeReveal()
             return
@@ -278,6 +285,7 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
         host.addSubview(curl)
         curlView = curl
         host.layoutIfNeeded()
+        PageCurlLatency.mark("cover-up")
 
         guard let frame = await delegate.curlPanRevealIncoming(
             direction: direction,
@@ -289,6 +297,7 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
         }
         withinResource = frame.withinResource
         revealed = true
+        PageCurlLatency.mark("incoming-ready")
         // A cancel that arrived while the snapshot was in flight must not
         // upload textures just to spring back to zero.
         if aborted || Task.isCancelled || host.window == nil || pendingRelease?.commit == false {
@@ -317,6 +326,7 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
             fingerUV: uv(fingerPoint, in: host)
         )
         metalArmed = armed
+        PageCurlLatency.mark("armed", "ok=\(armed)")
         // Detach during the upload leaves `beginInteractive` false. Staying
         // `.armed` would pin the reader behind a cover that never finishes.
         if aborted || Task.isCancelled || !armed || host.window == nil {
@@ -356,6 +366,7 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
         let finger = fingerState(of: gesture, in: host)
         lastProgress = finger.progress
         lastFinger = finger.point
+        PageCurlLatency.finger(x: finger.point.x)
         guard phase == .armed, metalArmed, let curlView else { return }
         curlView.track(progress: finger.progress, fingerUV: uv(finger.point, in: host))
     }
@@ -392,6 +403,7 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
             cancelled: cancelled || aborted
         )
         let commit = decision == .commit
+        PageCurlLatency.mark("released", "commit=\(commit) phase=\(phase)")
         switch phase {
         case .preparing:
             pendingRelease = (commit, velocity, lastFinger)

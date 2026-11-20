@@ -6,6 +6,7 @@
 
 import Foundation
 import os
+import QuartzCore
 
 /// Page-curl geometry lines. Off unless the process was launched with
 /// `-ReadiumCurlDebug YES`, and compiled out of release builds. The navigator
@@ -45,5 +46,48 @@ enum PageCurlDebug {
             return
         }
         logger.info("\(message, privacy: .public)")
+    }
+}
+
+/// Drag latency marks (`curl-t`), in milliseconds since the touch-down that
+/// started the drag. Curl debug only, so release builds never record them.
+@MainActor
+enum PageCurlLatency {
+    private static var origin: CFTimeInterval = 0
+
+    /// `timestamp` is the touch's own event time (the same clock as
+    /// `CACurrentMediaTime`), so delivery delay is part of every later mark.
+    static func touchDown(at timestamp: CFTimeInterval, x: CGFloat) {
+        guard PageCurlDebug.enabled else {
+            return
+        }
+        origin = timestamp
+        trail = [(timestamp, x)]
+        PageCurlDebug.log("curl-t touch-down +0.0ms delivered=+\(ms(CACurrentMediaTime() - timestamp))ms")
+    }
+
+    static func mark(_ name: String, _ extra: String = "") {
+        guard PageCurlDebug.enabled, origin > 0 else {
+            return
+        }
+        PageCurlDebug.log("curl-t \(name) +\(sinceTouchDown(CACurrentMediaTime()))ms \(extra)")
+    }
+
+    static func sinceTouchDown(_ time: CFTimeInterval) -> String {
+        ms(time - origin)
+    }
+
+    /// Finger x (points, host view) per pan sample since the touch-down.
+    private(set) static var trail: [(time: CFTimeInterval, x: CGFloat)] = []
+
+    static func finger(x: CGFloat) {
+        guard PageCurlDebug.enabled, trail.count < 512, x.isFinite else {
+            return
+        }
+        trail.append((CACurrentMediaTime(), x))
+    }
+
+    static func ms(_ seconds: CFTimeInterval) -> String {
+        String(format: "%.1f", seconds * 1000)
     }
 }
