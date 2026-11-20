@@ -204,7 +204,7 @@ class PageCurlPanStateMachineTests: XCTestCase {
         XCTAssertFalse(PageCurlPanStateMachine.releaseLocationIsLive(cancelled: true, numberOfTouches: 0, location: .zero))
         XCTAssertFalse(PageCurlPanStateMachine.releaseLocationIsLive(cancelled: true, numberOfTouches: 0, location: CGPoint(x: 200, y: 300)))
         XCTAssertFalse(PageCurlPanStateMachine.releaseLocationIsLive(cancelled: false, numberOfTouches: 0, location: .zero))
-        XCTAssertFalse(PageCurlPanStateMachine.releaseLocationIsLive(cancelled: false, numberOfTouches: 1, location: CGPoint(x: .nan, y: 1)))
+        XCTAssertFalse(PageCurlPanStateMachine.releaseLocationIsLive(cancelled: false, numberOfTouches: 1, location: CGPoint(x: CGFloat.nan, y: 1)))
         XCTAssertTrue(PageCurlPanStateMachine.releaseLocationIsLive(cancelled: false, numberOfTouches: 0, location: CGPoint(x: 340, y: 440)))
         XCTAssertTrue(PageCurlPanStateMachine.releaseLocationIsLive(cancelled: true, numberOfTouches: 1, location: CGPoint(x: 10, y: 440)))
 

@@ -437,6 +437,18 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         }
     }
 
+    /// A tap curl turns off the pagination view's touches, and the drag's
+    /// cover passes nothing on, so a tap mid-turn lands here. It must not
+    /// reach the observers as a tap on the page (the host's chrome toggle).
+    override func pointerEventToForward(_ event: PointerEvent) -> PointerEvent? {
+        switch state {
+        case .moving, .interactiveMoving:
+            return event.deliveredWhileNavigatorBusy()
+        default:
+            return event
+        }
+    }
+
     private var isActive = true
 
     @objc private func willResignActive() {
@@ -1419,18 +1431,6 @@ extension EPUBNavigatorViewController: EPUBSpreadViewDelegate {
         // Settings already applied the pan policy when this spread was created.
         // Applying them again re-enables the pagination scroll under a slide.
         applySpreadPanPolicy(interactiveCurl: interactiveCurlEnabled, to: spreadView)
-    }
-
-    /// A tap curl turns off the pagination view's touches, and the drag's
-    /// cover passes nothing on, so a tap mid-turn lands here. It must not
-    /// reach the observers as a tap on the page (the host's chrome toggle).
-    override func pointerEventToForward(_ event: PointerEvent) -> PointerEvent? {
-        switch state {
-        case .moving, .interactiveMoving:
-            return event.deliveredWhileNavigatorBusy()
-        default:
-            return event
-        }
     }
 
     func spreadView(_ spreadView: EPUBSpreadView, didReceive event: PointerEvent) {

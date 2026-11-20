@@ -1024,9 +1024,15 @@ class PageCurlGeometryTests: XCTestCase {
         XCTAssertEqual(PageCurlGeometry.incomingReveal(snapshotSucceeded: false), .crossfade)
     }
 
+    /// Fifteen floats, as `CurlUniforms` in the shader (no padding).
     func testUniformStrideMatchesTheShaderStruct() {
-        XCTAssertEqual(MemoryLayout<PageCurlUniforms>.stride, 64)
-        XCTAssertEqual(MemoryLayout<PageCurlUniforms>.size, 64)
+        XCTAssertEqual(MemoryLayout<PageCurlUniforms>.stride, 15 * 4)
+        XCTAssertEqual(MemoryLayout<PageCurlUniforms>.size, 15 * 4)
+        let fields = PageCurlShader.source.components(separatedBy: "struct CurlUniforms {")[1]
+            .components(separatedBy: "};")[0]
+            .components(separatedBy: ";")
+            .filter { $0.contains("float ") }
+        XCTAssertEqual(fields.count, 15)
     }
 
     func testCurlShaderCompiles() throws {
