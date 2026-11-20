@@ -1598,6 +1598,15 @@ extension EPUBNavigatorViewController: PaginationViewDelegate {
         )
         spreadView.delegate = self
         applySpreadPanPolicy(interactiveCurl: interactiveCurlEnabled, to: spreadView)
+        if let reflow = spreadView as? EPUBReflowableSpreadView {
+            reflow.curlContentGeneration = { [weak self] in self?.curlContentGeneration ?? -1 }
+            reflow.curlTapDidLand = { [weak self, weak reflow] pages in
+                guard let self, let reflow else {
+                    return
+                }
+                self.storeTapCurlPages(pages, on: reflow)
+            }
+        }
 
         let userContentController = spreadView.webView.configuration.userContentController
         delegate?.navigator(self, setupUserScripts: userContentController)
@@ -1868,7 +1877,11 @@ extension EPUBNavigatorViewController: PageCurlPanDelegate {
             return
         }
         let background = viewModel.settings.effectiveBackgroundColor.uiColor
-        let image = await reflow.prerenderCurlBeyond(direction: spreadDirection(for: direction), background: background)
+        let image = await reflow.prerenderCurlBeyond(
+            direction: spreadDirection(for: direction),
+            background: background,
+            covered: { [weak self] in self?.curlPan?.isCovering ?? false }
+        )
         PageCurlLatency.mark("prerender-beyond", "ok=\(image != nil)")
         curlDragBeyond = image
     }
@@ -1963,6 +1976,21 @@ extension EPUBNavigatorViewController: PageCurlPanDelegate {
             backward: direction == .forward ? behind : beyond
         )
         fillCurlFingerprint(of: incoming, key: key)
+    }
+
+    /// A tap curl landed: same bookkeeping as a committed drag.
+    private func storeTapCurlPages(_ pages: PageCurlLandedPages, on spread: EPUBReflowableSpreadView) {
+        guard pages.generation == curlContentGeneration, paginationView?.currentView === spread else {
+            return
+        }
+        let key = curlPageKey(for: spread)
+        curlPrerender.store(
+            key: key,
+            current: nil,
+            forward: pages.forward ? pages.beyond : pages.outgoing,
+            backward: pages.forward ? pages.outgoing : pages.beyond
+        )
+        fillCurlFingerprint(of: pages.incoming, key: key)
     }
 
     /// A cancelled drag leaves the outgoing page on screen and has just

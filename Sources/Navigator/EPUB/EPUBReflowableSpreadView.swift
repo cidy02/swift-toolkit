@@ -31,6 +31,10 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
     /// Cache hit: the column scroll runs under the cover while the leaf
     /// already follows the finger. Commit, cancel and the prerender wait for it.
     private var pendingCurlScroll: Task<Void, Never>?
+    /// The navigator's content generation, read when a tap curl starts, and
+    /// where its pages go once it lands, so a later drag can use them.
+    var curlContentGeneration: (() -> Int)?
+    var curlTapDidLand: ((PageCurlLandedPages) -> Void)?
     /// A cancel restores the previous column, then a late scroll message can
     /// still arrive. Drop progression events until this time so the peek does
     /// not become a location, including on the last page of a work.
@@ -296,6 +300,8 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
     /// reports one location.
     private func curl(by offsetX: CGFloat, direction: Direction) async {
         setSuppressingProgressionUpdates(true)
+        let generation = curlContentGeneration?()
+        let startOffset = scrollView.contentOffset.x
         let background = viewModel.settings.effectiveBackgroundColor.uiColor
         // The page is already on screen. `afterScreenUpdates: true` is for the
         // incoming column, after the scroll.
@@ -365,6 +371,17 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
             guard let shot else {
                 return
             }
+            // The leaf covers the web view while it runs: render the column
+            // past this one behind it, as a drag's spring does.
+            let target = startOffset + offsetX
+            let beyond = Task { @MainActor [weak self] in
+                await self?.prerenderCurlBeyond(
+                    direction: direction,
+                    target: target,
+                    background: background,
+                    covered: { [weak curlView] in curlView?.superview != nil }
+                )
+            }
             await curlView.runTap(
                 outgoing: outgoing,
                 incoming: shot,
@@ -373,6 +390,18 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
                 realVerso: columns >= 2,
                 reversed: PageCurlGeometry.playsReversed(renderedColumns: columns, forward: forward)
             )
+            let beyondImage = await beyond.value
+            if let generation, curlHostAttached, curlView.superview != nil,
+               abs(scrollView.contentOffset.x - target) <= 2
+            {
+                curlTapDidLand?(PageCurlLandedPages(
+                    outgoing: outgoing,
+                    incoming: shot,
+                    beyond: beyondImage,
+                    forward: forward,
+                    generation: generation
+                ))
+            }
         }
     }
 
@@ -466,16 +495,45 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
     /// view. Step one more column the same way, snapshot it, and step back,
     /// so the next drag in this direction has its page ready. Nil at the end
     /// of the resource, or if the column did not land where expected.
-    func prerenderCurlBeyond(direction: Direction, background: UIColor) async -> UIImage? {
+    /// `covered` is false once the leaf's cover is gone (an abort): the web
+    /// view is visible again, so no further column may be shown.
+    func prerenderCurlBeyond(
+        direction: Direction,
+        background: UIColor,
+        covered: @escaping () -> Bool
+    ) async -> UIImage? {
         await awaitPendingCurlScroll()
-        guard let target = curlTargetOffset, curlHostAttached else {
+        guard let target = curlTargetOffset else {
+            return nil
+        }
+        guard let image = await prerenderCurlBeyond(
+            direction: direction,
+            target: target,
+            background: background,
+            covered: covered
+        ),
+              curlTargetOffset == target
+        else {
+            return nil
+        }
+        return image
+    }
+
+    /// `target` is the column the turn lands on, already scrolled to.
+    private func prerenderCurlBeyond(
+        direction: Direction,
+        target: CGFloat,
+        background: UIColor,
+        covered: () -> Bool
+    ) async -> UIImage? {
+        guard curlHostAttached, covered() else {
             return nil
         }
         let onIncoming = PageCurlGeometry.curlColumnCorrection(offset: scrollView.contentOffset.x, target: target)
         if onIncoming != 0 {
             await scrollByAwaitingPaint(onIncoming)
         }
-        guard curlHostAttached, curlTargetOffset == target,
+        guard curlHostAttached, covered(),
               abs(scrollView.contentOffset.x - target) <= 2,
               let delta = pageDelta(for: direction)
         else {
@@ -483,10 +541,11 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         }
         await scrollByAwaitingPaint(delta)
         var image: UIImage?
-        if curlHostAttached, abs(scrollView.contentOffset.x - (target + delta)) <= 2 {
+        if curlHostAttached, covered(), abs(scrollView.contentOffset.x - (target + delta)) <= 2 {
             image = await PageCurlSnapshotter.capture(of: self, backgroundColor: background)
-            // The snapshot drains the run loop. Keep it only if the column held.
-            if abs(scrollView.contentOffset.x - (target + delta)) > 2 {
+            // The snapshot drains the run loop. Keep it only if the column held
+            // and the cover was up the whole time.
+            if abs(scrollView.contentOffset.x - (target + delta)) > 2 || !covered() {
                 image = nil
             }
         }
@@ -1116,4 +1175,14 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
             return nil
         }
     }
+}
+
+/// A tap curl that landed inside the resource: the page it left, the page
+/// now on screen, and the column past it (nil at the end of the resource).
+struct PageCurlLandedPages {
+    var outgoing: UIImage
+    var incoming: UIImage
+    var beyond: UIImage?
+    var forward: Bool
+    var generation: Int
 }

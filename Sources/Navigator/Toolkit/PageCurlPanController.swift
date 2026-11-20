@@ -109,6 +109,11 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
         phase != .idle
     }
 
+    /// The leaf's cover is over the web view, so a hidden scroll is invisible.
+    var isCovering: Bool {
+        !aborted && curlView?.superview != nil
+    }
+
     /// Detach, reload, rotation, Reduce Motion, VoiceOver, background, or a
     /// posture change. The cover comes off immediately. A spring already
     /// running is cut, and `finish` will not commit onto a navigator that
@@ -200,6 +205,7 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
             sample: sample(of: pan),
             context: delegate.curlPanContext(in: view)
         )
+        PageCurlLatency.mark("should-begin", "\(decision)")
         guard case let .track(direction) = decision else {
             return false
         }
