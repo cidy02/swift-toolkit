@@ -30,7 +30,14 @@ class PageCurlMotionTests: XCTestCase {
     /// 2 a one-page back (paper). A two-page back is the next page's facing
     /// half, so it counts as the next page: once flat it is those pixels.
     private func frame(_ page: Page, progress: CGFloat, p0: CGPoint, p: CGPoint) -> [UInt16] {
-        let radius = PageCurlGeometry.cylinderRadius(progress: progress, span: page.span)
+        // As `PageCurlView.uniforms`.
+        let radius = PageCurlGeometry.spineSafeRadius(
+            PageCurlGeometry.cylinderRadius(progress: progress, span: page.span),
+            p0: p0,
+            p: p,
+            spineX: page.spineX,
+            pageHeight: page.height
+        )
         var keys: [UInt16] = []
         keys.reserveCapacity(30 * 60)
         for row in 0 ..< 60 {

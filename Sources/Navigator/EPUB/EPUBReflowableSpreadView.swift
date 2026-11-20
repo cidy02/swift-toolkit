@@ -65,6 +65,10 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
     /// A posture cancel removed the cover. The turn's defer must not clear
     /// progression suppression a reflow hold just took.
     private var curlCancelKeepsSuppression = false
+    /// While the column past the landing is being rendered under the leaf,
+    /// the page the tap lands on. A cancel then keeps the cover up on it
+    /// until the web view is back on that column.
+    private var activeCurlLanding: UIImage?
 
     /// After the Readium stylesheets. Their body padding is `!important`, so an
     /// earlier style element loses. Newlines are spaces: the CSS sits inside one
@@ -91,9 +95,23 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
             return
         }
         curlCancelKeepsSuppression = true
-        activeCurlView?.releaseResources()
-        activeCurlView?.removeFromSuperview()
+        stopActiveCurl()
+    }
+
+    /// Takes the leaf down. During the render past the landing the web view
+    /// may be a column further on: the still cover shows the landing page
+    /// until `curl(by:)` has stepped back and removes it.
+    private func stopActiveCurl() {
+        guard let curlView = activeCurlView else {
+            return
+        }
         activeCurlView = nil
+        if let landing = activeCurlLanding {
+            curlView.freezeOnCover(showing: landing)
+        } else {
+            curlView.releaseResources()
+            curlView.removeFromSuperview()
+        }
     }
 
     /// The cancel kept progression suppression so a reflow hold could take it.
@@ -344,10 +362,15 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         curlView.showCover(outgoing, background: background)
         addSubview(curlView)
         activeCurlView = curlView
+        // False once cancelled, even while a frozen cover is still up.
+        let running = { [weak self, weak curlView] in
+            curlView != nil && curlView?.superview != nil && self?.activeCurlView === curlView
+        }
         defer {
             if activeCurlView === curlView {
                 activeCurlView = nil
             }
+            activeCurlLanding = nil
             curlView.releaseResources()
             curlView.removeFromSuperview()
             let keepSuppression = curlCancelKeepsSuppression
@@ -358,11 +381,11 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         }
 
         await scrollByAwaitingPaint(offsetX)
-        guard curlHostAttached, curlView.superview != nil else {
+        guard curlHostAttached, running() else {
             return
         }
         let shot = await PageCurlSnapshotter.capture(of: self, backgroundColor: background)
-        guard curlHostAttached, curlView.superview != nil else {
+        guard curlHostAttached, running() else {
             return
         }
         switch PageCurlGeometry.incomingReveal(snapshotSucceeded: shot != nil) {
@@ -375,12 +398,13 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
             // The leaf covers the web view while it runs: render the column
             // past this one behind it, as a drag's spring does.
             let target = startOffset + offsetX
+            activeCurlLanding = shot
             let beyond = Task { @MainActor [weak self] in
                 await self?.prerenderCurlBeyond(
                     direction: direction,
                     target: target,
                     background: background,
-                    covered: { [weak curlView] in curlView?.superview != nil }
+                    covered: running
                 )
             }
             await curlView.runTap(
@@ -392,7 +416,7 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
                 reversed: PageCurlGeometry.playsReversed(renderedColumns: columns, forward: forward)
             )
             let beyondImage = await beyond.value
-            if let generation, curlHostAttached, curlView.superview != nil,
+            if let generation, curlHostAttached, running(),
                abs(scrollView.contentOffset.x - target) <= 2
             {
                 curlTapDidLand?(PageCurlLandedPages(
@@ -1054,9 +1078,7 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         isReduceMotionEnabled = UIAccessibility.isReduceMotionEnabled
         if isReduceMotionEnabled {
             scrollDidEnd()
-            activeCurlView?.releaseResources()
-            activeCurlView?.removeFromSuperview()
-            activeCurlView = nil
+            stopActiveCurl()
         }
     }
 

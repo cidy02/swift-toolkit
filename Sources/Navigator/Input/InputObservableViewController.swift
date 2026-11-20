@@ -110,19 +110,31 @@ open class InputObservableViewController: UIViewController, InputObservable {
         on(.up, touches: touches, event: event)
     }
 
-    private func on(_ phase: PointerEvent.Phase, touches: Set<UITouch>, event: UIEvent?) {
-        Task {
-            for touch in touches {
-                guard let view = view else {
-                    continue
-                }
+    /// What a raw touch on this view sends to the observers. A subclass in
+    /// the middle of a page turn drops it, or turns its end into a cancel.
+    func pointerEventToForward(_ event: PointerEvent) -> PointerEvent? {
+        event
+    }
 
-                _ = await inputObservers.didReceive(PointerEvent(
-                    pointer: Pointer(touch: touch, event: event),
-                    phase: phase,
-                    location: touch.location(in: view),
-                    modifiers: KeyModifiers(event: event)
-                ))
+    private func on(_ phase: PointerEvent.Phase, touches: Set<UITouch>, event: UIEvent?) {
+        guard let view = view else {
+            return
+        }
+        // Filtered now, while the state is the one the touch arrived in.
+        let events = touches.compactMap { touch in
+            pointerEventToForward(PointerEvent(
+                pointer: Pointer(touch: touch, event: event),
+                phase: phase,
+                location: touch.location(in: view),
+                modifiers: KeyModifiers(event: event)
+            ))
+        }
+        guard !events.isEmpty else {
+            return
+        }
+        Task {
+            for event in events {
+                _ = await inputObservers.didReceive(event)
             }
         }
     }

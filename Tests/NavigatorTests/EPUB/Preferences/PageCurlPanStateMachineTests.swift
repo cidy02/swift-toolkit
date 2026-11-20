@@ -140,7 +140,7 @@ class PageCurlPanStateMachineTests: XCTestCase {
         XCTAssertEqual(notFinite, CGPoint(x: 10, y: 10))
     }
 
-    /// Owner, 2026-11-19: pages snapped back when the finger neared the edge.
+    /// Pages snapped back when the finger neared the edge.
     /// UIKit ending the pan (`.cancelled`) is not the reader asking for the
     /// page back: past the commit distance it commits. Short, or moving
     /// back, it reverts.
@@ -192,6 +192,40 @@ class PageCurlPanStateMachineTests: XCTestCase {
         XCTAssertEqual(
             PageCurlPanStateMachine.release(progress: 0.05, turnVelocity: 0, width: w, cancelled: false, atFarEdge: true),
             .cancel
+        )
+    }
+
+    /// A cancel with no touch left reports the view's origin. Read as the
+    /// finger, a 5% peek from x 360 became a drag to x 0: progress 0.9 and
+    /// the far edge, so it committed. The last tracked point stands instead,
+    /// and a real release at the edge still commits from there.
+    func testAZeroTouchCancelKeepsTheLastTrackedFinger() {
+        let w: CGFloat = 402
+        XCTAssertFalse(PageCurlPanStateMachine.releaseLocationIsLive(cancelled: true, numberOfTouches: 0, location: .zero))
+        XCTAssertFalse(PageCurlPanStateMachine.releaseLocationIsLive(cancelled: true, numberOfTouches: 0, location: CGPoint(x: 200, y: 300)))
+        XCTAssertFalse(PageCurlPanStateMachine.releaseLocationIsLive(cancelled: false, numberOfTouches: 0, location: .zero))
+        XCTAssertFalse(PageCurlPanStateMachine.releaseLocationIsLive(cancelled: false, numberOfTouches: 1, location: CGPoint(x: .nan, y: 1)))
+        XCTAssertTrue(PageCurlPanStateMachine.releaseLocationIsLive(cancelled: false, numberOfTouches: 0, location: CGPoint(x: 340, y: 440)))
+        XCTAssertTrue(PageCurlPanStateMachine.releaseLocationIsLive(cancelled: true, numberOfTouches: 1, location: CGPoint(x: 10, y: 440)))
+
+        // What the origin would have decided.
+        let fromOrigin = PageCurlPanStateMachine.progress(translationX: 0 - 360, width: w, forward: true, rtl: false)
+        XCTAssertGreaterThan(fromOrigin, 0.85)
+        XCTAssertTrue(PageCurlPanStateMachine.isAtFarEdge(locationX: 0, width: w, forward: true, rtl: false))
+        // The last tracked finger: x 340 after a 20 pt peek.
+        let lastProgress = PageCurlPanStateMachine.progress(translationX: 340 - 360, width: w, forward: true, rtl: false)
+        let progress = PageCurlPanStateMachine.progressAtRelease(live: 0, lastProgress: lastProgress)
+        let edge = PageCurlPanStateMachine.isAtFarEdge(locationX: 340, width: w, forward: true, rtl: false)
+        XCTAssertEqual(
+            PageCurlPanStateMachine.release(progress: progress, turnVelocity: 0, width: w, cancelled: true, atFarEdge: edge),
+            .cancel
+        )
+        // Backward LTR to the right edge, then a zero-touch cancel: still the edge.
+        let backEdge = PageCurlPanStateMachine.isAtFarEdge(locationX: 395, width: w, forward: false, rtl: false)
+        let backProgress = PageCurlPanStateMachine.progress(translationX: 395 - 280, width: w, forward: false, rtl: false)
+        XCTAssertEqual(
+            PageCurlPanStateMachine.release(progress: backProgress, turnVelocity: 0, width: w, cancelled: true, atFarEdge: backEdge),
+            .commit
         )
     }
 

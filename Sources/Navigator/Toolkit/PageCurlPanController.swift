@@ -5,6 +5,7 @@
 //
 
 import UIKit
+import UIKit.UIGestureRecognizerSubclass
 
 struct PageCurlPanFrame {
     var outgoing: UIImage
@@ -27,6 +28,9 @@ protocol PageCurlPanDelegate: AnyObject {
     /// First finger down while idle, before the pan is recognised. May start
     /// work that has no visible effect; the delegate drops it if no drag follows.
     func curlPanTouchDown()
+    /// The touch sequence ended (lifted, failed or rejected) without starting
+    /// a drag. Work started at the touch-down can go.
+    func curlPanTouchSequenceEnded()
     func curlPanDidBegin(direction: PageCurlTurnDirection) -> Bool
     func curlPanCaptureOutgoing() async -> (image: UIImage, background: UIColor)?
     func curlPanRevealIncoming(
@@ -90,8 +94,12 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
     private var aborted = false
 
     override init() {
-        recognizer = UIPanGestureRecognizer()
+        let pan = PageCurlPanRecognizer()
+        recognizer = pan
         super.init()
+        pan.onReset = { [weak self] in
+            self?.recognizerDidReset()
+        }
         recognizer.addTarget(self, action: #selector(handlePan(_:)))
         recognizer.delegate = self
         recognizer.maximumNumberOfTouches = 1
@@ -118,8 +126,14 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
     /// posture change. The cover comes off immediately. A spring already
     /// running is cut, and `finish` will not commit onto a navigator that
     /// has since reloaded.
-    func abort() {
-        beginTeardown()
+    /// `keepingCover`: the reader stays where it is (rotation, background,
+    /// Reduce Motion, a posture or CSS change). The leaf stops, but its still
+    /// cover stays up until the column under it is back on the page the drag
+    /// started from: a commit spring may have stepped the web view one
+    /// column past the landing to render it. A reload or a navigation takes
+    /// the cover off at once; the spread under it is being replaced.
+    func abort(keepingCover: Bool = false) {
+        beginTeardown(keepingCover: keepingCover)
     }
 
     /// Posture changed under the finger. Same teardown as `abort`, then wait
@@ -132,7 +146,7 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
         guard phase != .idle else {
             return
         }
-        beginTeardown()
+        beginTeardown(keepingCover: true)
         if phase == .idle {
             return
         }
@@ -145,16 +159,21 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
         }
     }
 
-    private func beginTeardown() {
+    private func beginTeardown(keepingCover: Bool) {
         guard phase != .idle else {
             return
         }
         aborted = true
         prepareTask?.cancel()
-        // Unblock `finishInteractive` and `drawAndWait`, and take the cover
-        // down before a reload installs a new spread under it.
-        curlView?.releaseResources()
-        curlView?.removeFromSuperview()
+        // Unblock `finishInteractive` and `drawAndWait`. The cover comes off
+        // now before a reload installs a new spread under it; otherwise in
+        // `tearDown`, once `finish` has put the column back.
+        if keepingCover {
+            curlView?.freezeOnCover()
+        } else {
+            curlView?.releaseResources()
+            curlView?.removeFromSuperview()
+        }
         guard phase == .armed else {
             return
         }
@@ -189,6 +208,15 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
             sawAnotherTouch = true
         }
         return true
+    }
+
+    /// UIKit resets the recognizer once the touch sequence is over, whether or
+    /// not it began. Still idle means no drag took the touch-down.
+    private func recognizerDidReset() {
+        guard phase == .idle else {
+            return
+        }
+        delegate?.curlPanTouchSequenceEnded()
     }
 
     /// The recorded touch-down, if it is still the one touch on the page.
@@ -354,7 +382,9 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
             lastFinger = now.point
             curl.track(progress: now.progress, fingerUV: uv(now.point, in: host))
         } else {
-            curl.track(progress: lastProgress, fingerUV: uv(fingerPoint, in: host))
+            // The finger lifted while the textures uploaded: its last tracked
+            // point, not the one sampled before the wait.
+            curl.track(progress: lastProgress, fingerUV: uv(lastFinger, in: host))
         }
         if let pending = pendingRelease {
             pendingRelease = nil
@@ -389,14 +419,23 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
         // A flick can jump from .began to .ended without a .changed sample.
         // The location is still valid here. After this returns, UIKit resets
         // the gesture to `.possible` and a later sample reads the origin.
+        // A cancel with no touch left reports the view's origin, not the
+        // finger: keep the last tracked position and velocity then.
         var live: CGFloat = 0
-        if let host = gesture.view {
-            velocities.append(PageCurlPanStateMachine.turnVelocity(
-                velocityX: gesture.velocity(in: host).x,
-                forward: direction == .forward,
-                rtl: rtl
-            ))
-            if gesture.state != .possible {
+        var touches = 0
+        if let host = gesture.view, gesture.state != .possible {
+            touches = gesture.numberOfTouches
+            let location = gesture.location(in: host)
+            if PageCurlPanStateMachine.releaseLocationIsLive(
+                cancelled: cancelled,
+                numberOfTouches: touches,
+                location: location
+            ) {
+                velocities.append(PageCurlPanStateMachine.turnVelocity(
+                    velocityX: gesture.velocity(in: host).x,
+                    forward: direction == .forward,
+                    rtl: rtl
+                ))
                 let finger = fingerState(of: gesture, in: host)
                 live = finger.progress
                 if finger.progress > 0 {
@@ -407,8 +446,6 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
         }
         let velocity = PageCurlPanStateMachine.smoothedVelocity(velocities)
         let width = gesture.view?.bounds.width ?? 1
-        // A system cancel near the edge can report the origin; the last
-        // `.changed` sample is where the finger really was.
         let progress = PageCurlPanStateMachine.progressAtRelease(live: live, lastProgress: lastProgress)
         let atFarEdge = PageCurlPanStateMachine.isAtFarEdge(
             locationX: lastFinger.x,
@@ -426,9 +463,9 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
         let commit = decision == .commit
         PageCurlLatency.mark("released", "commit=\(commit) phase=\(phase)")
         PageCurlDebug.log(String(
-            format: "curl-release state=%@ live=%.3f last=%.3f progress=%.3f v=%.0f x=%.0f edge=%@ aborted=%@ -> %@",
+            format: "curl-release state=%@ touches=%d live=%.3f last=%.3f progress=%.3f v=%.0f x=%.0f edge=%@ aborted=%@ -> %@",
             "\(gesture.state.rawValue)\(cancelled ? "(cancelled)" : "")",
-            live, lastProgress, progress, velocity, lastFinger.x,
+            touches, live, lastProgress, progress, velocity, lastFinger.x,
             atFarEdge ? "yes" : "no", aborted ? "yes" : "no", commit ? "commit" : "cancel"
         ))
         switch phase {
@@ -552,5 +589,16 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
             return CGPoint(x: 1, y: 1)
         }
         return CGPoint(x: point.x / width, y: point.y / height)
+    }
+}
+
+/// Reports `reset()`, the one callback UIKit makes for a sequence that ended
+/// without the pan beginning (a tap, a rejected or failed pan).
+private final class PageCurlPanRecognizer: UIPanGestureRecognizer {
+    var onReset: (() -> Void)?
+
+    override func reset() {
+        super.reset()
+        onReset?()
     }
 }

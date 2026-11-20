@@ -86,6 +86,28 @@ class CSSCommitTests: XCTestCase {
         XCTAssertEqual(recorder.lastProperties()?["--RS__foldInset"] as? String, "57.00000px")
     }
 
+    /// Book pose, then flat, while the first report is still waiting on the
+    /// visible-element probe. The navigator's sequence: each report notes its
+    /// clearance, awaits, and commits only if it is still the latest. The
+    /// older report used to resume first and commit its 80 pt over the 0.
+    func testAnOlderFoldReportDoesNotCommitOverANewerOne() {
+        let viewModel = makeViewModel(EPUBPreferences(columnCount: .two))
+        XCTAssertTrue(viewModel.applyFoldColumnGap(60))
+        var requests = LatestRequest()
+        requests.begin()
+        let bookPose = requests.latest
+        XCTAssertTrue(viewModel.noteFoldClearance(80))
+        requests.begin()
+        let flat = requests.latest
+        XCTAssertTrue(viewModel.noteFoldClearance(nil))
+        // The Book-pose report resumes first.
+        XCTAssertFalse(requests.isLatest(bookPose))
+        XCTAssertTrue(requests.isLatest(flat))
+        XCTAssertTrue(viewModel.foldInsetNeedsCommit)
+        XCTAssertTrue(viewModel.applyFoldColumnGap(nil))
+        XCTAssertTrue(recorder.lastProperties()?["--RS__foldInset"] is NSNull)
+    }
+
     /// Vertical text pages by rows (one 100vh column); scroll is one column.
     /// Neither takes the explicit two-column count or the fold inset.
     func testVerticalTextAndScrollDoNotForceTwoColumns() {

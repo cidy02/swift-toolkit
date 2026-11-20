@@ -202,3 +202,17 @@ final class ReflowPositionKeeper {
         spread?.setSuppressingProgressionUpdates(false)
     }
 }
+
+/// Numbers requests that run across an `await`. Only the newest may still
+/// commit when it resumes; an older one finds it is no longer `isLatest`.
+struct LatestRequest {
+    private(set) var latest = 0
+
+    mutating func begin() {
+        latest &+= 1
+    }
+
+    func isLatest(_ request: Int) -> Bool {
+        request == latest
+    }
+}

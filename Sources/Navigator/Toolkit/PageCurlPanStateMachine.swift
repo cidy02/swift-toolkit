@@ -232,6 +232,20 @@ enum PageCurlPanStateMachine {
         return .cancel
     }
 
+    /// Whether the recognizer's location at release is the finger. `.ended`
+    /// reports where the finger lifted. A cancel (or any release) with no
+    /// touch left can report the view's origin, which would read as a drag
+    /// to the far edge from a 1% peek; the last tracked position stands then.
+    static func releaseLocationIsLive(cancelled: Bool, numberOfTouches: Int, location: CGPoint) -> Bool {
+        guard location.x.isFinite, location.y.isFinite else {
+            return false
+        }
+        if numberOfTouches > 0 {
+            return true
+        }
+        return !cancelled && location != .zero
+    }
+
     /// Progress the release decision should see. A flick's `.ended` sample can
     /// report a zero translation; use the last `.changed` progress. A drag that
     /// came back near the start must not be replaced by an earlier high-water mark.

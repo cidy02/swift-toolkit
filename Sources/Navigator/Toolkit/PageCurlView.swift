@@ -29,7 +29,7 @@ final class PageCurlView: UIView {
     private var peelSign: CGFloat = 1
     private var realVerso = false
     private var reversed = false
-    private var paper = PageCurlPaper(r: 0.96, g: 0.96, b: 0.96, mix: PageCurlGeometry.backsideMix, specular: 0.3)
+    private var paper = PageCurlPaper(r: 0.96, g: 0.96, b: 0.96, mix: PageCurlGeometry.backsideMix)
     private var progress: CGFloat = 0
     /// Tap follows `tapGrab`. A finger uses the points below.
     private var fingerDriven = false
@@ -200,6 +200,7 @@ final class PageCurlView: UIView {
             await fadeFallback(to: incoming, duration: duration)
             return
         }
+        let stops = lifecycleStops
         guard await renderer.prepare(outgoing: outgoing, incoming: incoming) else {
             guard isAttached else {
                 return
@@ -207,7 +208,9 @@ final class PageCurlView: UIView {
             await fadeFallback(to: incoming, duration: duration)
             return
         }
-        guard isAttached else {
+        // Resigning active while the textures uploaded stops the turn, as it
+        // does one already running.
+        guard isAttached, lifecycleStops == stops else {
             renderer.releaseTextures()
             return
         }
@@ -247,7 +250,7 @@ final class PageCurlView: UIView {
 
     /// The outgoing cover is already up. The first presented frame already has
     /// the leaf under the finger: no catch-up, so the page moves with the
-    /// finger from the first frame (T-561j).
+    /// finger from the first frame.
     func beginInteractive(
         outgoing: UIImage,
         incoming: UIImage,
@@ -277,12 +280,13 @@ final class PageCurlView: UIView {
             interactivePhase = .none
             return false
         }
+        let stops = lifecycleStops
         guard await renderer.prepare(outgoing: outgoing, incoming: incoming) else {
             interactivePhase = .none
             return false
         }
         PageCurlLatency.mark("textures")
-        guard isAttached else {
+        guard isAttached, lifecycleStops == stops else {
             renderer.releaseTextures()
             interactivePhase = .none
             return false
@@ -349,6 +353,11 @@ final class PageCurlView: UIView {
             progress = target
             return
         }
+        // A release between display-link ticks (or before the first one)
+        // springs from the finger, not from the last frame drawn.
+        if interactivePhase == .track {
+            progress = fingerProgress
+        }
         springFrom = progress
         springVelocity = velocity
         springTarget = target
@@ -357,7 +366,14 @@ final class PageCurlView: UIView {
         let aspect = pageAspect()
         let leaf = PageCurlGeometry.span(spine: spine, peelSign: peelSign)
         let grab = liveGrab(span: leaf, aspect: aspect)
-        springPFrom = grab.p
+        // The point the shader drew, kept within the spine's reach. Outside
+        // it the spring would sit on the boundary until the curve came back in.
+        springPFrom = PageCurlGeometry.attachedHeldPoint(
+            p0: grab.p0,
+            p: grab.p,
+            spineX: spine.normalizedX,
+            pageHeight: 1 / max(aspect, 0.05)
+        )
         let landing = PageCurlGeometry.commitLanding(
             p0: grab.p0,
             spineX: spine.normalizedX,
@@ -390,12 +406,36 @@ final class PageCurlView: UIView {
         }
     }
 
+    // The cover takes the touches (`isUserInteractionEnabled`) and keeps
+    // them: UIView's default passes them up the responder chain, to the
+    // navigator's own touch observers, as a tap on the hidden page.
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {}
+    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {}
+    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {}
+    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {}
+
+    /// Stops the leaf and shows a still page (`image`, or the one the turn
+    /// started from) for a host that has to move the web view back under it
+    /// before it takes this view down.
+    func freezeOnCover(showing image: UIImage? = nil) {
+        if let image {
+            coverView.image = image
+        }
+        coverView.alpha = 1
+        coverView.isHidden = false
+        releaseResources()
+    }
+
     func releaseResources() {
         stopClock()
         resumeWaiters()
         renderer?.cancelDrawWait()
         renderer?.releaseTextures()
     }
+
+    /// Bumped by every resign-active or background. A turn awaiting its
+    /// texture upload when it changes does not start.
+    private var lifecycleStops = 0
 
     private var isAttached: Bool {
         window != nil && superview != nil && UIApplication.shared.applicationState != .background
@@ -411,6 +451,7 @@ final class PageCurlView: UIView {
     /// Background, or the view leaving the hierarchy. Stop the clock before
     /// another frame can submit GPU work, and unblock whoever is awaiting.
     private func cancelForLifecycle() {
+        lifecycleStops &+= 1
         guard turnIsRunning else {
             releaseResources()
             return
@@ -442,16 +483,23 @@ final class PageCurlView: UIView {
     private func uniforms(in metal: MTKView) -> PageCurlUniforms {
         let span = PageCurlGeometry.span(spine: spine, peelSign: peelSign)
         let shown = shownProgress
-        let radius = PageCurlGeometry.cylinderRadius(progress: shown, span: span)
         let aspect = pageAspect(of: metal)
         let live = liveGrab(span: span, aspect: aspect)
+        let pageHeight = 1 / max(aspect, 0.05)
         let held = PageCurlGeometry.attachedHeldPoint(
             p0: live.p0,
             p: live.p,
             spineX: spine.normalizedX,
-            pageHeight: 1 / max(aspect, 0.05)
+            pageHeight: pageHeight
         )
         let grab = (p0: live.p0, p: held)
+        let radius = PageCurlGeometry.spineSafeRadius(
+            PageCurlGeometry.cylinderRadius(progress: shown, span: span),
+            p0: grab.p0,
+            p: grab.p,
+            spineX: spine.normalizedX,
+            pageHeight: pageHeight
+        )
         return PageCurlUniforms(
             progress: Float(shown),
             spineX: Float(spine.normalizedX),
@@ -463,7 +511,6 @@ final class PageCurlView: UIView {
             py: Float(grab.p.y),
             span: Float(span),
             realVerso: realVerso ? 1 : 0,
-            specular: Float(paper.specular),
             paperR: Float(paper.r),
             paperG: Float(paper.g),
             paperB: Float(paper.b),
@@ -902,6 +949,8 @@ private final class PageCurlRenderer {
 
     private static func resources(for device: MTLDevice) -> (queue: MTLCommandQueue, loader: MTKTextureLoader)? {
         if cachedDevice !== device {
+            // Textures belong to their device.
+            dropPreloads()
             cachedPipeline = nil
             cachedQueue = nil
             cachedLoader = nil
@@ -1010,7 +1059,8 @@ private final class PageCurlRenderer {
 
     /// Starts uploading `images` now. `prepare` picks the textures up by bitmap.
     static func preload(_ images: [UIImage]) {
-        guard let device = cachedDevice ?? MTLCreateSystemDefaultDevice(),
+        guard UIApplication.shared.applicationState != .background,
+              let device = cachedDevice ?? MTLCreateSystemDefaultDevice(),
               let loader = resources(for: device)?.loader
         else {
             return
@@ -1025,6 +1075,9 @@ private final class PageCurlRenderer {
 
     /// Drag over, reader closing, or the bitmaps went stale.
     static func dropPreloads() {
+        for preload in preloads {
+            preload.task.cancel()
+        }
         preloads.removeAll()
     }
 
@@ -1037,7 +1090,11 @@ private final class PageCurlRenderer {
 
     private static func startUpload(_ image: UIImage, loader: MTKTextureLoader) -> Task<MTLTexture?, Never> {
         Task { @MainActor in
-            guard let cgImage = image.cgImage else {
+            // No GPU work from the background, and none for a dropped preload.
+            guard !Task.isCancelled,
+                  UIApplication.shared.applicationState != .background,
+                  let cgImage = image.cgImage
+            else {
                 return nil
             }
             return try? await loader.newTexture(cgImage: cgImage, options: [

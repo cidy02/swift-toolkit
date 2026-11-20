@@ -78,14 +78,12 @@ struct PageCurlDivisionSample: Equatable {
 
 /// Paper colour mixed into a one-page underside. `mix` is how far the mirrored
 /// front is pulled toward `color` (`PageCurlGeometry.backsideMix`).
-/// `specular` is the crest highlight; Apple shows none, so it is 0.
 struct PageCurlPaper: Equatable {
     var r: CGFloat
     var g: CGFloat
     var b: CGFloat
     /// 0 = the mirrored front, 1 = flat paper.
     var mix: CGFloat
-    var specular: CGFloat
 }
 
 struct PageCurlRGB: Equatable {
@@ -121,22 +119,21 @@ enum PageCurlGeometry {
     /// Peak cylinder radius as a fraction of view width, at progress 0.5.
     /// The leaf wraps a real cylinder (`rollArc`): the roll on screen is
     /// `radius` wide, front text squeezing onto it and the back coming over
-    /// the top. Apple Books' roll in the owner's recording (iPhone, 2026-11-19)
-    /// is about 25–35 pt wide mid-turn, so 0.08 (32 pt at 402 pt).
+    /// the top. 0.08 is a roll about 32 pt wide mid-turn on a 402 pt phone,
+    /// the width a printed page's roll reads at.
     static let peakRadius: CGFloat = 0.08
     /// How much of the mirrored front shows through a one-page back, in the
-    /// shader's (gamma-encoded) colour space. Apple Books' back on a black
-    /// page draws white type at 57–65 of 255 (owner's recording, 1.30 s and
-    /// 1.62 s, every 40 px column of the flap), so about a quarter. The old
-    /// 0.04 (mix 0.96) read as a blank card.
+    /// shader's (gamma-encoded) colour space. A quarter: white type on a
+    /// black page's back comes out at about 64 of 255, readable as text seen
+    /// through paper. 0.04 (mix 0.96) read as a blank card.
     static let backGhostStrength: CGFloat = 0.25
     /// `1 - backGhostStrength`: how far the mirrored front is pulled into the paper.
     static let backsideMix: CGFloat = 1 - backGhostStrength
     /// Darkening where the sheet turns edge-on, at the roll's crest
-    /// (`rollShade`). Apple's is gentle; 0 at the flat parts.
+    /// (`rollShade`). Gentle; 0 at the flat parts.
     static let rollCrestDarkening: CGFloat = 0.12
     /// Shadow the roll casts on the next page, at the roll's edge, and how
-    /// fast it fades (view widths). Apple's is faint.
+    /// fast it fades (view widths). Faint.
     static let rollShadowStrength: CGFloat = 0.10
     static let rollShadowWidth: CGFloat = 0.018
     /// Shadow the flat back casts on the leaf's own front along its edges.
@@ -249,7 +246,7 @@ enum PageCurlGeometry {
     /// Early on it is P0 moved by the finger's travel, so the leaf is at the
     /// finger. As the finger nears the far screen edge, P runs ahead to the
     /// landing (`commitLanding`), so the fold keeps going to the spine: at the
-    /// edge the page is turned, as in Apple Books, instead of stopping halfway
+    /// edge the page is turned, instead of stopping halfway
     /// with the leaf's edge under the finger. The finger's vertical offset
     /// fades out the same way, so the leaf lands flat. Points are isotropic.
     static func fingerAim(
@@ -275,10 +272,52 @@ enum PageCurlGeometry {
         let lead = pow(t, edgeLeadPower)
         let landing = commitLanding(p0: p0, spineX: spineX, peelSign: peelSign, span: span)
         let followAtEdge = p0.x - sign * available
+        // Only ever ahead of the finger. On a spine off the middle the plain
+        // follow can pass the landing before the finger reaches the edge;
+        // leading "back" to it would hold the leaf behind the finger.
+        let shortfall = min(0, (landing.x - followAtEdge) * sign) * sign
         return CGPoint(
-            x: follow.x + (landing.x - followAtEdge) * lead,
+            x: follow.x + shortfall * lead,
             y: follow.y + (p0.y - follow.y) * lead
         )
+    }
+
+    /// `radius`, cut so the roll stays on the leaf's side of the spine. The
+    /// sheet leaves the page at the cylinder axis, `π/2 · radius` past the
+    /// bisector toward the spine (`grabFold`), and the paper from the spine
+    /// to that axis lies flat. Driven by the finger's travel alone, the
+    /// radius was still large when the fold reached the spine, so the axis
+    /// crossed it and a strip of the old facing page showed between the roll
+    /// and the spine. Cut, the roll closes to a crease as the fold lands.
+    /// A spine on the view's edge (one page) is left alone: past it is off
+    /// screen.
+    static func spineSafeRadius(
+        _ radius: CGFloat,
+        p0: CGPoint,
+        p: CGPoint,
+        spineX: CGFloat,
+        pageHeight: CGFloat
+    ) -> CGFloat {
+        let r = max(radius.isFinite ? radius : 0, 0)
+        let spine = spineX.isFinite ? spineX : 0
+        guard r > 0, spine > 0.02, spine < 0.98 else {
+            return r
+        }
+        let height = max(pageHeight.isFinite ? pageHeight : 1, 0.05)
+        let held = attachedHeldPoint(p0: p0, p: p, spineX: spine, pageHeight: height)
+        let dx = held.x - p0.x
+        let dy = held.y - p0.y
+        let len = (dx * dx + dy * dy).squareRoot()
+        guard len.isFinite, len > 0.0008 else {
+            return r
+        }
+        let mid = CGPoint(x: (p0.x + held.x) * 0.5, y: (p0.y + held.y) * 0.5)
+        // Distance from the bisector to each end of the spine, toward the spine.
+        func room(_ end: CGPoint) -> CGFloat {
+            ((end.x - mid.x) * dx + (end.y - mid.y) * dy) / len
+        }
+        let clearance = min(room(CGPoint(x: spine, y: 0)), room(CGPoint(x: spine, y: height)))
+        return min(r, max(0, clearance) * 2 / .pi)
     }
 
     /// One page going back plays the forward curl from landed to flat.
@@ -881,8 +920,7 @@ enum PageCurlGeometry {
             r: channel(background.r),
             g: channel(background.g),
             b: channel(background.b),
-            mix: backsideMix,
-            specular: 0
+            mix: backsideMix
         )
     }
 }
@@ -901,10 +939,9 @@ struct PageCurlUniforms {
     var py: Float = 1
     var span: Float = 1
     var realVerso: Float = 0
-    var specular: Float = 0.3
     var paperR: Float = 1
     var paperG: Float = 1
     var paperB: Float = 1
-    var paperMix: Float = 0.96
+    var paperMix: Float = 0.75
     var aspect: Float = 1
 }

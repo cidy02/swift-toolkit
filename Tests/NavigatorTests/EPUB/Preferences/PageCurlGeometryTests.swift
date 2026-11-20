@@ -51,7 +51,7 @@ class PageCurlGeometryTests: XCTestCase {
         XCTAssertEqual(PageCurlGeometry.cylinderRadius(progress: 1, span: 1), 0, accuracy: 0.0001)
         let mid = PageCurlGeometry.cylinderRadius(progress: 0.5, span: 1)
         XCTAssertEqual(mid, PageCurlGeometry.peakRadius, accuracy: 0.0001)
-        // Apple Books' roll is about 25–35 pt on a 402 pt iPhone mid-turn.
+        // About 25–35 pt on a 402 pt phone mid-turn.
         XCTAssertGreaterThanOrEqual(PageCurlGeometry.peakRadius * 402, 25)
         XCTAssertLessThanOrEqual(PageCurlGeometry.peakRadius * 402, 40)
         // A narrow leaf does not grow a cylinder wider than itself.
@@ -372,7 +372,6 @@ class PageCurlGeometryTests: XCTestCase {
             XCTAssertEqual(paper.g, background.g, accuracy: 0.0001, name)
             XCTAssertEqual(paper.b, background.b, accuracy: 0.0001, name)
             XCTAssertEqual(paper.mix, PageCurlGeometry.backsideMix, accuracy: 0.0001, name)
-            XCTAssertEqual(paper.specular, 0, accuracy: 0.0001, name)
         }
         let odd = PageCurlGeometry.backsidePaper(background: PageCurlRGB(r: .nan, g: 1.2, b: -0.1))
         XCTAssertEqual(odd.r, 1)
@@ -380,8 +379,8 @@ class PageCurlGeometryTests: XCTestCase {
         XCTAssertEqual(odd.b, 0)
     }
 
-    /// The mirrored text shows through at Apple's strength: white type on a
-    /// black page comes out at 57–65 of 255 in the owner's recording.
+    /// The mirrored text shows through at about a quarter: white type on a
+    /// black page comes out at 50–80 of 255.
     func testBackShowsTheMirroredTextAtAboutAQuarter() {
         XCTAssertEqual(PageCurlGeometry.backsideMix, 1 - PageCurlGeometry.backGhostStrength, accuracy: 0.0001)
         let paper = PageCurlGeometry.backsidePaper(background: PageCurlRGB(r: 0, g: 0, b: 0))
@@ -665,7 +664,7 @@ class PageCurlGeometryTests: XCTestCase {
         XCTAssertLessThan(spine - 0.50, 0)
     }
 
-    /// Owner, 2026-11-19: a slow drag never got past halfway. The fold keeps
+    /// A slow drag used to stop halfway. The fold keeps
     /// moving toward the spine all the way to the far edge, and is on it
     /// there; early on the leaf stays at the finger.
     func testSlowDragTurnsThePageAllTheWayToTheEdge() {
@@ -717,6 +716,89 @@ class PageCurlGeometryTests: XCTestCase {
             spineX: 0.5, peelSign: 1, span: 0.5
         )
         XCTAssertEqual(aim.x, 0, accuracy: 0.0001)
+    }
+
+    /// Two pages, a drag from inside the right page to the left edge: the
+    /// fold is on the spine, so the left page is all new (the leaf's back).
+    /// The radius used to follow the finger's travel alone (still 0.057 at
+    /// progress 0.75), the roll's axis crossed the spine, and a strip of the
+    /// old left page showed between the roll and the spine.
+    func testTwoPageDragToTheEdgeShowsNoStripOfTheOldFacingPage() {
+        let aspect: CGFloat = 1032.0 / 1376.0
+        let height = 1 / aspect
+        let spineX: CGFloat = 0.5
+        let span: CGFloat = 0.5
+        for originX in [CGFloat(0.55), 0.75, 0.97] {
+            let origin = CGPoint(x: originX, y: 0.6 / aspect)
+            let p0 = PageCurlGeometry.heldPoint(
+                touchUV: CGPoint(x: originX, y: 0.6), spineX: spineX, peelSign: 1, span: span, aspect: aspect
+            )
+            let finger = CGPoint(x: 0, y: origin.y)
+            let p = PageCurlGeometry.fingerAim(
+                p0: p0, origin: origin, finger: finger, spineX: spineX, peelSign: 1, span: span
+            )
+            let progress = PageCurlPanStateMachine.progress(
+                translationX: -originX * 1032, width: 1032, forward: true, rtl: false
+            )
+            let radius = PageCurlGeometry.spineSafeRadius(
+                PageCurlGeometry.cylinderRadius(progress: progress, span: span),
+                p0: p0, p: p, spineX: spineX, pageHeight: height
+            )
+            for col in 0 ..< 200 {
+                let u = (CGFloat(col) + 0.5) / 200 * spineX
+                for v in [CGFloat(0.1), 0.5, 0.9] {
+                    let sample = PageCurlGeometry.spreadSample(
+                        uvX: u, uvY: v, progress: progress, spineX: spineX, peelSign: 1, span: span,
+                        twoPage: true, realVerso: true, p0: p0, p: p, radius: radius, aspect: aspect
+                    )
+                    XCTAssertEqual(sample.sheet, .incoming, "origin \(originX) u \(u) v \(v) radius \(radius)")
+                }
+            }
+        }
+    }
+
+    /// The cut only binds near the spine: mid-turn the roll keeps its size,
+    /// and one page (spine on the view's edge) is never cut.
+    func testSpineSafeRadiusLeavesTheRollAloneAwayFromTheSpine() {
+        let p0 = CGPoint(x: 1, y: 0.8)
+        let mid = PageCurlGeometry.cylinderRadius(progress: 0.3, span: 0.5)
+        XCTAssertEqual(
+            PageCurlGeometry.spineSafeRadius(mid, p0: p0, p: CGPoint(x: 0.7, y: 0.8), spineX: 0.5, pageHeight: 1.4),
+            mid, accuracy: 0.000_1
+        )
+        let onePage = PageCurlGeometry.cylinderRadius(progress: 0.9, span: 1)
+        XCTAssertEqual(
+            PageCurlGeometry.spineSafeRadius(onePage, p0: p0, p: CGPoint(x: -0.98, y: 0.8), spineX: 0, pageHeight: 2.2),
+            onePage, accuracy: 0.000_1
+        )
+        // On the spine: a crease.
+        XCTAssertEqual(
+            PageCurlGeometry.spineSafeRadius(mid, p0: p0, p: CGPoint(x: 0, y: 0.8), spineX: 0.5, pageHeight: 1.4),
+            0, accuracy: 0.000_1
+        )
+    }
+
+    /// Book pose with the hinge right of centre: the finger's own travel
+    /// reaches the landing before the edge. The leaf stays at the finger;
+    /// it used to be held up to 8% of the width behind it.
+    func testOffCentreSpineNeverHoldsTheLeafBehindTheFinger() {
+        for (spineX, peelSign, originX) in [(CGFloat(0.65), CGFloat(1), CGFloat(0.95)), (0.35, -1, 0.05)] {
+            let span = PageCurlGeometry.span(spine: .center(normalizedX: spineX), peelSign: peelSign)
+            let p0 = PageCurlGeometry.heldPoint(
+                touchUV: CGPoint(x: originX, y: 0.5), spineX: spineX, peelSign: peelSign, span: span, aspect: 1.4
+            )
+            let origin = CGPoint(x: originX, y: 0.5 / 1.4)
+            for step in 1 ... 20 {
+                let fx = originX + ((peelSign > 0 ? 0 : 1) - originX) * CGFloat(step) / 20
+                let finger = CGPoint(x: fx, y: origin.y)
+                let aim = PageCurlGeometry.fingerAim(
+                    p0: p0, origin: origin, finger: finger, spineX: spineX, peelSign: peelSign, span: span
+                )
+                let follow = p0.x + (fx - originX)
+                // Ahead means further in the turn's direction (-x for +peel).
+                XCTAssertLessThanOrEqual((aim.x - follow) * peelSign, 0.000_1, "spine \(spineX) step \(step)")
+            }
+        }
     }
 
     func testCommitLandsOnTheMirrorOfTheHeldPoint() {

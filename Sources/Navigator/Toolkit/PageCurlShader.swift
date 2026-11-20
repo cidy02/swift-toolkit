@@ -42,7 +42,6 @@ enum PageCurlShader {
         float py;
         float span;
         float realVerso;
-        float specular;
         float paperR;
         float paperG;
         float paperB;
