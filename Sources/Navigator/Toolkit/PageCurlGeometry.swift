@@ -78,6 +78,7 @@ struct PageCurlDivisionSample: Equatable {
 
 /// Paper colour mixed into a one-page underside. `mix` is how far the mirrored
 /// front is pulled toward `color` (`PageCurlGeometry.backsideMix`).
+/// `specular` is the crest highlight; Apple shows none, so it is 0.
 struct PageCurlPaper: Equatable {
     var r: CGFloat
     var g: CGFloat
@@ -95,9 +96,11 @@ struct PageCurlRGB: Equatable {
 
 /// The fold for one grab. `point` lies on the perpendicular bisector of the
 /// segment from the held point to the finger. `normal` is the unit direction
-/// of that segment (held point → finger). `axis` is the bisector shifted by
-/// `radius` along `normal`: the cylinder's crest. `clamped` means the bisector
-/// was pushed back so it does not cross the spine.
+/// of that segment (held point → finger). `axis` is the cylinder's axis seen
+/// from above: the line where the sheet leaves the page, the bisector shifted
+/// by `π/2 · radius` along `normal`, so the rolled edge still lands on the
+/// finger (`rollArc`). `clamped` means the bisector was pushed back so it
+/// does not cross the spine.
 struct PageCurlGrabFold: Equatable {
     var point: CGPoint
     var normal: CGPoint
@@ -116,21 +119,29 @@ enum PageCurlGeometry {
     /// it started, so the turn ends with the fold on the spine.
     static let tapArc: CGFloat = 0.5
     /// Peak cylinder radius as a fraction of view width, at progress 0.5.
-    /// The roll on screen is `2 * radius` wide, so 0.10 is a fifth of the page
-    /// at mid-turn. 0.07 read as a thin band rather than a paper roll.
-    static let peakRadius: CGFloat = 0.10
-    /// How far the mirrored front is pulled into the paper. 0.78 still read as
-    /// reversed type, including at 0.90, so the ghost is a light stain.
-    static let backsideMix: CGFloat = 0.96
-    /// Back of the leaf at the fold, as a multiple of its paper. The back is
-    /// the theme's paper everywhere else; only a band next to the fold, where
-    /// the sheet rolls away from the light, is darker. The previous ramp
-    /// (0.74 at the fold to 0.98 by 0.45 view widths) never reached the paper
-    /// on a half-page flap, so Light read as a flat mid-grey.
-    static let backFoldShade: CGFloat = 0.84
-    /// Width of that darker band, in view widths from the fold (about 24 pt on
-    /// an iPhone).
-    static let backShadeBand: CGFloat = 0.06
+    /// The leaf wraps a real cylinder (`rollArc`): the roll on screen is
+    /// `radius` wide, front text squeezing onto it and the back coming over
+    /// the top. Apple Books' roll in the owner's recording (iPhone, 2026-11-19)
+    /// is about 25–35 pt wide mid-turn, so 0.08 (32 pt at 402 pt).
+    static let peakRadius: CGFloat = 0.08
+    /// How much of the mirrored front shows through a one-page back, in the
+    /// shader's (gamma-encoded) colour space. Apple Books' back on a black
+    /// page draws white type at 57–65 of 255 (owner's recording, 1.30 s and
+    /// 1.62 s, every 40 px column of the flap), so about a quarter. The old
+    /// 0.04 (mix 0.96) read as a blank card.
+    static let backGhostStrength: CGFloat = 0.25
+    /// `1 - backGhostStrength`: how far the mirrored front is pulled into the paper.
+    static let backsideMix: CGFloat = 1 - backGhostStrength
+    /// Darkening where the sheet turns edge-on, at the roll's crest
+    /// (`rollShade`). Apple's is gentle; 0 at the flat parts.
+    static let rollCrestDarkening: CGFloat = 0.12
+    /// Shadow the roll casts on the next page, at the roll's edge, and how
+    /// fast it fades (view widths). Apple's is faint.
+    static let rollShadowStrength: CGFloat = 0.10
+    static let rollShadowWidth: CGFloat = 0.018
+    /// Shadow the flat back casts on the leaf's own front along its edges.
+    static let flapShadowStrength: CGFloat = 0.08
+    static let flapShadowWidth: CGFloat = 0.010
     /// A vertical fold reported outside this band is clamped, not trusted.
     static let divisionRange: ClosedRange<CGFloat> = 0.35 ... 0.65
 
@@ -320,7 +331,7 @@ enum PageCurlGeometry {
 
     /// Perpendicular bisector of P0→P, with P first kept within reach of the
     /// spine (`attachedHeldPoint`). The cylinder axis is that line offset by
-    /// `radius` toward the finger. Nil when the finger has not moved.
+    /// `π/2 · radius` toward the finger. Nil when the finger has not moved.
     static func grabFold(
         p0: CGPoint,
         p: CGPoint,
@@ -348,10 +359,11 @@ enum PageCurlGeometry {
         let mx = (p0.x + held.x) * 0.5
         let my = (p0.y + held.y) * 0.5
         let r = max(radius.isFinite ? radius : 0, 0)
+        let lift = r * .pi / 2
         return PageCurlGrabFold(
             point: CGPoint(x: mx, y: my),
             normal: CGPoint(x: nx, y: ny),
-            axis: CGPoint(x: mx + nx * r, y: my + ny * r),
+            axis: CGPoint(x: mx + nx * lift, y: my + ny * lift),
             radius: r,
             clamped: hypot(held.x - p.x, held.y - p.y) > 1e-6
         )
@@ -647,8 +659,10 @@ enum PageCurlGeometry {
         enum Region: Equatable {
             case flatOutgoing
             case flatIncoming
-            /// Cylinder band: the back, between the fold and the axis's far side.
+            /// The back over the top of the cylinder.
             case rollBack
+            /// The front on the cylinder's near side, squeezed toward the crest.
+            case rollFront
             /// Flat back of the leaf, from the cylinder out to the moved edge.
             case flatBack
         }
@@ -714,11 +728,14 @@ enum PageCurlGeometry {
                 ? sample(.incoming, u, .flatIncoming)
                 : sample(.outgoing, u, .flatOutgoing)
         }
-        let s = (iso.x - fold.point.x) * fold.normal.x + (iso.y - fold.point.y) * fold.normal.y
-        let pre = CGPoint(
-            x: iso.x - 2 * s * fold.normal.x,
-            y: iso.y - 2 * s * fold.normal.y
-        )
+        // w: distance from the cylinder axis toward the held edge (away from
+        // the finger). The sheet is flat for w < 0, wraps the cylinder over
+        // 0 ... radius, and its back comes over the top toward the finger.
+        let w = (fold.axis.x - iso.x) * fold.normal.x + (fold.axis.y - iso.y) * fold.normal.y
+        // The point of the unturned leaf that lands here from arc length t.
+        func original(_ t: CGFloat) -> CGPoint {
+            CGPoint(x: iso.x - fold.normal.x * (t - w), y: iso.y - fold.normal.y * (t - w))
+        }
         func inLeaf(_ q: CGPoint) -> Bool {
             let along = (q.x - spineX) * sign
             if along < -0.004 || along > leafSpan + 0.004 {
@@ -729,21 +746,33 @@ enum PageCurlGeometry {
             }
             return true
         }
-        // The flap is the reflection of the peeled part of the leaf. It lies on
-        // the finger's side of the fold, over the page, out to the moved edge.
-        if s > 0, inLeaf(pre) {
+        func back(_ q: CGPoint, _ region: SpreadSample.Region) -> SpreadSample {
             let sheet: SpreadSample.Sheet = realVerso ? .incoming : .outgoing
             let x: CGFloat
             if realVerso {
-                let along = (pre.x - spineX) * sign
+                let along = (q.x - spineX) * sign
                 x = spineX + sign * versoAlong(orig: along, span: leafSpan, twoPage: twoPage)
             } else {
-                x = pre.x
+                x = q.x
             }
-            let region: SpreadSample.Region = s < fold.radius * 2 ? .rollBack : .flatBack
             return sample(sheet, x, region)
         }
-        if inLeaf(iso), s >= 0 {
+        let arc = rollArc(w: w, radius: fold.radius)
+        // Topmost first: the back (flat, then over the roll), then the front
+        // squeezing onto the roll, then the flat page.
+        if let t = arc.back {
+            let q = original(t)
+            if inLeaf(q) {
+                return back(q, w < 0 ? .flatBack : .rollBack)
+            }
+        }
+        if let t = arc.front {
+            let q = original(t)
+            if inLeaf(q) {
+                return sample(.outgoing, q.x, .rollFront)
+            }
+        }
+        if w < 0, inLeaf(iso) {
             return sample(.outgoing, u, .flatOutgoing)
         }
         // The other page of a spread stays put. The fold is not allowed to
@@ -757,6 +786,41 @@ enum PageCurlGeometry {
         return sample(.incoming, u, .flatIncoming)
     }
 
+    /// Orthographic cylinder seen from above. `w` is the distance from the
+    /// axis toward the held edge, `radius` the cylinder's. Returns the arc
+    /// length from the axis of the sheet's back (on top: the roll's upper
+    /// half for 0 ... radius, then flat at the cylinder's height for w < 0)
+    /// and of its front (the roll's lower half, 0 ... radius only). Nil where
+    /// that side does not pass over w. Flat paper short of the roll is
+    /// `t = w` and is not returned. With `radius` 0 the back is the mirror
+    /// across the axis, the old flat fold.
+    static func rollArc(w: CGFloat, radius: CGFloat) -> (back: CGFloat?, front: CGFloat?) {
+        guard w.isFinite else {
+            return (nil, nil)
+        }
+        let r = max(radius.isFinite ? radius : 0, 0)
+        if w > r {
+            return (nil, nil)
+        }
+        if w < 0 {
+            return (.pi * r - w, nil)
+        }
+        let theta = asin(min(1, w / max(r, 1e-9)))
+        return (r * (.pi - theta), r * theta)
+    }
+
+    /// Brightness multiplier on the roll at `w` (as in `rollArc`): 1 on the
+    /// flat parts, `1 - rollCrestDarkening` where the sheet is edge-on.
+    /// The same for the front and the back, so both meet at the crest.
+    static func rollShade(w: CGFloat, radius: CGFloat) -> CGFloat {
+        let r = radius.isFinite ? radius : 0
+        guard r > 0, w.isFinite, w >= 0 else {
+            return 1
+        }
+        let sinTheta = min(1, w / r)
+        return 1 - rollCrestDarkening * sinTheta * sinTheta
+    }
+
     /// What actually plays. The policy is the gate: Reduce Motion, VoiceOver,
     /// scroll mode and `animated: false` are none, and a curl past the
     /// neighbour resource is a fade. `.curl` is then rendered, not slid.
@@ -764,37 +828,20 @@ enum PageCurlGeometry {
         PageTransitionPolicy.rendered(PageTransitionPolicy.resolve(request))
     }
 
-    /// Multiplier on the back's colour at `distance` (view widths) from the
-    /// fold, toward the moved edge. Matches the shader's `shade`.
-    static func backShade(distanceFromFold distance: CGFloat) -> CGFloat {
-        let d = distance.isFinite ? max(0, distance) : 0
-        let t = min(1, d / max(backShadeBand, 0.0001))
-        let smooth = t * t * (3 - 2 * t)
-        return backFoldShade + (1 - backFoldShade) * smooth
-    }
-
-    /// Underside of a one-page leaf. The colour is the theme's own paper.
-    /// Warming a white page (the previous mix) painted a beige leaf on Light.
-    /// OLED black is lifted so the sheet does not disappear. `mix` is `backsideMix`.
+    /// Underside of a one-page leaf: the theme's own page colour, in every
+    /// theme, with the mirrored text showing through (`backsideMix`). Apple
+    /// Books' back on a black page is black; the type is what makes it read.
+    /// The old lifted OLED black and the grey Dark card read as a second shape.
     static func backsidePaper(background: PageCurlRGB) -> PageCurlPaper {
-        let y = 0.2126 * background.r + 0.7152 * background.g + 0.0722 * background.b
-        if y < 0.06 {
-            // About 7% above black.
-            return PageCurlPaper(r: 0.07, g: 0.07, b: 0.075, mix: backsideMix, specular: 0.12)
+        func channel(_ value: CGFloat) -> CGFloat {
+            value.isFinite ? min(1, max(0, value)) : 1
         }
-        if y < 0.28 {
-            return PageCurlPaper(r: 0.20, g: 0.20, b: 0.22, mix: backsideMix, specular: 0.16)
-        }
-        let chroma = max(background.r, background.g, background.b) - min(background.r, background.g, background.b)
-        // Near-neutral paper (Light): the same hue, 4% darker. Tinted paper
-        // (Sepia): a little darker, still that tint, not a second beige.
-        let scale: CGFloat = chroma < 0.08 ? 0.96 : 0.92
         return PageCurlPaper(
-            r: min(1, background.r * scale),
-            g: min(1, background.g * scale),
-            b: min(1, background.b * scale),
+            r: channel(background.r),
+            g: channel(background.g),
+            b: channel(background.b),
             mix: backsideMix,
-            specular: y > 0.7 ? 0.28 : 0.22
+            specular: 0
         )
     }
 }

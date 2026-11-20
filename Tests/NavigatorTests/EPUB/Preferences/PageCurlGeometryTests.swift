@@ -51,9 +51,9 @@ class PageCurlGeometryTests: XCTestCase {
         XCTAssertEqual(PageCurlGeometry.cylinderRadius(progress: 1, span: 1), 0, accuracy: 0.0001)
         let mid = PageCurlGeometry.cylinderRadius(progress: 0.5, span: 1)
         XCTAssertEqual(mid, PageCurlGeometry.peakRadius, accuracy: 0.0001)
-        // Wide enough to read as paper. A thin band was 0.07.
-        XCTAssertGreaterThanOrEqual(PageCurlGeometry.peakRadius, 0.09)
-        XCTAssertLessThanOrEqual(PageCurlGeometry.peakRadius, 0.14)
+        // Apple Books' roll is about 25–35 pt on a 402 pt iPhone mid-turn.
+        XCTAssertGreaterThanOrEqual(PageCurlGeometry.peakRadius * 402, 25)
+        XCTAssertLessThanOrEqual(PageCurlGeometry.peakRadius * 402, 40)
         // A narrow leaf does not grow a cylinder wider than itself.
         let narrow = PageCurlGeometry.cylinderRadius(progress: 0.5, span: 0.1)
         XCTAssertLessThanOrEqual(narrow, 0.1 * 0.45 + 0.0001)
@@ -357,41 +357,44 @@ class PageCurlGeometryTests: XCTestCase {
         XCTAssertEqual(PageCurlGeometry.rendered(request(animated: false, resourceDistance: 3)), .none)
     }
 
-    func testBacksidePaperFollowsTheTheme() {
-        let oled = PageCurlGeometry.backsidePaper(background: PageCurlRGB(r: 0, g: 0, b: 0))
-        XCTAssertGreaterThan(oled.r, 0.05)
-        XCTAssertLessThan(oled.r, 0.10)
-        XCTAssertEqual(oled.mix, PageCurlGeometry.backsideMix, accuracy: 0.0001)
-        XCTAssertLessThan(oled.specular, 0.2)
+    /// The back is the page's own colour in every theme (Apple: black on a
+    /// black page), with no OLED lift and no grey card.
+    func testBacksidePaperIsThePageColourInEveryTheme() {
+        let themes: [(String, PageCurlRGB)] = [
+            ("OLED", PageCurlRGB(r: 0, g: 0, b: 0)),
+            ("Dark", PageCurlRGB(r: 0.12, g: 0.12, b: 0.13)),
+            ("Light", PageCurlRGB(r: 1, g: 1, b: 1)),
+            ("Sepia", PageCurlRGB(r: 0.984, g: 0.941, b: 0.851)),
+        ]
+        for (name, background) in themes {
+            let paper = PageCurlGeometry.backsidePaper(background: background)
+            XCTAssertEqual(paper.r, background.r, accuracy: 0.0001, name)
+            XCTAssertEqual(paper.g, background.g, accuracy: 0.0001, name)
+            XCTAssertEqual(paper.b, background.b, accuracy: 0.0001, name)
+            XCTAssertEqual(paper.mix, PageCurlGeometry.backsideMix, accuracy: 0.0001, name)
+            XCTAssertEqual(paper.specular, 0, accuracy: 0.0001, name)
+        }
+        let odd = PageCurlGeometry.backsidePaper(background: PageCurlRGB(r: .nan, g: 1.2, b: -0.1))
+        XCTAssertEqual(odd.r, 1)
+        XCTAssertEqual(odd.g, 1)
+        XCTAssertEqual(odd.b, 0)
+    }
 
-        // Light is white, slightly greyed. Warming it produced a beige leaf.
+    /// The mirrored text shows through at Apple's strength: white type on a
+    /// black page comes out at 57–65 of 255 in the owner's recording.
+    func testBackShowsTheMirroredTextAtAboutAQuarter() {
+        XCTAssertEqual(PageCurlGeometry.backsideMix, 1 - PageCurlGeometry.backGhostStrength, accuracy: 0.0001)
+        let paper = PageCurlGeometry.backsidePaper(background: PageCurlRGB(r: 0, g: 0, b: 0))
+        // The shader's paperBack: mix(text, paper, mix).
+        let whiteType = 1 + (paper.r - 1) * paper.mix
+        XCTAssertGreaterThanOrEqual(whiteType * 255, 50)
+        XCTAssertLessThanOrEqual(whiteType * 255, 80)
+        // Light: black type on white is a light grey, still readable.
         let light = PageCurlGeometry.backsidePaper(background: PageCurlRGB(r: 1, g: 1, b: 1))
-        XCTAssertEqual(light.mix, PageCurlGeometry.backsideMix, accuracy: 0.0001)
-        XCTAssertEqual(light.r, 0.96, accuracy: 0.001)
-        XCTAssertEqual(light.g, light.r, accuracy: 0.001)
-        XCTAssertEqual(light.b, light.r, accuracy: 0.001)
-
-        let sepiaBackground = PageCurlRGB(r: 0.984, g: 0.941, b: 0.851)
-        let sepia = PageCurlGeometry.backsidePaper(background: sepiaBackground)
-        XCTAssertEqual(sepia.mix, PageCurlGeometry.backsideMix, accuracy: 0.0001)
-        XCTAssertEqual(sepia.r, sepiaBackground.r * 0.92, accuracy: 0.001)
-        XCTAssertEqual(sepia.g, sepiaBackground.g * 0.92, accuracy: 0.001)
-        XCTAssertEqual(sepia.b, sepiaBackground.b * 0.92, accuracy: 0.001)
-        XCTAssertGreaterThan(sepia.r, sepia.b)
-
-        let dark = PageCurlGeometry.backsidePaper(background: PageCurlRGB(r: 0.12, g: 0.12, b: 0.13))
-        XCTAssertEqual(dark.r, 0.20, accuracy: 0.001)
-        XCTAssertEqual(dark.g, 0.20, accuracy: 0.001)
-        XCTAssertEqual(dark.b, 0.22, accuracy: 0.001)
-
-        // The dark branch is 0.06 <= luminance < 0.28. Just inside both ends.
-        let darkFloor = PageCurlGeometry.backsidePaper(background: PageCurlRGB(r: 0.07, g: 0.07, b: 0.07))
-        XCTAssertEqual(darkFloor.r, 0.20, accuracy: 0.001)
-        XCTAssertEqual(darkFloor.b, 0.22, accuracy: 0.001)
-        let darkCeil = PageCurlGeometry.backsidePaper(background: PageCurlRGB(r: 0.27, g: 0.27, b: 0.27))
-        XCTAssertEqual(darkCeil.r, 0.20, accuracy: 0.001)
-        let aboveDark = PageCurlGeometry.backsidePaper(background: PageCurlRGB(r: 0.30, g: 0.30, b: 0.30))
-        XCTAssertEqual(aboveDark.r, 0.30 * 0.96, accuracy: 0.001)
+        let blackType = 0 + (light.r - 0) * light.mix
+        XCTAssertLessThan(blackType, 0.85)
+        XCTAssertGreaterThan(blackType, 0.6)
+        XCTAssertTrue(PageCurlShader.source.contains("paperBack(sampleTex(outgoing, paperUV(q, aspect)), u)"))
     }
 
     func testGrabAtACornerPeelsDiagonallyAndMidEdgeStaysVertical() {
@@ -447,7 +450,7 @@ class PageCurlGeometryTests: XCTestCase {
         XCTAssertGreaterThan(abs(low.normal.y - high.normal.y), 0.4)
     }
 
-    func testFoldAxisIsTheBisectorOffsetByTheRadius() {
+    func testFoldAxisIsTheBisectorOffsetByAQuarterTurnOfTheRoll() {
         let p0 = CGPoint(x: 1, y: 1.2)
         let p = CGPoint(x: 0.4, y: 1.2)
         let radius: CGFloat = 0.08
@@ -455,10 +458,10 @@ class PageCurlGeometryTests: XCTestCase {
         XCTAssertFalse(fold.clamped)
         XCTAssertEqual(fold.point.x, (p0.x + p.x) / 2, accuracy: 0.0001)
         XCTAssertEqual(fold.point.y, (p0.y + p.y) / 2, accuracy: 0.0001)
-        XCTAssertEqual(fold.axis.x, fold.point.x + fold.normal.x * radius, accuracy: 0.0001)
-        XCTAssertEqual(fold.axis.y, fold.point.y + fold.normal.y * radius, accuracy: 0.0001)
+        XCTAssertEqual(fold.axis.x, fold.point.x + fold.normal.x * radius * .pi / 2, accuracy: 0.0001)
+        XCTAssertEqual(fold.axis.y, fold.point.y + fold.normal.y * radius * .pi / 2, accuracy: 0.0001)
         let offset = hypot(fold.axis.x - fold.point.x, fold.axis.y - fold.point.y)
-        XCTAssertEqual(offset, radius, accuracy: 0.0001)
+        XCTAssertEqual(offset, radius * .pi / 2, accuracy: 0.0001)
         // The axis sits toward the finger, not back toward the held point.
         let towardFinger = (p.x - p0.x) * fold.normal.x + (p.y - p0.y) * fold.normal.y
         XCTAssertGreaterThan(towardFinger, 0)
@@ -694,28 +697,82 @@ class PageCurlGeometryTests: XCTestCase {
         XCTAssertEqual(PageCurlGeometry.curlColumnCorrection(offset: 1170, target: 783), -387, accuracy: 0.001)
     }
 
-    /// The back is the paper, darker only next to the fold. On a
-    /// mid-edge drag of 0.5 view widths the flap is 0.25 wide; all but the
-    /// band next to the fold is the paper itself.
-    func testBackIsPaperAwayFromTheFold() {
-        XCTAssertEqual(PageCurlGeometry.backShade(distanceFromFold: 0), PageCurlGeometry.backFoldShade, accuracy: 0.0001)
-        XCTAssertGreaterThanOrEqual(PageCurlGeometry.backFoldShade, 0.8)
-        XCTAssertEqual(PageCurlGeometry.backShade(distanceFromFold: PageCurlGeometry.backShadeBand), 1, accuracy: 0.0001)
-        XCTAssertEqual(PageCurlGeometry.backShade(distanceFromFold: 0.2), 1, accuracy: 0.0001)
-        XCTAssertLessThanOrEqual(PageCurlGeometry.backShadeBand, 0.25 * 0.3)
-        var last: CGFloat = 0
+    /// A real cylinder: the front runs up the near side, the back comes
+    /// over the top, both meet at the crest, and the flat back beyond is the
+    /// mirror across the bisector (so the edge still lands on the finger).
+    func testRollArcIsContinuousFromFrontOverTheCrestToTheBack() throws {
+        let r: CGFloat = 0.08
+        XCTAssertNil(PageCurlGeometry.rollArc(w: r + 0.001, radius: r).back)
+        XCTAssertNil(PageCurlGeometry.rollArc(w: r + 0.001, radius: r).front)
+        let crest = PageCurlGeometry.rollArc(w: r, radius: r)
+        XCTAssertEqual(try XCTUnwrap(crest.back), r * .pi / 2, accuracy: 0.0001)
+        XCTAssertEqual(try XCTUnwrap(crest.front), r * .pi / 2, accuracy: 0.0001)
+        let base = PageCurlGeometry.rollArc(w: 0, radius: r)
+        XCTAssertEqual(try XCTUnwrap(base.front), 0, accuracy: 0.0001)
+        XCTAssertEqual(try XCTUnwrap(base.back), r * .pi, accuracy: 0.0001)
+        let flat = PageCurlGeometry.rollArc(w: -0.0001, radius: r)
+        XCTAssertNil(flat.front)
+        XCTAssertEqual(try XCTUnwrap(flat.back), r * .pi + 0.0001, accuracy: 0.00001)
+        // Squeezed toward the crest: more paper per point of screen.
+        let a = try XCTUnwrap(PageCurlGeometry.rollArc(w: 0.9 * r, radius: r).front)
+        let b = try XCTUnwrap(PageCurlGeometry.rollArc(w: 0.99 * r, radius: r).front)
+        XCTAssertGreaterThan((b - a) / (0.09 * r), 2)
+        // No radius: the old flat fold, a mirror across the axis.
+        XCTAssertEqual(try XCTUnwrap(PageCurlGeometry.rollArc(w: -0.1, radius: 0).back), 0.1, accuracy: 0.0001)
+    }
+
+    /// Gentle darkening only where the sheet turns edge-on.
+    func testRollShadeIsGentleAndOnlyOnTheRoll() {
+        let r: CGFloat = 0.08
+        XCTAssertEqual(PageCurlGeometry.rollShade(w: -0.05, radius: r), 1)
+        XCTAssertEqual(PageCurlGeometry.rollShade(w: 0, radius: r), 1, accuracy: 0.0001)
+        XCTAssertEqual(PageCurlGeometry.rollShade(w: r, radius: r), 1 - PageCurlGeometry.rollCrestDarkening, accuracy: 0.0001)
+        XCTAssertLessThanOrEqual(PageCurlGeometry.rollCrestDarkening, 0.15)
+        XCTAssertLessThanOrEqual(PageCurlGeometry.rollShadowStrength, 0.12)
+        XCTAssertLessThanOrEqual(PageCurlGeometry.flapShadowStrength, 0.10)
+        var last: CGFloat = 1
         for step in 0 ... 10 {
-            let shade = PageCurlGeometry.backShade(distanceFromFold: CGFloat(step) * 0.01)
-            XCTAssertGreaterThanOrEqual(shade, last)
+            let shade = PageCurlGeometry.rollShade(w: CGFloat(step) * r / 10, radius: r)
+            XCTAssertLessThanOrEqual(shade, last)
             last = shade
         }
-        // Light: white paper, so the back is near-white away from the fold.
-        let light = PageCurlGeometry.backsidePaper(background: PageCurlRGB(r: 1, g: 1, b: 1))
-        XCTAssertGreaterThan(light.r * PageCurlGeometry.backShade(distanceFromFold: 0.1), 0.95)
         let source = PageCurlShader.source
-        XCTAssertTrue(source.contains(String(format: "mix(%.4f, 1.0, smoothstep(0.0, %.4f, s))",
-                                             PageCurlGeometry.backFoldShade, PageCurlGeometry.backShadeBand)))
-        XCTAssertFalse(source.contains("0.74, 0.98"))
+        XCTAssertTrue(source.contains(String(format: "1.0 - %.4f * sinT * sinT", PageCurlGeometry.rollCrestDarkening)))
+        XCTAssertFalse(source.contains("smoothstep(0.0, 0.0600, s)"))
+    }
+
+    /// Early in a drag the leaf is shorter than the roll's top: the front
+    /// text squeezes onto the near side of the roll instead of a flat crease.
+    func testFrontSqueezesOntoTheRollWhereTheBackIsShort() {
+        let p0 = CGPoint(x: 1, y: 0.5)
+        let p = CGPoint(x: 0.9, y: 0.5)
+        let radius: CGFloat = 0.05
+        // Axis at 0.95 - π/2 · 0.05 = 0.8715; the edge is 0.1285 of arc from it.
+        let near = sample(
+            uvX: 0.875, uvY: 0.5, progress: 0.1, spineX: 0, peelSign: 1, span: 1,
+            twoPage: false, realVerso: false, p0: p0, p: p, radius: radius, aspect: 1
+        )
+        XCTAssertEqual(near.region, .rollFront)
+        XCTAssertEqual(near.sheet, .outgoing)
+        let crestSide = sample(
+            uvX: 0.895, uvY: 0.5, progress: 0.1, spineX: 0, peelSign: 1, span: 1,
+            twoPage: false, realVerso: false, p0: p0, p: p, radius: radius, aspect: 1
+        )
+        XCTAssertEqual(crestSide.region, .rollFront)
+        // Nearer the crest the short leaf's edge has come over the top.
+        let over = sample(
+            uvX: 0.92, uvY: 0.5, progress: 0.1, spineX: 0, peelSign: 1, span: 1,
+            twoPage: false, realVerso: false, p0: p0, p: p, radius: radius, aspect: 1
+        )
+        XCTAssertEqual(over.region, .rollBack)
+        // The page under it shows past the crest.
+        let past = sample(
+            uvX: 0.93, uvY: 0.5, progress: 0.1, spineX: 0, peelSign: 1, span: 1,
+            twoPage: false, realVerso: false, p0: p0, p: p, radius: radius, aspect: 1
+        )
+        XCTAssertEqual(past.region, .flatIncoming)
+        // 0.02 of screen holds more than 0.02 of the page.
+        XCTAssertGreaterThan(crestSide.x - near.x, 0.895 - 0.875)
     }
 
     /// A mid-edge drag: the moved edge lands on P, the fold is the

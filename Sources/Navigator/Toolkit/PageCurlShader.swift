@@ -11,12 +11,21 @@ import Foundation
 ///
 /// The shader has no duration and no easing. `progress` is already the visual
 /// position, 0 = outgoing flat, 1 = incoming flat. `radius` is zero at both
-/// ends. The fold is the perpendicular bisector of `p0`→`p` (see
-/// `PageCurlGeometry.spreadSample`, which this fragment matches). The back of
-/// the leaf is opaque. The next page is drawn only where the leaf does not cover it.
+/// ends. The fold is the perpendicular bisector of `p0`→`p`; the leaf wraps a
+/// cylinder whose axis is that line moved `π/2 · radius` toward the finger
+/// (see `PageCurlGeometry.spreadSample` and `rollArc`, which this fragment
+/// matches). The back of the leaf is opaque. The next page is drawn only where
+/// the leaf does not cover it.
 enum PageCurlShader {
-    private static let backFoldShade = String(format: "%.4f", PageCurlGeometry.backFoldShade)
-    private static let backShadeBand = String(format: "%.4f", PageCurlGeometry.backShadeBand)
+    private static func f(_ value: CGFloat) -> String {
+        String(format: "%.4f", value)
+    }
+
+    private static let crestDarkening = f(PageCurlGeometry.rollCrestDarkening)
+    private static let rollShadowStrength = f(PageCurlGeometry.rollShadowStrength)
+    private static let rollShadowWidth = f(PageCurlGeometry.rollShadowWidth)
+    private static let flapShadowStrength = f(PageCurlGeometry.flapShadowStrength)
+    private static let flapShadowWidth = f(PageCurlGeometry.flapShadowWidth)
 
     static let source = #"""
     #include <metal_stdlib>
@@ -74,9 +83,27 @@ enum PageCurlShader {
         return float2(clamp(paper.x, 0.0, 1.0), clamp(paper.y * aspect, 0.0, 1.0));
     }
 
-    // Keep this in lockstep with PageCurlGeometry.spreadSample. s > 0 is the
-    // finger's side of the bisector. The flap is the reflection of the peeled
-    // leaf and is drawn opaque. The next page is only the uncovered part.
+    // Distance from the leaf's rectangle, 0 inside.
+    static float leafGap(float2 q, float spineX, float sign, float span, float pageH) {
+        float along = (q.x - spineX) * sign;
+        float dx = 0.0;
+        if (along < 0.0) dx = -along;
+        else if (along > span) dx = along - span;
+        float dy = 0.0;
+        if (q.y < 0.0) dy = -q.y;
+        else if (q.y > pageH) dy = q.y - pageH;
+        return length(float2(dx, dy));
+    }
+
+    static bool inLeaf(float2 q, float spineX, float sign, float span, float pageH) {
+        float along = (q.x - spineX) * sign;
+        return along >= -0.004 && along <= span + 0.004 && q.y >= -0.004 && q.y <= pageH + 0.004;
+    }
+
+    // Keep this in lockstep with PageCurlGeometry.spreadSample / rollArc.
+    // w is the distance from the cylinder axis toward the held edge. The
+    // sheet is flat for w < 0, wraps the cylinder over 0 ... R, and its back
+    // comes over the top toward the finger. Topmost surface wins.
     fragment float4 curlFragment(
         CurlVertexOut in [[stage_in]],
         texture2d<float> outgoing [[texture(0)]],
@@ -115,52 +142,46 @@ enum PageCurlShader {
         // `finger` is already within reach of the spine
         // (PageCurlGeometry.attachedHeldPoint), so the bisector never crosses it.
         float2 N = delta / len;
-        float2 M = (p0 + finger) * 0.5;
-
         float R = max(u.radius, 0.0);
-        float s = dot(iso - M, N);
-        float2 pre = iso - N * (2.0 * s);
+        float2 axis = (p0 + finger) * 0.5 + N * (R * 1.57079633);
+        float w = dot(axis - iso, N);
+        float sinT = clamp(w / R, 0.0, 1.0);
+        float theta = asin(sinT);
+        // Darker only where the sheet turns edge-on (PageCurlGeometry.rollShade).
+        float rollShade = w >= 0.0 ? 1.0 - \#(crestDarkening) * sinT * sinT : 1.0;
 
-        bool peeled = false;
-        {
-            float along = (pre.x - u.spineX) * sign;
-            bool insideX = along >= -0.004 && along <= span + 0.004;
-            bool insideY = pre.y >= -0.004 && pre.y <= pageH + 0.004;
-            peeled = insideX && insideY;
-        }
-
-        // Back of the leaf. Opaque: one page is a paper ghost of the mirrored
-        // front, two pages are the incoming facing half. Darker only near the fold.
-        // A soft highlight sits on the cylinder axis (the bisector, offset by R).
-        if (s > 0.0 && peeled) {
-            float3 back;
-            if (u.realVerso > 0.5) {
-                float along = (pre.x - u.spineX) * sign;
-                float far = max(1.0 - span, 0.0);
-                float versoAlong = -along * (far / span);
-                float versoX = u.spineX + sign * versoAlong;
-                back = sampleTex(incoming, float2(versoX, clamp(pre.y * aspect, 0.0, 1.0)));
-            } else {
-                back = paperBack(sampleTex(outgoing, paperUV(pre, aspect)), u);
+        // Back: flat over the page (w < 0) or over the top of the roll.
+        if (w <= R) {
+            float t = w < 0.0 ? 3.14159265 * R - w : R * (3.14159265 - theta);
+            float2 q = iso - N * (t - w);
+            if (inLeaf(q, u.spineX, sign, span, pageH)) {
+                float3 back;
+                if (u.realVerso > 0.5) {
+                    float along = (q.x - u.spineX) * sign;
+                    float far = max(1.0 - span, 0.0);
+                    float versoAlong = -along * (far / span);
+                    float versoX = u.spineX + sign * versoAlong;
+                    back = sampleTex(incoming, float2(versoX, clamp(q.y * aspect, 0.0, 1.0)));
+                } else {
+                    back = paperBack(sampleTex(outgoing, paperUV(q, aspect)), u);
+                }
+                return float4(clamp(back * rollShade, 0.0, 1.0), 1.0);
             }
-            // Paper everywhere but a band next to the fold
-            // (PageCurlGeometry.backShade).
-            float shade = mix(\#(backFoldShade), 1.0, smoothstep(0.0, \#(backShadeBand), s));
-            float axisDist = abs(s - R);
-            float crest = exp(-pow(axisDist / max(R * 1.1, 0.015), 2.0));
-            float spec = crest * u.specular * 0.22 * envelope;
-            float3 specColor = spec * float3(1.0, 0.98, 0.94);
-            return float4(clamp(back * shade + specColor, 0.0, 1.0), 1.0);
         }
-
-        bool onLeaf = false;
-        {
-            float along = (iso.x - u.spineX) * sign;
-            onLeaf = along >= -0.004 && along <= span + 0.004
-                && iso.y >= -0.004 && iso.y <= pageH + 0.004;
+        // Front, squeezing onto the near side of the roll.
+        if (w >= 0.0 && w <= R) {
+            float2 q = iso - N * (R * theta - w);
+            if (inLeaf(q, u.spineX, sign, span, pageH)) {
+                float3 front = sampleTex(outgoing, paperUV(q, aspect));
+                return float4(clamp(front * rollShade, 0.0, 1.0), 1.0);
+            }
         }
-        if (onLeaf && s >= 0.0) {
-            return float4(outC, 1.0);
+        // Flat front of the leaf, with a faint shadow along the flap's edge.
+        if (w < 0.0 && inLeaf(iso, u.spineX, sign, span, pageH)) {
+            float2 q = iso - N * (3.14159265 * R - 2.0 * w);
+            float gap = leafGap(q, u.spineX, sign, span, pageH);
+            float shadow = exp(-gap / \#(flapShadowWidth)) * \#(flapShadowStrength) * envelope;
+            return float4(clamp(outC * (1.0 - shadow), 0.0, 1.0), 1.0);
         }
         // The other half of a spread is not peeled. The fold stops at the spine.
         if (u.realVerso > 0.5) {
@@ -171,20 +192,11 @@ enum PageCurlShader {
             }
         }
 
-        // Next page, full contrast, with a short shadow along the leaf's edge.
+        // Next page, full contrast, with a faint shadow past the roll.
         float3 inC = sampleTex(incoming, uv);
-        float gap = -s;
-        if (s >= 0.0) {
-            float along = (pre.x - u.spineX) * sign;
-            float dx = 0.0;
-            if (along < 0.0) dx = -along;
-            else if (along > span) dx = along - span;
-            float dy = 0.0;
-            if (pre.y < 0.0) dy = -pre.y;
-            else if (pre.y > pageH) dy = pre.y - pageH;
-            gap = length(float2(dx, dy));
-        }
-        float shadow = exp(-max(gap, 0.0) / 0.020) * 0.18 * envelope;
+        float2 crest = iso - N * (R * 1.57079633 - w);
+        float gap = max(w - R, 0.0) + leafGap(crest, u.spineX, sign, span, pageH);
+        float shadow = exp(-gap / \#(rollShadowWidth)) * \#(rollShadowStrength) * envelope;
         return float4(clamp(inC * (1.0 - shadow), 0.0, 1.0), 1.0);
     }
     """#
