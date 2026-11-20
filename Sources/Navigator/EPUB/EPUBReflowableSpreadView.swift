@@ -109,6 +109,7 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         activeCurlView?.releaseResources()
         activeCurlView?.removeFromSuperview()
         activeCurlView = nil
+        pendingCurlScroll = nil
         super.clear()
 
         // Clean up go to continuations.
@@ -421,6 +422,8 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
     /// the outgoing bitmap. Returns the incoming bitmap, or nil if this
     /// resource has no further column.
     func prepareCurlIncoming(direction: Direction, background: UIColor) async -> UIImage? {
+        // A cached drag whose session was dropped (reload) left its scroll here.
+        await awaitPendingCurlScroll()
         guard let delta = pageDelta(for: direction) else {
             return nil
         }
