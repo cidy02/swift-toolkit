@@ -69,8 +69,6 @@ enum PageCurlPanStateMachine {
     static let horizontalDominance: CGFloat = 1.25
     /// Leading-edge inset left for the reader's dismiss swipe.
     static let bezelInset: CGFloat = 20
-    /// How long the leaf takes to catch a finger that moved during the snapshot.
-    static let catchUpDuration: TimeInterval = 0.05
     /// At rest, a critically damped spring is within ~2% in about 300 ms.
     static let settleOmega: CGFloat = 16
     /// A flick (about 4 page-widths per second) lands nearer 190 ms.

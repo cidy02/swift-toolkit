@@ -28,6 +28,9 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
     /// `contentOffset.x` the commit must land on. A flick's touch-end can
     /// undo the `scrollBy` that was made for the snapshot.
     private var curlTargetOffset: CGFloat?
+    /// Cache hit: the column scroll runs under the cover while the leaf
+    /// already follows the finger. Commit, cancel and the prerender wait for it.
+    private var pendingCurlScroll: Task<Void, Never>?
     /// A cancel restores the previous column, then a late scroll message can
     /// still arrive. Drop progression events until this time so the peek does
     /// not become a location, including on the last page of a work.
@@ -434,8 +437,69 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         return image
     }
 
+    /// The incoming bitmap came from the prerender cache. Scroll one column
+    /// under the cover without waiting for the paint: nothing reads this
+    /// column until commit or cancel, and both wait for the scroll first.
+    func beginCurlIncomingScroll(direction: Direction) -> Bool {
+        guard pendingCurlScroll == nil, let delta = pageDelta(for: direction) else {
+            return false
+        }
+        curlDelta = delta
+        curlTargetOffset = scrollView.contentOffset.x + delta
+        setSuppressingProgressionUpdates(true)
+        pendingCurlScroll = Task { @MainActor [weak self] in
+            await self?.scrollByAwaitingPaint(delta)
+            PageCurlLatency.mark("incoming-scrolled-behind")
+        }
+        return true
+    }
+
+    private func awaitPendingCurlScroll() async {
+        guard let pending = pendingCurlScroll else {
+            return
+        }
+        await pending.value
+        pendingCurlScroll = nil
+    }
+
+    /// While a committed leaf springs to rest, the cover still hides the web
+    /// view. Step one more column the same way, snapshot it, and step back,
+    /// so the next drag in this direction has its page ready. Nil at the end
+    /// of the resource, or if the column did not land where expected.
+    func prerenderCurlBeyond(direction: Direction, background: UIColor) async -> UIImage? {
+        await awaitPendingCurlScroll()
+        guard let target = curlTargetOffset, curlHostAttached else {
+            return nil
+        }
+        let onIncoming = PageCurlGeometry.curlColumnCorrection(offset: scrollView.contentOffset.x, target: target)
+        if onIncoming != 0 {
+            await scrollByAwaitingPaint(onIncoming)
+        }
+        guard curlHostAttached, curlTargetOffset == target,
+              abs(scrollView.contentOffset.x - target) <= 2,
+              let delta = pageDelta(for: direction)
+        else {
+            return nil
+        }
+        await scrollByAwaitingPaint(delta)
+        var image: UIImage?
+        if curlHostAttached, abs(scrollView.contentOffset.x - (target + delta)) <= 2 {
+            image = await PageCurlSnapshotter.capture(of: self, backgroundColor: background)
+            // The snapshot drains the run loop. Keep it only if the column held.
+            if abs(scrollView.contentOffset.x - (target + delta)) > 2 {
+                image = nil
+            }
+        }
+        let back = PageCurlGeometry.curlColumnCorrection(offset: scrollView.contentOffset.x, target: target)
+        if back != 0 {
+            await scrollByAwaitingPaint(back)
+        }
+        return image
+    }
+
     /// Puts the column back and drops the peeked progression. No location event.
     func revertCurlIncoming() async {
+        await awaitPendingCurlScroll()
         let delta = curlDelta
         let target = curlTargetOffset
         curlDelta = 0
@@ -456,6 +520,7 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
     /// undo the scroll that was made for the snapshot; do that scroll again
     /// now that the finger is up. Emit the location once.
     func commitCurlIncoming() async {
+        await awaitPendingCurlScroll()
         if let target = curlTargetOffset {
             let correction = PageCurlGeometry.curlColumnCorrection(
                 offset: scrollView.contentOffset.x,

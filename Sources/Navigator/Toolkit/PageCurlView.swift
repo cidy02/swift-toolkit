@@ -44,7 +44,6 @@ final class PageCurlView: UIView {
     /// Finger position while a drag is in flight. The display link reads it.
     private var fingerProgress: CGFloat = 0
     private var interactivePhase: InteractivePhase = .none
-    private var catchUpStart: CFTimeInterval = 0
     private var springStart: CFTimeInterval = 0
     private var springFrom: CGFloat = 0
     private var springVelocity: CGFloat = 0
@@ -56,7 +55,6 @@ final class PageCurlView: UIView {
 
     private enum InteractivePhase {
         case none
-        case catchUp
         case track
         case spring
     }
@@ -70,6 +68,15 @@ final class PageCurlView: UIView {
         Task { @MainActor in
             await PageCurlRenderer.warmPipeline(device: device)
         }
+    }
+
+    /// Uploads bitmaps a drag is about to use (touch-down), off the main actor.
+    static func preloadTextures(_ images: [UIImage]) {
+        PageCurlRenderer.preload(images)
+    }
+
+    static func dropPreloadedTextures() {
+        PageCurlRenderer.dropPreloads()
     }
 
     override init(frame: CGRect) {
@@ -238,8 +245,9 @@ final class PageCurlView: UIView {
         }
     }
 
-    /// The outgoing cover is already up. The first presented frame is the flat
-    /// page, then the leaf catches the finger over `catchUpDuration`.
+    /// The outgoing cover is already up. The first presented frame already has
+    /// the leaf under the finger: no catch-up, so the page moves with the
+    /// finger from the first frame (T-561j).
     func beginInteractive(
         outgoing: UIImage,
         incoming: UIImage,
@@ -261,8 +269,8 @@ final class PageCurlView: UIView {
         self.grabUV = grabUV
         self.fingerUV = fingerUV
         fingerProgress = PageCurlGeometry.clampProgress(progress)
-        self.progress = 0
-        interactivePhase = .catchUp
+        self.progress = fingerProgress
+        interactivePhase = .track
         latencyFrames = 0
 
         guard isAttached, let renderer, let metalView else {
@@ -290,9 +298,8 @@ final class PageCurlView: UIView {
             interactivePhase = .none
             return false
         }
-        PageCurlLatency.mark("flat-frame-done")
+        PageCurlLatency.mark("first-frame-done")
         coverView.isHidden = true
-        catchUpStart = CACurrentMediaTime()
         clockIsTap = false
         startClock()
         return true
@@ -364,14 +371,9 @@ final class PageCurlView: UIView {
         } else {
             springPTo = target >= 0.5 ? landing : grab.p0
         }
-        // Released before the leaf caught the finger (a flick that ended while
-        // the snapshot was taken): bend the path through the finger, or the
-        // drag's angle is lost and the turn plays as a straight peel.
-        if interactivePhase == .catchUp, !reversed {
-            springPControl = fingerAim(p0: grab.p0, aspect: aspect)
-        } else {
-            springPControl = PageCurlGeometry.mix(springPFrom, springPTo, 0.5)
-        }
+        // The leaf is at the finger from the first frame, so the spring
+        // starts on the drag's own aim and keeps its angle.
+        springPControl = PageCurlGeometry.mix(springPFrom, springPTo, 0.5)
         interactivePhase = .spring
         if abs(progress - target) < 0.004, abs(velocity) < 0.02 {
             progress = target
@@ -533,13 +535,7 @@ final class PageCurlView: UIView {
                 pageHeight: pageH
             ))
         }
-        var aim = fingerAim(p0: p0, aspect: aspect)
-        if interactivePhase == .catchUp {
-            let denom = max(fingerProgress, 0.0001)
-            let u = min(1, max(0, progress / denom))
-            aim = PageCurlGeometry.mix(p0, aim, u)
-        }
-        return (p0, aim)
+        return (p0, fingerAim(p0: p0, aspect: aspect))
     }
 
     /// The held point moved by the finger's travel since the touch-down.
@@ -599,15 +595,6 @@ final class PageCurlView: UIView {
         switch interactivePhase {
         case .none:
             return
-        case .catchUp:
-            let duration = PageCurlPanStateMachine.catchUpDuration
-            let elapsed = CACurrentMediaTime() - catchUpStart
-            let u = duration > 0 ? min(1, elapsed / duration) : 1
-            progress = fingerProgress * PageCurlGeometry.easeInOut(CGFloat(u))
-            if u >= 1 {
-                interactivePhase = .track
-                progress = fingerProgress
-            }
         case .track:
             progress = fingerProgress
         case .spring:
@@ -645,7 +632,7 @@ final class PageCurlView: UIView {
     /// the leaf now is. Logged again when the GPU has finished the frame.
     private func latencyFrameLogger() -> ((CFTimeInterval) -> Void)? {
         guard PageCurlDebug.enabled, latencyFrames < 12,
-              interactivePhase == .catchUp || interactivePhase == .track
+              interactivePhase == .track
         else {
             return nil
         }
@@ -817,12 +804,17 @@ private final class PageCurlRenderer {
         _ = await sharedPipeline(for: device)
     }
 
+    /// Both bitmaps upload at once, on the texture loader's own queue, so the
+    /// main actor only waits. A bitmap preloaded at touch-down is already
+    /// (or nearly) a texture.
     func prepare(outgoing: UIImage, incoming: UIImage) async -> Bool {
         guard await ensurePipeline() else {
             return false
         }
-        self.outgoing = texture(from: outgoing)
-        self.incoming = texture(from: incoming)
+        let outgoingUpload = Self.upload(outgoing, loader: loader)
+        let incomingUpload = Self.upload(incoming, loader: loader)
+        self.outgoing = await outgoingUpload.value
+        self.incoming = await incomingUpload.value
         if self.outgoing == nil || self.incoming == nil {
             releaseTextures()
             return false
@@ -1005,15 +997,49 @@ private final class PageCurlRenderer {
         }
     }
 
-    private func texture(from image: UIImage) -> MTLTexture? {
-        guard let cgImage = image.cgImage else {
-            return nil
+    /// Uploads started before the drag was recognised, newest last. Bounded:
+    /// a turn needs two, and the oldest is dropped past `preloadLimit`.
+    private static var preloads: [(image: UIImage, task: Task<MTLTexture?, Never>)] = []
+    private static let preloadLimit = 3
+
+    /// Starts uploading `images` now. `prepare` picks the textures up by bitmap.
+    static func preload(_ images: [UIImage]) {
+        guard let device = cachedDevice ?? MTLCreateSystemDefaultDevice(),
+              let loader = resources(for: device)?.loader
+        else {
+            return
         }
-        return try? loader.newTexture(cgImage: cgImage, options: [
-            .origin: MTKTextureLoader.Origin.topLeft,
-            .SRGB: false,
-            .textureUsage: NSNumber(value: MTLTextureUsage.shaderRead.rawValue),
-        ])
+        for image in images where !preloads.contains(where: { $0.image === image }) {
+            preloads.append((image, startUpload(image, loader: loader)))
+        }
+        if preloads.count > preloadLimit {
+            preloads.removeFirst(preloads.count - preloadLimit)
+        }
+    }
+
+    /// Drag over, reader closing, or the bitmaps went stale.
+    static func dropPreloads() {
+        preloads.removeAll()
+    }
+
+    private static func upload(_ image: UIImage, loader: MTKTextureLoader) -> Task<MTLTexture?, Never> {
+        if let index = preloads.firstIndex(where: { $0.image === image }) {
+            return preloads.remove(at: index).task
+        }
+        return startUpload(image, loader: loader)
+    }
+
+    private static func startUpload(_ image: UIImage, loader: MTKTextureLoader) -> Task<MTLTexture?, Never> {
+        Task { @MainActor in
+            guard let cgImage = image.cgImage else {
+                return nil
+            }
+            return try? await loader.newTexture(cgImage: cgImage, options: [
+                .origin: MTKTextureLoader.Origin.topLeft,
+                .SRGB: false,
+                .textureUsage: NSNumber(value: MTLTextureUsage.shaderRead.rawValue),
+            ])
+        }
     }
 
     /// `MTKView.currentDrawable` is filled at the end of `-draw`. This path

@@ -408,6 +408,12 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             name: UIAccessibility.voiceOverStatusDidChangeNotification,
             object: nil
         )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(releaseCurlPrerender),
+            name: UIApplication.didReceiveMemoryWarningNotification,
+            object: nil
+        )
     }
 
     @available(*, unavailable)
@@ -438,6 +444,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         // A drag in flight must revert. Leaving it resumes in the background
         // and submits Metal work the GPU will abort.
         curlPan?.abort()
+        invalidateCurlPrerender("resign-active")
     }
 
     @objc private func didBecomeActive() {
@@ -510,8 +517,15 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         viewModel.viewSizeWillChange(view.bounds.size)
     }
 
+    /// Closing the reader frees the curl's cached bitmaps.
+    override open func viewDidDisappear(_ animated: Bool) {
+        super.viewDidDisappear(animated)
+        invalidateCurlPrerender("disappear")
+    }
+
     override open func viewWillTransition(to size: CGSize, with coordinator: UIViewControllerTransitionCoordinator) {
         super.viewWillTransition(to: size, with: coordinator)
+        invalidateCurlPrerender("size")
 
         // A spring is still this turn. Resizing under it would commit the old
         // page width onto the new spread. The restore waits until the
@@ -720,6 +734,20 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     /// Commit and cancel no-op once a reload has replaced that spread.
     private var curlSessionGeneration: UInt = 0
     private weak var curlSessionSpread: EPUBSpreadView?
+    /// Neighbour bitmaps for the next drag, taken under the previous turn's
+    /// leaf (T-561j). See `PageCurlPrerenderCache`.
+    private var curlPrerender = PageCurlPrerenderCache()
+    /// Bumped by every change that can alter a page's pixels. A bitmap taken
+    /// under an older generation is never stored or shown from the cache.
+    private var curlContentGeneration = 0
+    /// The page under the finger at the latest touch-down, taken before the
+    /// pan is recognised. Dropped when that touch turns out to be a tap.
+    private var curlTouchDownShot: Task<CurlPageShot?, Never>?
+    /// This drag's pages and the generation they belong to.
+    private var curlDragOutgoing: CurlPageShot?
+    private var curlDragIncoming: UIImage?
+    private var curlDragBeyond: UIImage?
+    private var curlDragGeneration = 0
     private let reflowPosition = ReflowPositionKeeper()
     private var openPointers = OpenPointerSequences()
 
@@ -774,6 +802,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     }
 
     private func _reloadSpreads() {
+        invalidateCurlPrerender("reload")
         // The held spread is about to be destroyed. Leaving the hold set
         // blocks a later hold on the new spread, and the restore never runs.
         reflowPosition.cancelForNavigation()
@@ -1032,6 +1061,9 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                     return DiffableDecoration(decoration: d)
                 }
                 self.decorations[group] = target
+                if source != target {
+                    self.invalidateCurlPrerender("decorations")
+                }
 
                 if decorations.isEmpty {
                     for (_, pageView) in paginationView.loadedViews {
@@ -1096,6 +1128,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     }
 
     public func submitPreferences(_ preferences: EPUBPreferences) {
+        invalidateCurlPrerender("preferences")
         viewModel.submitPreferences(preferences)
         applySettings()
 
@@ -1153,7 +1186,24 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         if !interactiveCurlEnabled {
             curlPan?.abort()
         }
+        invalidateCurlPrerender("accessibility")
         applySettings()
+    }
+
+    @objc private func releaseCurlPrerender() {
+        invalidateCurlPrerender("memory")
+    }
+
+    /// Anything that may change what a page looks like, and the reader
+    /// leaving the screen. Frees the bitmaps and the preloaded textures.
+    private func invalidateCurlPrerender(_ reason: String) {
+        curlContentGeneration &+= 1
+        if PageCurlDebug.enabled, !curlPrerender.isEmpty || curlTouchDownShot != nil {
+            PageCurlDebug.log("curl-cache invalidate reason=\(reason) bytes=\(curlPrerender.byteCount)")
+        }
+        curlPrerender.invalidate()
+        curlTouchDownShot = nil
+        PageCurlView.dropPreloadedTextures()
     }
 
     // MARK: - EPUB-specific extensions
@@ -1303,6 +1353,7 @@ extension EPUBNavigatorViewController: EPUBSpreadViewDelegate {
     }
 
     func spreadViewDidLoad(_ spreadView: EPUBSpreadView) async {
+        invalidateCurlPrerender("spread-load")
         let templates = config.decorationTemplates.reduce(into: [String: JSONValue]()) { styles, item in
             styles[item.key.rawValue] = .object(item.value.jsonObject)
         }
@@ -1354,6 +1405,9 @@ extension EPUBNavigatorViewController: EPUBSpreadViewDelegate {
         }
         guard let delivered else {
             return
+        }
+        if state == .idle, delivered.phase == .up || delivered.phase == .cancel {
+            dropCurlTouchDownShot()
         }
         openPointers.note(delivered)
         Task {
@@ -1556,6 +1610,7 @@ extension EPUBNavigatorViewController: PaginationViewDelegate {
     }
 
     func paginationViewDidUpdateViews(_ paginationView: PaginationView) {
+        invalidateCurlPrerender("views")
         // Note that you should set the delegate before you load views
         // otherwise, when open the publication, you may miss the first
         // invocation.
@@ -1594,6 +1649,7 @@ extension EPUBNavigatorViewController: PaginationViewDelegate {
             releaseCurlSuppressionIfIdle()
             return
         }
+        invalidateCurlPrerender("fold")
         if let spread = paginationView?.currentView as? EPUBSpreadView,
            spread.isSpreadReadyForPresentation,
            !reflowPosition.isHolding
@@ -1670,11 +1726,47 @@ extension EPUBNavigatorViewController: PageCurlPanDelegate {
         paginationView
     }
 
+    /// A finger landed while idle. Snapshot the page now, while the pan is
+    /// still deciding, and start uploading it and the cached forward
+    /// neighbour. Nothing moves and nothing covers the page, so a tap, a
+    /// vertical scroll or a selection is unaffected; the shot is dropped when
+    /// the touch ends without a drag.
+    func curlPanTouchDown() {
+        guard state == .idle, interactiveCurlEnabled, currentSelection == nil,
+              let spread = paginationView?.currentView as? EPUBSpreadView,
+              spread.isSpreadReadyForPresentation
+        else {
+            return
+        }
+        let background = viewModel.settings.effectiveBackgroundColor.uiColor
+        let key = curlPageKey(for: spread)
+        let forward = curlPrerender.key == key
+            ? (try? curlPrerender.neighbor(.forward, key: key, onScreen: curlPrerender.current).get())
+            : nil
+        curlTouchDownShot = Task { @MainActor [weak spread] in
+            guard let spread, let image = await PageCurlSnapshotter.capture(
+                of: spread,
+                backgroundColor: background,
+                afterScreenUpdates: false
+            ) else {
+                return nil
+            }
+            PageCurlLatency.mark("touch-outgoing")
+            PageCurlView.preloadTextures([image] + (forward.map { [$0] } ?? []))
+            let fingerprint = await Self.fingerprint(of: image)
+            return CurlPageShot(image: image, background: background, key: key, fingerprint: fingerprint)
+        }
+    }
+
     func curlPanDidBegin(direction: PageCurlTurnDirection) -> Bool {
         let accepted = on(.interactiveMove(spreadDirection(for: direction)))
         if accepted {
             curlSessionGeneration = paginationView?.turnGeneration ?? 0
             curlSessionSpread = paginationView?.currentView as? EPUBSpreadView
+            curlDragGeneration = curlContentGeneration
+            curlDragOutgoing = nil
+            curlDragIncoming = nil
+            curlDragBeyond = nil
         }
         return accepted
     }
@@ -1683,7 +1775,15 @@ extension EPUBNavigatorViewController: PageCurlPanDelegate {
         guard let spread = paginationView?.currentView as? EPUBSpreadView else {
             return nil
         }
+        let pending = curlTouchDownShot
+        curlTouchDownShot = nil
+        // The touch-down shot is this page if nothing moved or changed since.
+        if let pending, let shot = await pending.value, shot.key == curlPageKey(for: spread) {
+            curlDragOutgoing = shot
+            return (shot.image, shot.background)
+        }
         let background = viewModel.settings.effectiveBackgroundColor.uiColor
+        let key = curlPageKey(for: spread)
         guard let image = await PageCurlSnapshotter.capture(
             of: spread,
             backgroundColor: background,
@@ -1691,6 +1791,7 @@ extension EPUBNavigatorViewController: PageCurlPanDelegate {
         ) else {
             return nil
         }
+        curlDragOutgoing = CurlPageShot(image: image, background: background, key: key, fingerprint: nil)
         return (image, background)
     }
 
@@ -1719,9 +1820,18 @@ extension EPUBNavigatorViewController: PageCurlPanDelegate {
         let spreadDirection = spreadDirection(for: direction)
 
         if spread.canGo(to: spreadDirection), let reflow = spread as? EPUBReflowableSpreadView {
-            guard let incoming = await reflow.prepareCurlIncoming(direction: spreadDirection, background: background) else {
-                return nil
+            let incoming: UIImage
+            if let cached = cachedCurlNeighbor(direction, on: reflow),
+               reflow.beginCurlIncomingScroll(direction: spreadDirection)
+            {
+                incoming = cached
+            } else {
+                guard let shot = await reflow.prepareCurlIncoming(direction: spreadDirection, background: background) else {
+                    return nil
+                }
+                incoming = shot
             }
+            curlDragIncoming = incoming
             return PageCurlPanFrame(
                 outgoing: outgoing,
                 incoming: incoming,
@@ -1749,12 +1859,27 @@ extension EPUBNavigatorViewController: PageCurlPanDelegate {
         )
     }
 
+    /// Runs while the committed leaf springs to rest: renders the column past
+    /// the incoming one under the cover, so the next drag the same way finds it.
+    func curlPanPrerenderBeyond(direction: PageCurlTurnDirection, withinResource: Bool) async {
+        guard withinResource, curlSessionCurrent, curlDragGeneration == curlContentGeneration,
+              let reflow = curlSessionSpread as? EPUBReflowableSpreadView
+        else {
+            return
+        }
+        let background = viewModel.settings.effectiveBackgroundColor.uiColor
+        let image = await reflow.prerenderCurlBeyond(direction: spreadDirection(for: direction), background: background)
+        PageCurlLatency.mark("prerender-beyond", "ok=\(image != nil)")
+        curlDragBeyond = image
+    }
+
     func curlPanCommit(direction: PageCurlTurnDirection, withinResource: Bool) async {
         guard curlSessionCurrent else {
             return
         }
         if withinResource {
             await (curlSessionSpread as? EPUBReflowableSpreadView)?.commitCurlIncoming()
+            storeCommittedCurlPages(direction: direction)
             return
         }
         await paginationView?.commitCurlNeighbor(forward: direction == .forward)
@@ -1770,6 +1895,7 @@ extension EPUBNavigatorViewController: PageCurlPanDelegate {
             return
         }
         await (curlSessionSpread as? EPUBReflowableSpreadView)?.revertCurlIncoming()
+        storeCancelledCurlPages(direction: direction)
         // The revert clears progression suppression. A posture or size change
         // that aborted this drag has already taken its hold, and the relayout
         // it is about to run must stay suppressed.
@@ -1779,9 +1905,114 @@ extension EPUBNavigatorViewController: PageCurlPanDelegate {
     }
 
     func curlPanDidFinish() {
+        curlDragOutgoing = nil
+        curlDragIncoming = nil
+        curlDragBeyond = nil
         if case .interactiveMoving = state {
             on(.moved)
         }
+    }
+
+    private func curlPageKey(for spread: EPUBSpreadView) -> PageCurlPageKey {
+        PageCurlPageKey(
+            spread: ObjectIdentifier(spread),
+            offsetX: spread.scrollView.contentOffset.x,
+            size: spread.bounds.size,
+            contentGeneration: curlContentGeneration
+        )
+    }
+
+    /// The cached neighbour, if it belongs to this column and generation and
+    /// the page under the finger still matches the one it was taken next to.
+    private func cachedCurlNeighbor(_ direction: PageCurlTurnDirection, on spread: EPUBSpreadView) -> UIImage? {
+        guard curlDragGeneration == curlContentGeneration else {
+            return nil
+        }
+        let result = curlPrerender.neighbor(
+            direction,
+            key: curlPageKey(for: spread),
+            onScreen: curlDragOutgoing?.fingerprint
+        )
+        switch result {
+        case let .success(image):
+            PageCurlLatency.mark("cache-hit", "direction=\(direction)")
+            return image
+        case let .failure(miss):
+            PageCurlLatency.mark("cache-miss", "direction=\(direction) reason=\(miss)")
+            return nil
+        }
+    }
+
+    /// After a committed turn inside the resource: the incoming page is on
+    /// screen, the outgoing page is behind it, and the prerender (if any) is
+    /// past it. Nothing is stored if anything changed during the drag.
+    private func storeCommittedCurlPages(direction: PageCurlTurnDirection) {
+        guard curlDragGeneration == curlContentGeneration,
+              let spread = curlSessionSpread,
+              let incoming = curlDragIncoming
+        else {
+            return
+        }
+        let key = curlPageKey(for: spread)
+        let behind = curlDragOutgoing?.image
+        let beyond = curlDragBeyond
+        curlPrerender.store(
+            key: key,
+            current: nil,
+            forward: direction == .forward ? beyond : behind,
+            backward: direction == .forward ? behind : beyond
+        )
+        fillCurlFingerprint(of: incoming, key: key)
+    }
+
+    /// A cancelled drag leaves the outgoing page on screen and has just
+    /// rendered the neighbour it peeked at.
+    private func storeCancelledCurlPages(direction: PageCurlTurnDirection) {
+        guard curlDragGeneration == curlContentGeneration,
+              let spread = curlSessionSpread,
+              let incoming = curlDragIncoming,
+              let outgoing = curlDragOutgoing
+        else {
+            return
+        }
+        let key = curlPageKey(for: spread)
+        guard key == outgoing.key else {
+            return
+        }
+        curlPrerender.set(incoming, for: direction, key: key, current: outgoing.fingerprint)
+        if outgoing.fingerprint == nil {
+            fillCurlFingerprint(of: outgoing.image, key: key)
+        }
+    }
+
+    /// The fingerprint of the page now on screen, computed off the main actor.
+    private func fillCurlFingerprint(of image: UIImage, key: PageCurlPageKey) {
+        Task { @MainActor [weak self] in
+            let fingerprint = await Self.fingerprint(of: image)
+            guard let self, let fingerprint else {
+                return
+            }
+            self.curlPrerender.setCurrent(fingerprint, key: key)
+            PageCurlDebug.log("curl-cache stored key=\(key.offsetX) bytes=\(self.curlPrerender.byteCount) empty=\(self.curlPrerender.isEmpty)")
+        }
+    }
+
+    private static func fingerprint(of image: UIImage) async -> PageCurlFingerprint? {
+        guard let cgImage = image.cgImage else {
+            return nil
+        }
+        return await Task.detached(priority: .userInitiated) {
+            PageCurlFingerprint.of(cgImage)
+        }.value
+    }
+
+    /// A tap or a scroll ended without a drag: its touch-down shot is unused.
+    private func dropCurlTouchDownShot() {
+        guard curlTouchDownShot != nil, curlPan?.turnInFlight != true else {
+            return
+        }
+        curlTouchDownShot = nil
+        PageCurlView.dropPreloadedTextures()
     }
 
     private func canCurl(forward: Bool) -> Bool {
@@ -1797,4 +2028,12 @@ extension EPUBNavigatorViewController: PageCurlPanDelegate {
         let rtl = viewModel.readingProgression == .rtl
         return PageCurlPanStateMachine.spreadGoesRight(forward: forward, rtl: rtl) ? .right : .left
     }
+}
+
+/// A page bitmap and what was on screen when it was taken.
+private struct CurlPageShot {
+    var image: UIImage
+    var background: UIColor
+    var key: PageCurlPageKey
+    var fingerprint: PageCurlFingerprint?
 }

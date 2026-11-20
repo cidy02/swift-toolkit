@@ -24,6 +24,9 @@ struct PageCurlPanFrame {
 protocol PageCurlPanDelegate: AnyObject {
     func curlPanContext(in view: UIView) -> PageCurlPanContext
     func curlPanHostView() -> UIView?
+    /// First finger down while idle, before the pan is recognised. May start
+    /// work that has no visible effect; the delegate drops it if no drag follows.
+    func curlPanTouchDown()
     func curlPanDidBegin(direction: PageCurlTurnDirection) -> Bool
     func curlPanCaptureOutgoing() async -> (image: UIImage, background: UIColor)?
     func curlPanRevealIncoming(
@@ -31,6 +34,8 @@ protocol PageCurlPanDelegate: AnyObject {
         outgoing: UIImage,
         background: UIColor
     ) async -> PageCurlPanFrame?
+    /// Runs alongside the committing spring, before `curlPanCommit`.
+    func curlPanPrerenderBeyond(direction: PageCurlTurnDirection, withinResource: Bool) async
     func curlPanCommit(direction: PageCurlTurnDirection, withinResource: Bool) async
     func curlPanCancel(direction: PageCurlTurnDirection, withinResource: Bool) async
     func curlPanDidFinish()
@@ -172,6 +177,9 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
             touchDownTouch = touch
             sawAnotherTouch = false
             PageCurlLatency.touchDown(at: touch.timestamp, x: touch.location(in: view).x)
+            if isEnabled, touch.type == .direct {
+                delegate?.curlPanTouchDown()
+            }
         } else if touch !== touchDownTouch {
             sawAnotherTouch = true
         }
@@ -426,6 +434,16 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
         let width = delegate?.curlPanHostView()?.bounds.width ?? 1
         let progressVelocity = width > 1 ? velocity / width : 0
         let willCommit = commit && !aborted
+        // The leaf covers the web view for the whole spring, so the next
+        // column can be rendered behind it now instead of at the next touch.
+        var prerender: Task<Void, Never>?
+        if willCommit, revealed, let delegate {
+            let direction = direction
+            let withinResource = withinResource
+            prerender = Task { @MainActor in
+                await delegate.curlPanPrerenderBeyond(direction: direction, withinResource: withinResource)
+            }
+        }
         // Teardown releases the textures, which resumes this wait immediately.
         // Skip the spring: Reduce Motion and a reload must not keep animating.
         if !aborted, metalArmed, let curlView {
@@ -436,6 +454,7 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
                 progressVelocity: willCommit ? progressVelocity : min(0, progressVelocity)
             )
         }
+        await prerender?.value
         // `aborted` may flip during the spring. A stale finish must not commit
         // onto a navigator that reloaded while the leaf was moving. The delegate
         // also drops the call when the spread it prepared is gone.
@@ -470,6 +489,7 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
     }
 
     private func tearDown() {
+        PageCurlView.dropPreloadedTextures()
         curlView?.releaseResources()
         curlView?.removeFromSuperview()
         curlView = nil
