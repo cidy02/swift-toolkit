@@ -85,6 +85,18 @@ enum PageCurlPanStateMachine {
         preference == .curl && !scrolls && !reduceMotion && !voiceOverRunning
     }
 
+    /// Interactive finger-following page turn: Curl and lifted-card Slide in
+    /// paged mode, with Reduce Motion and VoiceOver off. Fast Fade and None
+    /// leave the pan off.
+    static func allowsInteractiveTurn(
+        preference: PageTransition,
+        scrolls: Bool,
+        reduceMotion: Bool,
+        voiceOverRunning: Bool
+    ) -> Bool {
+        (preference == .curl || preference == .slide) && !scrolls && !reduceMotion && !voiceOverRunning
+    }
+
     static func shouldBegin(sample: PageCurlPanSample, context: PageCurlPanContext) -> PageCurlPanBegin {
         guard context.acceptsGesture, context.interactiveCurlEnabled else {
             return .rejectDisabled

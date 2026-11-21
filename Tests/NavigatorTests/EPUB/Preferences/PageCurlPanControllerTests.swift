@@ -19,6 +19,12 @@ class PageCurlPanControllerTests: XCTestCase {
         var touchDowns = 0
         var sequencesEnded = 0
         var accepts = false
+        var hostView: UIView?
+        var makeSlide = false
+        var overlayMade: (any PageTurnOverlayView)?
+        var didFinish = 0
+        var didCancel = 0
+        var sampleImage: UIImage?
 
         func curlPanContext(in view: UIView) -> PageCurlPanContext {
             PageCurlPanContext(
@@ -32,20 +38,39 @@ class PageCurlPanControllerTests: XCTestCase {
             )
         }
 
-        func curlPanHostView() -> UIView? { nil }
+        func curlPanHostView() -> UIView? { hostView }
+        func curlPanMakeOverlayView(frame: CGRect) -> any PageTurnOverlayView {
+            let view: any PageTurnOverlayView = makeSlide ? PageSlideView(frame: frame) : PageCurlView(frame: frame)
+            overlayMade = view
+            return view
+        }
         func curlPanTouchDown() { touchDowns += 1 }
         func curlPanTouchSequenceEnded() { sequencesEnded += 1 }
         func curlPanDidBegin(direction: PageCurlTurnDirection) -> Bool { accepts }
-        func curlPanCaptureOutgoing() async -> (image: UIImage, background: UIColor)? { nil }
+        func curlPanCaptureOutgoing() async -> (image: UIImage, background: UIColor)? {
+            sampleImage.map { ($0, .black) }
+        }
         func curlPanRevealIncoming(
             direction: PageCurlTurnDirection,
             outgoing: UIImage,
             background: UIColor
-        ) async -> PageCurlPanFrame? { nil }
+        ) async -> PageCurlPanFrame? {
+            guard let img = sampleImage else { return nil }
+            return PageCurlPanFrame(
+                outgoing: outgoing,
+                incoming: img,
+                background: background,
+                spine: .leading,
+                peelSign: 1,
+                realVerso: false,
+                withinResource: true,
+                reversed: direction == .backward
+            )
+        }
         func curlPanPrerenderBeyond(direction: PageCurlTurnDirection, withinResource: Bool) async {}
         func curlPanCommit(direction: PageCurlTurnDirection, withinResource: Bool) async {}
-        func curlPanCancel(direction: PageCurlTurnDirection, withinResource: Bool) async {}
-        func curlPanDidFinish() {}
+        func curlPanCancel(direction: PageCurlTurnDirection, withinResource: Bool) async { didCancel += 1 }
+        func curlPanDidFinish() { didFinish += 1 }
     }
 
     func testASequenceThatEndsWithoutADragIsReported() {
@@ -71,5 +96,44 @@ class PageCurlPanControllerTests: XCTestCase {
         XCTAssertTrue(controller.turnInFlight)
         controller.recognizer.reset()
         XCTAssertEqual(delegate.sequencesEnded, 0)
+    }
+
+    /// Slide shares the curl's pan controller and installs `PageSlideView`
+    /// through the overlay factory, then tears down cleanly on `abortDrag`.
+    func testSlideDragInstallsPageSlideViewAndAbortsCleanly() async {
+        let bounds = CGRect(x: 0, y: 0, width: 402, height: 874)
+        let window = UIWindow(frame: bounds)
+        let host = UIView(frame: bounds)
+        window.addSubview(host)
+        window.makeKeyAndVisible()
+
+        let renderer = UIGraphicsImageRenderer(size: CGSize(width: 20, height: 20))
+        let img = renderer.image { ctx in
+            UIColor.black.setFill()
+            ctx.fill(CGRect(x: 0, y: 0, width: 20, height: 20))
+        }
+
+        let controller = PageCurlPanController()
+        let delegate = Delegate()
+        delegate.accepts = true
+        delegate.hostView = host
+        delegate.makeSlide = true
+        delegate.sampleImage = img
+        controller.delegate = delegate
+        controller.attach(to: host)
+
+        controller.begin(controller.recognizer)
+        // Let the prepare task arm the slide overlay.
+        for _ in 0 ..< 20 where !controller.isCovering {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertTrue(delegate.overlayMade is PageSlideView)
+        XCTAssertTrue(controller.isCovering)
+
+        await controller.abortDrag()
+        XCTAssertFalse(controller.turnInFlight)
+        XCTAssertFalse(controller.isCovering)
+        XCTAssertEqual(delegate.didCancel, 1)
+        XCTAssertEqual(delegate.didFinish, 1)
     }
 }

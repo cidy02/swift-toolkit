@@ -74,6 +74,30 @@ class PageCurlPanStateMachineTests: XCTestCase {
         ))
     }
 
+    func testInteractiveTurnAllowsCurlAndSlideOnly() {
+        XCTAssertTrue(PageCurlPanStateMachine.allowsInteractiveTurn(
+            preference: .curl, scrolls: false, reduceMotion: false, voiceOverRunning: false
+        ))
+        XCTAssertTrue(PageCurlPanStateMachine.allowsInteractiveTurn(
+            preference: .slide, scrolls: false, reduceMotion: false, voiceOverRunning: false
+        ))
+        XCTAssertFalse(PageCurlPanStateMachine.allowsInteractiveTurn(
+            preference: .fade, scrolls: false, reduceMotion: false, voiceOverRunning: false
+        ))
+        XCTAssertFalse(PageCurlPanStateMachine.allowsInteractiveTurn(
+            preference: .none, scrolls: false, reduceMotion: false, voiceOverRunning: false
+        ))
+        XCTAssertFalse(PageCurlPanStateMachine.allowsInteractiveTurn(
+            preference: .slide, scrolls: true, reduceMotion: false, voiceOverRunning: false
+        ))
+        XCTAssertFalse(PageCurlPanStateMachine.allowsInteractiveTurn(
+            preference: .slide, scrolls: false, reduceMotion: true, voiceOverRunning: false
+        ))
+        XCTAssertFalse(PageCurlPanStateMachine.allowsInteractiveTurn(
+            preference: .slide, scrolls: false, reduceMotion: false, voiceOverRunning: true
+        ))
+    }
+
     func testDistanceThresholdAndVelocityProjection() {
         // Strictly above 0.35. Sitting on the line is not a commit.
         XCTAssertEqual(

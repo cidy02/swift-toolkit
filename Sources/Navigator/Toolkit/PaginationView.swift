@@ -285,7 +285,7 @@ final class PaginationView: UIView, Loggable {
     /// The generation a finger curl captured when it began. Commit and cancel
     /// compare against it so a reload cannot receive the stale turn.
     var turnGeneration: UInt { reloadGeneration }
-    private weak var activeCurlView: PageCurlView?
+    private weak var activeCurlView: (any PageTurnOverlayView)?
     /// A posture cancel removed the cover. The turn's defer must not clear
     /// progression suppression a reflow hold just took.
     private var curlCancelKeepsSuppression = false
@@ -509,9 +509,9 @@ final class PaginationView: UIView, Loggable {
         case (.fade, _):
             await crossfadeToView(at: index, location: location)
         case (.curl, 1):
-            await curlToView(at: index, location: location)
+            await turnToViewWithOverlay(at: index, location: location, style: .curl)
         case (.slide, 1):
-            await slideToView(at: index, location: location, animated: true)
+            await turnToViewWithOverlay(at: index, location: location, style: .slide)
         case (.slide, _):
             // A jump keeps the historical dip. A curl across chapters is a
             // fade before this switch.
@@ -622,9 +622,9 @@ final class PaginationView: UIView, Loggable {
         return view
     }
 
-    /// Neighbour resource. The outgoing leaf stays up, opaque, until the
-    /// incoming spread has loaded and painted, then the cylinder runs.
-    private func curlToView(at index: Int, location: PageLocation) async {
+    /// Neighbour resource curl or lifted-card slide. The outgoing cover stays up,
+    /// opaque, until the incoming spread has loaded and painted, then the overlay runs.
+    private func turnToViewWithOverlay(at index: Int, location: PageLocation, style: PageTransition) async {
         let generation = reloadGeneration
         let source = loadedViews[currentIndex] ?? self
         let background = transitionBackgroundColor
@@ -660,23 +660,26 @@ final class PaginationView: UIView, Loggable {
             divisionNormalizedX: divisionNormalizedX
         )
         let divisionText = divisionNormalizedX.map { String(format: "%.3f", $0) } ?? "nil"
-        log(.info, "curl-spine columns=\(columns) division=\(divisionText) spine=\(spine) forward=\(forward)")
-        PageCurlDebug.log("curl-spine columns=\(columns) division=\(divisionText) spine=\(spine) forward=\(forward)")
-        let curl = PageCurlView(frame: bounds)
-        curl.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-        curl.showCover(outgoing, background: background)
-        addSubview(curl)
-        activeCurlView = curl
+        let logPrefix = style == .slide ? "slide-spine" : "curl-spine"
+        log(.info, "\(logPrefix) columns=\(columns) division=\(divisionText) spine=\(spine) forward=\(forward)")
+        PageCurlDebug.log("\(logPrefix) columns=\(columns) division=\(divisionText) spine=\(spine) forward=\(forward)")
+        let overlay: any PageTurnOverlayView = style == .slide
+            ? PageSlideView(frame: bounds)
+            : PageCurlView(frame: bounds)
+        overlay.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        overlay.showCover(outgoing, background: background)
+        addSubview(overlay)
+        activeCurlView = overlay
 
         var ownsFlags = false
         defer {
             let keepSuppression = curlCancelKeepsSuppression
             curlCancelKeepsSuppression = false
-            if activeCurlView === curl {
+            if activeCurlView === overlay {
                 activeCurlView = nil
             }
-            curl.releaseResources()
-            curl.removeFromSuperview()
+            overlay.releaseResources()
+            overlay.removeFromSuperview()
             // A reload already reset these for the new spread. Writing them
             // again would unpin that spread or re-enable a scroll it disabled.
             if ownsFlags, generation == reloadGeneration {
@@ -713,18 +716,19 @@ final class PaginationView: UIView, Loggable {
         }
         switch PageCurlGeometry.incomingReveal(snapshotSucceeded: shot != nil) {
         case .crossfade:
-            await PageTransitionAnimator.fade(curl, to: 0, duration: PageTransitionAnimator.fadeDuration)
+            await PageTransitionAnimator.fade(overlay, to: 0, duration: PageTransitionAnimator.fadeDuration)
         case .cylinder:
-            guard let shot else {
+            guard let shot, UIApplication.shared.applicationState == .active else {
                 return
             }
-            await curl.runTap(
+            await overlay.runTap(
                 outgoing: outgoing,
                 incoming: shot,
                 spine: spine,
                 peelSign: PageCurlGeometry.peelSign(spine: spine, rtl: rtl, forward: forward),
                 realVerso: columns >= 2,
-                reversed: PageCurlGeometry.playsReversed(renderedColumns: columns, forward: forward)
+                reversed: PageCurlGeometry.playsReversed(renderedColumns: columns, forward: forward),
+                duration: style == .slide ? PageSlideGeometry.tapDuration : PageCurlGeometry.tapDuration
             )
         }
     }

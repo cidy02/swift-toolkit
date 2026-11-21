@@ -25,6 +25,7 @@ struct PageCurlPanFrame {
 protocol PageCurlPanDelegate: AnyObject {
     func curlPanContext(in view: UIView) -> PageCurlPanContext
     func curlPanHostView() -> UIView?
+    func curlPanMakeOverlayView(frame: CGRect) -> any PageTurnOverlayView
     /// First finger down while idle, before the pan is recognised. May start
     /// work that has no visible effect; the delegate drops it if no drag follows.
     func curlPanTouchDown()
@@ -43,6 +44,12 @@ protocol PageCurlPanDelegate: AnyObject {
     func curlPanCommit(direction: PageCurlTurnDirection, withinResource: Bool) async
     func curlPanCancel(direction: PageCurlTurnDirection, withinResource: Bool) async
     func curlPanDidFinish()
+}
+
+extension PageCurlPanDelegate {
+    func curlPanMakeOverlayView(frame: CGRect) -> any PageTurnOverlayView {
+        PageCurlView(frame: frame)
+    }
 }
 
 /// Horizontal pan that lifts the page under the finger. Scroll mode, Reduce
@@ -66,7 +73,7 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
     private var phase: Phase = .idle
     private var direction: PageCurlTurnDirection = .forward
     private var withinResource = false
-    private var curlView: PageCurlView?
+    private var curlView: (any PageTurnOverlayView)?
     private var metalArmed = false
     private var revealed = false
     /// Last tracked finger, velocities and the release decision.
@@ -327,7 +334,7 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
             return
         }
 
-        let curl = PageCurlView(frame: host.bounds)
+        let curl = delegate.curlPanMakeOverlayView(frame: host.bounds)
         curl.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         curl.showCover(shot.image, background: shot.background)
         host.addSubview(curl)

@@ -59,9 +59,9 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         )
     }
 
-    /// The curl overlay, if a turn is in flight. Cleared with the spread so a
-    /// reload or a close cannot leave the display link running.
-    private weak var activeCurlView: PageCurlView?
+    /// The curl or slide overlay, if a turn is in flight. Cleared with the spread
+    /// so a reload or a close cannot leave the display link running.
+    private weak var activeCurlView: (any PageTurnOverlayView)?
     /// A posture cancel removed the cover. The turn's defer must not clear
     /// progression suppression a reflow hold just took.
     private var curlCancelKeepsSuppression = false
@@ -307,9 +307,9 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         case .fade:
             await fade(by: offsetX)
         case .curl:
-            await curl(by: offsetX, direction: direction)
+            await turnWithOverlay(by: offsetX, direction: direction, style: .curl)
         case .slide:
-            await slide(by: offsetX)
+            await turnWithOverlay(by: offsetX, direction: direction, style: .slide)
         case .none:
             await evaluateScript("window.scrollBy({ left: \(offsetX), behavior: 'instant' });")
         }
@@ -317,11 +317,11 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         return true
     }
 
-    /// Cylinder curl. The outgoing bitmap is up before the column scrolls.
-    /// The incoming bitmap is taken after the paint wait, then the leaf lifts.
-    /// Progression stays suppressed until the leaf is gone, so the scroll
-    /// reports one location.
-    private func curl(by offsetX: CGFloat, direction: Direction) async {
+    /// Cylinder curl or lifted-card slide. The outgoing bitmap is up before the
+    /// column scrolls. The incoming bitmap is taken after the paint wait, then
+    /// the overlay animates. Progression stays suppressed until the overlay is
+    /// gone, so the scroll reports one location.
+    private func turnWithOverlay(by offsetX: CGFloat, direction: Direction, style: PageTransition) async {
         setSuppressingProgressionUpdates(true)
         let generation = curlContentGeneration?()
         let startOffset = scrollView.contentOffset.x
@@ -359,24 +359,27 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
             divisionNormalizedX: divisionX
         )
         let divisionText = divisionX.map { String(format: "%.3f", $0) } ?? "nil"
-        log(.info, "curl-spine columns=\(columns) division=\(divisionText) spine=\(spine) forward=\(forward)")
-        PageCurlDebug.log("curl-spine columns=\(columns) division=\(divisionText) spine=\(spine) forward=\(forward)")
-        let curlView = PageCurlView(frame: bounds)
-        curlView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-        curlView.showCover(outgoing, background: background)
-        addSubview(curlView)
-        activeCurlView = curlView
+        let logPrefix = style == .slide ? "slide-spine" : "curl-spine"
+        log(.info, "\(logPrefix) columns=\(columns) division=\(divisionText) spine=\(spine) forward=\(forward)")
+        PageCurlDebug.log("\(logPrefix) columns=\(columns) division=\(divisionText) spine=\(spine) forward=\(forward)")
+        let overlayView: any PageTurnOverlayView = style == .slide
+            ? PageSlideView(frame: bounds)
+            : PageCurlView(frame: bounds)
+        overlayView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        overlayView.showCover(outgoing, background: background)
+        addSubview(overlayView)
+        activeCurlView = overlayView
         // False once cancelled, even while a frozen cover is still up.
-        let running = { [weak self, weak curlView] in
-            curlView != nil && curlView?.superview != nil && self?.activeCurlView === curlView
+        let running = { [weak self, weak overlayView] in
+            overlayView != nil && overlayView?.superview != nil && self?.activeCurlView === overlayView
         }
         defer {
-            if activeCurlView === curlView {
+            if activeCurlView === overlayView {
                 activeCurlView = nil
             }
             activeCurlLanding = nil
-            curlView.releaseResources()
-            curlView.removeFromSuperview()
+            overlayView.releaseResources()
+            overlayView.removeFromSuperview()
             let keepSuppression = curlCancelKeepsSuppression
             curlCancelKeepsSuppression = false
             if superview != nil, !keepSuppression {
@@ -394,12 +397,12 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         }
         switch PageCurlGeometry.incomingReveal(snapshotSucceeded: shot != nil) {
         case .crossfade:
-            await PageTransitionAnimator.fade(curlView, to: 0, duration: PageTransitionAnimator.fadeDuration)
+            await PageTransitionAnimator.fade(overlayView, to: 0, duration: PageTransitionAnimator.fadeDuration)
         case .cylinder:
             guard let shot else {
                 return
             }
-            // The leaf covers the web view while it runs: render the column
+            // The overlay covers the web view while it runs: render the column
             // past this one behind it, as a drag's spring does.
             let target = startOffset + offsetX
             activeCurlLanding = shot
@@ -411,21 +414,22 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
                     covered: running
                 )
             }
-            // Resigned active since the curl began (the cover's own observer
-            // already fired): no GPU turn. The cover shows the landing page
-            // while the render past it steps back.
+            // Resigned active since the turn began (the cover's own observer
+            // already fired): skip the animation. The cover shows the landing
+            // page while the render past it steps back.
             guard UIApplication.shared.applicationState == .active else {
                 stopActiveCurl()
                 _ = await beyond.value
                 return
             }
-            await curlView.runTap(
+            await overlayView.runTap(
                 outgoing: outgoing,
                 incoming: shot,
                 spine: spine,
                 peelSign: PageCurlGeometry.peelSign(spine: spine, rtl: rtl, forward: forward),
                 realVerso: columns >= 2,
-                reversed: PageCurlGeometry.playsReversed(renderedColumns: columns, forward: forward)
+                reversed: PageCurlGeometry.playsReversed(renderedColumns: columns, forward: forward),
+                duration: style == .slide ? PageSlideGeometry.tapDuration : PageCurlGeometry.tapDuration
             )
             let beyondImage = await beyond.value
             if let generation, curlHostAttached, running(),

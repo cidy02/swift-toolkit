@@ -85,7 +85,7 @@ enum PageCurlSnapshotter {
         if let web = view as? WKWebView {
             found.append(web)
         }
-        for subview in view.subviews where !(subview is PageCurlView) {
+        for subview in view.subviews where !(subview is any PageTurnOverlayView) {
             found.append(contentsOf: webViews(in: subview))
         }
         return found

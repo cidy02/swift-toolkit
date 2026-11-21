@@ -12,7 +12,7 @@ import UIKit
 /// synthetic grab from the lower corner. A finger sets `progress` and the
 /// grab points itself. Nothing in here times the shader.
 @MainActor
-final class PageCurlView: UIView {
+final class PageCurlView: UIView, PageTurnOverlayView {
     private let coverView = UIImageView()
     private let incomingCover = UIImageView()
     private var metalView: MTKView?
@@ -807,7 +807,7 @@ private final class PageCurlClock: NSObject {
     }
 }
 
-private extension UIColor {
+extension UIColor {
     var pageCurlRGB: PageCurlRGB {
         var r: CGFloat = 1
         var g: CGFloat = 1
@@ -819,7 +819,7 @@ private extension UIColor {
         return PageCurlRGB(r: 1, g: 1, b: 1)
     }
 
-    var mtlClearColor: MTLClearColor {
+    fileprivate var mtlClearColor: MTLClearColor {
         let rgb = pageCurlRGB
         return MTLClearColor(red: Double(rgb.r), green: Double(rgb.g), blue: Double(rgb.b), alpha: 1)
     }

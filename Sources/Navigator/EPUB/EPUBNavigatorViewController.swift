@@ -747,6 +747,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     /// Commit and cancel no-op once a reload has replaced that spread.
     private var curlSessionGeneration: UInt = 0
     private weak var curlSessionSpread: EPUBSpreadView?
+    private var curlSessionTransition: PageTransition = .curl
     /// Neighbour bitmaps for the next drag, taken under the previous turn's
     /// leaf. See `PageCurlPrerenderCache`.
     private var curlPrerender = PageCurlPrerenderCache()
@@ -874,8 +875,8 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
     // MARK: - Navigator
 
-    private var interactiveCurlEnabled: Bool {
-        PageCurlPanStateMachine.allowsInteractiveCurl(
+    private var interactiveTurnEnabled: Bool {
+        PageCurlPanStateMachine.allowsInteractiveTurn(
             preference: settings.pageTransition,
             scrolls: settings.scroll,
             reduceMotion: UIAccessibility.isReduceMotionEnabled,
@@ -884,7 +885,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     }
 
     private var isPaginationViewScrollingEnabled: Bool {
-        !(config.disablePageTurnsWhileScrolling && settings.scroll) && !interactiveCurlEnabled
+        !(config.disablePageTurnsWhileScrolling && settings.scroll) && !interactiveTurnEnabled
     }
 
     public var presentation: VisualNavigatorPresentation {
@@ -1169,13 +1170,13 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         }
 
         view.backgroundColor = settings.effectiveBackgroundColor.uiColor
-        let curl = interactiveCurlEnabled
+        let interactive = interactiveTurnEnabled
         paginationView?.isScrollEnabled = isPaginationViewScrollingEnabled
         paginationView?.pageTransition = settings.pageTransition
         paginationView?.scrolls = settings.scroll
         paginationView?.transitionBackgroundColor = settings.effectiveBackgroundColor.uiColor
-        curlPan?.isEnabled = curl
-        applySpreadPanPolicy(interactiveCurl: curl)
+        curlPan?.isEnabled = interactive
+        applySpreadPanPolicy(interactiveCurl: interactive)
         if settings.pageTransition == .curl {
             PageCurlView.prewarm()
         }
@@ -1205,7 +1206,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     }
 
     @objc private func curlAccessibilityChanged() {
-        if !interactiveCurlEnabled {
+        if !interactiveTurnEnabled {
             curlPan?.abort(keepingCover: true)
         }
         invalidateCurlPrerender("accessibility")
@@ -1430,8 +1431,8 @@ extension EPUBNavigatorViewController: EPUBSpreadViewDelegate {
 
         await spreadView.evaluateScript("(function() {\n\(script)\n})();")
         // Settings already applied the pan policy when this spread was created.
-        // Applying them again re-enables the pagination scroll under a slide.
-        applySpreadPanPolicy(interactiveCurl: interactiveCurlEnabled, to: spreadView)
+        // Applying them again re-enables the pagination scroll under a fade/none turn.
+        applySpreadPanPolicy(interactiveCurl: interactiveTurnEnabled, to: spreadView)
     }
 
     func spreadView(_ spreadView: EPUBSpreadView, didReceive event: PointerEvent) {
@@ -1635,7 +1636,7 @@ extension EPUBNavigatorViewController: PaginationViewDelegate {
             animatedLoad: false
         )
         spreadView.delegate = self
-        applySpreadPanPolicy(interactiveCurl: interactiveCurlEnabled, to: spreadView)
+        applySpreadPanPolicy(interactiveCurl: interactiveTurnEnabled, to: spreadView)
         if let reflow = spreadView as? EPUBReflowableSpreadView {
             reflow.curlContentGeneration = { [weak self] in self?.curlContentGeneration ?? -1 }
             reflow.curlTapDidLand = { [weak self, weak reflow] pages in
@@ -1779,7 +1780,7 @@ extension EPUBNavigatorViewController: PageCurlPanDelegate {
             canGoForward: canCurl(forward: true),
             canGoBackward: canCurl(forward: false),
             hasSelection: currentSelection != nil,
-            interactiveCurlEnabled: PageCurlPanStateMachine.allowsInteractiveCurl(
+            interactiveCurlEnabled: PageCurlPanStateMachine.allowsInteractiveTurn(
                 preference: settings.pageTransition,
                 scrolls: settings.scroll,
                 reduceMotion: UIAccessibility.isReduceMotionEnabled,
@@ -1794,25 +1795,30 @@ extension EPUBNavigatorViewController: PageCurlPanDelegate {
         paginationView
     }
 
+    func curlPanMakeOverlayView(frame: CGRect) -> any PageTurnOverlayView {
+        curlSessionTransition == .slide ? PageSlideView(frame: frame) : PageCurlView(frame: frame)
+    }
+
     /// A finger landed while idle. Snapshot the page now, while the pan is
     /// still deciding, and start uploading it and the cached forward
-    /// neighbour. Nothing moves and nothing covers the page, so a tap, a
-    /// vertical scroll or a selection is unaffected; the shot is dropped when
-    /// the touch ends without a drag.
+    /// neighbour (Metal textures for Curl only). Nothing moves and nothing
+    /// covers the page, so a tap, a vertical scroll or a selection is
+    /// unaffected; the shot is dropped when the touch ends without a drag.
     func curlPanTouchDown() {
         // The last sequence's shot, if its end was never seen, is not this one.
         dropCurlTouchDownShot()
-        guard state == .idle, interactiveCurlEnabled, currentSelection == nil,
+        guard state == .idle, interactiveTurnEnabled, currentSelection == nil,
               let spread = paginationView?.currentView as? EPUBSpreadView,
               spread.isSpreadReadyForPresentation,
-              // A zoomed fixed-layout page pans; it does not curl.
+              // A zoomed fixed-layout page pans; it does not turn.
               spread.scrollView.zoomScale <= spread.scrollView.minimumZoomScale + 0.01
         else {
             return
         }
         let background = viewModel.settings.effectiveBackgroundColor.uiColor
         let key = curlPageKey(for: spread)
-        let forward = curlPrerender.key == key
+        let preloadMetal = settings.pageTransition == .curl
+        let forward = preloadMetal && curlPrerender.key == key
             ? (try? curlPrerender.neighbor(.forward, key: key, onScreen: curlPrerender.current).get())
             : nil
         curlTouchDownShot = Task { @MainActor [weak spread] in
@@ -1829,7 +1835,9 @@ extension EPUBNavigatorViewController: PageCurlPanDelegate {
                 return nil
             }
             PageCurlLatency.mark("touch-outgoing")
-            PageCurlView.preloadTextures([image] + (forward.map { [$0] } ?? []))
+            if preloadMetal {
+                PageCurlView.preloadTextures([image] + (forward.map { [$0] } ?? []))
+            }
             let fingerprint = await Self.fingerprint(of: image)
             guard !Task.isCancelled else {
                 return nil
@@ -1843,6 +1851,7 @@ extension EPUBNavigatorViewController: PageCurlPanDelegate {
         if accepted {
             curlSessionGeneration = paginationView?.turnGeneration ?? 0
             curlSessionSpread = paginationView?.currentView as? EPUBSpreadView
+            curlSessionTransition = settings.pageTransition
             curlDragGeneration = curlContentGeneration
             curlDragOutgoing = nil
             curlDragIncoming = nil
@@ -1899,8 +1908,9 @@ extension EPUBNavigatorViewController: PageCurlPanDelegate {
             divisionNormalizedX: divisionX
         )
         let divisionText = divisionX.map { String(format: "%.3f", $0) } ?? "nil"
-        log(.info, "curl-spine columns=\(columns) division=\(divisionText) spine=\(spine) forward=\(forward)")
-        PageCurlDebug.log("curl-spine columns=\(columns) division=\(divisionText) spine=\(spine) forward=\(forward)")
+        let prefix = curlSessionTransition == .slide ? "slide-spine" : "curl-spine"
+        log(.info, "\(prefix) columns=\(columns) division=\(divisionText) spine=\(spine) forward=\(forward)")
+        PageCurlDebug.log("\(prefix) columns=\(columns) division=\(divisionText) spine=\(spine) forward=\(forward)")
         let peel = PageCurlGeometry.peelSign(spine: spine, rtl: rtl, forward: forward)
         let spreadDirection = spreadDirection(for: direction)
 
