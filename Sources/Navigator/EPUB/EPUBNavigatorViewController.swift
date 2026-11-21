@@ -1182,9 +1182,9 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         }
     }
 
-    /// Reflowable paging pans are off while the curl recognizer owns the drag.
-    /// Fixed layout keeps its pan so a zoomed page can still move. Slide, fade
-    /// and none leave both pans alone.
+    /// Reflowable paging pans are off while the interactive turn recognizer owns
+    /// the drag (Curl and Slide). Fixed layout keeps its pan so a zoomed page
+    /// can still move. Fast Fade and None leave both pans alone.
     private func applySpreadPanPolicy(interactiveCurl: Bool) {
         guard let loaded = paginationView?.loadedViews else {
             return
@@ -1208,6 +1208,10 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     @objc private func curlAccessibilityChanged() {
         if !interactiveTurnEnabled {
             curlPan?.abort(keepingCover: true)
+        }
+        if UIAccessibility.isReduceMotionEnabled {
+            paginationView?.cancelActiveCurl()
+            paginationView?.releaseCurlCancelSuppression()
         }
         invalidateCurlPrerender("accessibility")
         applySettings()

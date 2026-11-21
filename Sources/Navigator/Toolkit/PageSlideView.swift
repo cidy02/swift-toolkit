@@ -488,7 +488,10 @@ final class PageSlideView: UIView, PageTurnOverlayView {
     }
 
     private var turnIsRunning: Bool {
-        displayLink != nil || tapContinuation != nil || interactiveContinuation != nil
+        displayLink != nil
+            || tapContinuation != nil
+            || interactiveContinuation != nil
+            || interactivePhase != .none
     }
 
     private func cancelForLifecycle() {

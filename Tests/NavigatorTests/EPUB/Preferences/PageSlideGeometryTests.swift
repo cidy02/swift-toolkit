@@ -289,6 +289,68 @@ class PageSlideGeometryTests: XCTestCase {
         slide.removeFromSuperview()
     }
 
+    @MainActor
+    func testResignActiveDuringTrackRestoresCoverAndUnblocksFinish() async {
+        let window = UIWindow(frame: phoneBounds)
+        let host = UIView(frame: phoneBounds)
+        window.addSubview(host)
+        window.makeKeyAndVisible()
+
+        let slide = PageSlideView(frame: phoneBounds)
+        let image = solidImage(color: .black, size: CGSize(width: 20, height: 20))
+        slide.showCover(image, background: .black)
+        host.addSubview(slide)
+        host.layoutIfNeeded()
+
+        let armed = await slide.beginInteractive(
+            outgoing: image,
+            incoming: image,
+            spine: .leading,
+            peelSign: 1,
+            realVerso: false,
+            reversed: false,
+            progress: 0.3,
+            grabUV: CGPoint(x: 0.9, y: 0.5),
+            fingerUV: CGPoint(x: 0.6, y: 0.5)
+        )
+        XCTAssertTrue(armed)
+        let cover = slide.subviews.compactMap { $0 as? UIImageView }.last
+        XCTAssertEqual(cover?.isHidden, true)
+
+        NotificationCenter.default.post(name: UIApplication.willResignActiveNotification, object: nil)
+        // Resigning active during `.track` must restore the still cover (no blank frame)
+        // and leave `finishInteractive` non-blocking.
+        XCTAssertEqual(cover?.isHidden, false)
+        await slide.finishInteractive(target: 1, progressVelocity: 0)
+        slide.removeFromSuperview()
+    }
+
+    @MainActor
+    func testRunTapCompletesAndClearsCover() async {
+        let window = UIWindow(frame: phoneBounds)
+        let host = UIView(frame: phoneBounds)
+        window.addSubview(host)
+        window.makeKeyAndVisible()
+
+        let slide = PageSlideView(frame: phoneBounds)
+        let image = solidImage(color: .white, size: CGSize(width: 20, height: 20))
+        slide.showCover(image, background: .white)
+        host.addSubview(slide)
+        host.layoutIfNeeded()
+
+        await slide.runTap(
+            outgoing: image,
+            incoming: image,
+            spine: .leading,
+            peelSign: 1,
+            realVerso: false,
+            reversed: false,
+            duration: 0.05
+        )
+        slide.releaseResources()
+        slide.removeFromSuperview()
+    }
+
     private func solidImage(color: UIColor, size: CGSize) -> UIImage {
         let renderer = UIGraphicsImageRenderer(size: size)
         return renderer.image { ctx in
