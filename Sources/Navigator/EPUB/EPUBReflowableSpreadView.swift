@@ -18,6 +18,9 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
     /// Read at each turn. The notification updates it and cuts short a smooth
     /// scroll that was already running.
     private var isReduceMotionEnabled = UIAccessibility.isReduceMotionEnabled
+    /// Test hooks defaulting to live UIAccessibility state.
+    var reduceMotionProvider: () -> Bool = { UIAccessibility.isReduceMotionEnabled }
+    var voiceOverProvider: () -> Bool = { UIAccessibility.isVoiceOverRunning }
 
     private var isSuppressingProgressionUpdates = false
     /// Set when a hidden scroll changed the progression, so lifting the
@@ -62,6 +65,9 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
     /// The curl or slide overlay, if a turn is in flight. Cleared with the spread
     /// so a reload or a close cannot leave the display link running.
     private weak var activeCurlView: (any PageTurnOverlayView)?
+    /// Set by `stopActiveCurlForAccessibility()` so the turn stops animating
+    /// while keeping `activeCurlView` tracked for any later reload/cancel.
+    private var activeCurlStoppedForAccessibility = false
     /// A posture cancel removed the cover. The turn's defer must not clear
     /// progression suppression a reflow hold just took.
     private var curlCancelKeepsSuppression = false
@@ -102,6 +108,14 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         stopActiveCurl()
     }
 
+    override func stopActiveCurlForAccessibility() {
+        guard let curlView = activeCurlView else {
+            return
+        }
+        activeCurlStoppedForAccessibility = true
+        curlView.freezeOnCover(showing: activeCurlLanding)
+    }
+
     /// Takes the leaf down. During the render past the landing the web view
     /// may be a column further on: the still cover shows the landing page
     /// until `curl(by:)` has stepped back and removes it.
@@ -110,6 +124,7 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
             return
         }
         activeCurlView = nil
+        activeCurlStoppedForAccessibility = false
         if let landing = activeCurlLanding {
             curlView.freezeOnCover(showing: landing)
         } else {
@@ -131,6 +146,7 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         activeCurlView?.releaseResources()
         activeCurlView?.removeFromSuperview()
         activeCurlView = nil
+        activeCurlStoppedForAccessibility = false
         pendingCurlScroll = nil
         super.clear()
 
@@ -295,9 +311,9 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
             PageTransitionPolicy.Request(
                 preference: viewModel.settings.pageTransition,
                 animated: options.animated,
-                reduceMotion: isReduceMotionEnabled,
+                reduceMotion: reduceMotionProvider(),
                 scrolls: false,
-                voiceOverRunning: UIAccessibility.isVoiceOverRunning,
+                voiceOverRunning: voiceOverProvider(),
                 resourceDistance: nil,
                 overrideRaw: options.pageTransitionOverride
             )
@@ -315,6 +331,33 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         }
 
         return true
+    }
+
+    private func resolvedOverlayTransition(for style: PageTransition) -> PageTransition {
+        PageTransitionPolicy.rendered(PageTransitionPolicy.resolve(
+            PageTransitionPolicy.Request(
+                preference: style,
+                animated: true,
+                reduceMotion: reduceMotionProvider(),
+                scrolls: viewModel.scroll,
+                voiceOverRunning: voiceOverProvider(),
+                resourceDistance: nil,
+                overrideRaw: nil
+            )
+        ))
+    }
+
+    private func fallbackTurnAfterPreparation(by offsetX: CGFloat, resolved: PageTransition) async {
+        switch resolved {
+        case .fade:
+            await fade(by: offsetX)
+        case .none:
+            if !viewModel.scroll {
+                await evaluateScript("window.scrollBy({ left: \(offsetX), behavior: 'instant' });")
+            }
+        case .slide, .curl:
+            await slide(by: offsetX)
+        }
     }
 
     /// Cylinder curl or lifted-card slide. The outgoing bitmap is up before the
@@ -337,7 +380,7 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
             guard curlHostAttached else {
                 return
             }
-            await slide(by: offsetX)
+            await fallbackTurnAfterPreparation(by: offsetX, resolved: resolvedOverlayTransition(for: style))
             return
         }
         guard curlHostAttached else {
@@ -350,6 +393,13 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
             setSuppressingProgressionUpdates(false)
             return
         }
+        let prepared = resolvedOverlayTransition(for: style)
+        if prepared != style {
+            setSuppressingProgressionUpdates(false)
+            await fallbackTurnAfterPreparation(by: offsetX, resolved: prepared)
+            return
+        }
+
         let rtl = viewModel.readingProgression == .rtl
         let forward = isForward(direction)
         let divisionX = pageCurlDivisionNormalizedX
@@ -369,13 +419,18 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         overlayView.showCover(outgoing, background: background)
         addSubview(overlayView)
         activeCurlView = overlayView
-        // False once cancelled, even while a frozen cover is still up.
+        activeCurlStoppedForAccessibility = false
+        // False once cancelled or stopped for accessibility, even while a frozen cover is still up.
         let running = { [weak self, weak overlayView] in
-            overlayView != nil && overlayView?.superview != nil && self?.activeCurlView === overlayView
+            overlayView != nil
+                && overlayView?.superview != nil
+                && self?.activeCurlView === overlayView
+                && self?.activeCurlStoppedForAccessibility == false
         }
         defer {
             if activeCurlView === overlayView {
                 activeCurlView = nil
+                activeCurlStoppedForAccessibility = false
             }
             activeCurlLanding = nil
             overlayView.releaseResources()
@@ -388,13 +443,29 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         }
 
         await scrollByAwaitingPaint(offsetX)
-        guard curlHostAttached, running() else {
+        guard curlHostAttached, overlayView.superview != nil else {
             return
         }
+        let afterScroll = resolvedOverlayTransition(for: style)
+        if !running() || afterScroll != style {
+            if afterScroll == .fade {
+                await PageTransitionAnimator.fade(overlayView, to: 0, duration: PageTransitionAnimator.fadeDuration)
+            }
+            return
+        }
+
         let shot = await PageCurlSnapshotter.capture(of: self, backgroundColor: background)
-        guard curlHostAttached, running() else {
+        guard curlHostAttached, overlayView.superview != nil else {
             return
         }
+        let beforeAnimate = resolvedOverlayTransition(for: style)
+        if !running() || beforeAnimate != style {
+            if beforeAnimate == .fade {
+                await PageTransitionAnimator.fade(overlayView, to: 0, duration: PageTransitionAnimator.fadeDuration)
+            }
+            return
+        }
+
         switch PageCurlGeometry.incomingReveal(snapshotSucceeded: shot != nil) {
         case .crossfade:
             await PageTransitionAnimator.fade(overlayView, to: 0, duration: PageTransitionAnimator.fadeDuration)
@@ -414,21 +485,30 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
                     covered: running
                 )
             }
-            // Resigned active since the turn began (the cover's own observer
-            // already fired): skip the animation. The cover shows the landing
-            // page while the render past it steps back.
-            guard UIApplication.shared.applicationState == .active else {
-                stopActiveCurl()
+            // Resigned active or accessibility flipped since the turn began:
+            // skip the animation. The cover shows the landing page while the
+            // render past it steps back.
+            guard UIApplication.shared.applicationState == .active,
+                  running(),
+                  resolvedOverlayTransition(for: style) == style
+            else {
+                stopActiveCurlForAccessibility()
                 _ = await beyond.value
                 return
             }
+            let peelSign = style == .slide
+                ? PageSlideGeometry.peelSign(rtl: rtl)
+                : PageCurlGeometry.peelSign(spine: spine, rtl: rtl, forward: forward)
+            let reversed = style == .slide
+                ? PageSlideGeometry.playsReversed(forward: forward)
+                : PageCurlGeometry.playsReversed(renderedColumns: columns, forward: forward)
             await overlayView.runTap(
                 outgoing: outgoing,
                 incoming: shot,
                 spine: spine,
-                peelSign: PageCurlGeometry.peelSign(spine: spine, rtl: rtl, forward: forward),
+                peelSign: peelSign,
                 realVerso: columns >= 2,
-                reversed: PageCurlGeometry.playsReversed(renderedColumns: columns, forward: forward),
+                reversed: reversed,
                 duration: style == .slide ? PageSlideGeometry.tapDuration : PageCurlGeometry.tapDuration
             )
             let beyondImage = await beyond.value
@@ -1091,10 +1171,10 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
     }
 
     @objc private func reduceMotionStatusDidChange() {
-        isReduceMotionEnabled = UIAccessibility.isReduceMotionEnabled
+        isReduceMotionEnabled = reduceMotionProvider()
         if isReduceMotionEnabled {
             scrollDidEnd()
-            stopActiveCurl()
+            stopActiveCurlForAccessibility()
         }
     }
 

@@ -10,8 +10,9 @@ import Foundation
 /// preference applies at all.
 ///
 /// `NavigatorGoOptions.animated == false` always wins, so scrubs, VoiceOver
-/// scrolls and silent seeks stay instant. Reduce Motion and scroll mode do
-/// too. A jump of more than one resource never curls.
+/// scrolls and silent seeks stay instant. Scroll mode and VoiceOver do too.
+/// Under Reduce Motion, Slide falls back to Fast Fade while Curl, Fast Fade and
+/// None stay instant. A jump of more than one resource never curls.
 enum PageTransitionPolicy {
     /// Key in `NavigatorGoOptions.otherOptions` for a one-call override.
     /// The value is a `PageTransition` raw string (`"fade"`, …).
@@ -33,7 +34,6 @@ enum PageTransitionPolicy {
     /// `.curl` is preserved so a later renderer can take this value as-is.
     static func resolve(_ request: Request) -> PageTransition {
         guard request.animated,
-              !request.reduceMotion,
               !request.scrolls,
               !request.voiceOverRunning
         else {
@@ -42,6 +42,9 @@ enum PageTransitionPolicy {
 
         let requested = request.overrideRaw.flatMap(PageTransition.init(rawValue:))
             ?? request.preference
+        if request.reduceMotion {
+            return requested == .slide ? .fade : .none
+        }
         if requested == .curl, let distance = request.resourceDistance, distance > 1 {
             return .fade
         }

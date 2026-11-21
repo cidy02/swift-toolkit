@@ -97,6 +97,77 @@ enum PageCurlPanStateMachine {
         (preference == .curl || preference == .slide) && !scrolls && !reduceMotion && !voiceOverRunning
     }
 
+    /// Trackpad two-finger scroll and mouse scroll-wheel paging for paged Slide
+    /// while native paging is disabled for direct drags. Curl stays untouched.
+    static func allowsIndirectSlideTurn(
+        preference: PageTransition,
+        scrolls: Bool,
+        reduceMotion: Bool,
+        voiceOverRunning: Bool
+    ) -> Bool {
+        preference == .slide && !scrolls && !reduceMotion && !voiceOverRunning
+    }
+
+    /// Minimum horizontal travel (points) or velocity (pt/s) for a trackpad or
+    /// scroll-wheel gesture to commit one auto-driven Slide turn.
+    static let indirectScrollDistance: CGFloat = 12
+    static let indirectScrollVelocity: CGFloat = 120
+    static let indirectScrollEndedDistance: CGFloat = 4
+    static let indirectScrollEndedVelocity: CGFloat = 60
+
+    /// Direction for an indirect horizontal scroll (iPad trackpad two-finger
+    /// scroll or mouse wheel) in paged Slide. Ignores the leading dismiss bezel
+    /// because the pointer cursor may rest anywhere while scrolling.
+    static func indirectScrollDirection(
+        sample: PageCurlPanSample,
+        context: PageCurlPanContext
+    ) -> PageCurlTurnDirection? {
+        guard context.acceptsGesture,
+              context.interactiveCurlEnabled,
+              !context.hasSelection,
+              !context.zoomed
+        else {
+            return nil
+        }
+
+        let vx = finite(sample.velocityX)
+        let vy = finite(sample.velocityY)
+        let dx = finite(sample.translationX)
+        let dy = finite(sample.translationY)
+        let horizontal: Bool
+        let goingRight: Bool
+        if abs(vx) > 20 || abs(vy) > 20 {
+            horizontal = abs(vx) > abs(vy) * horizontalDominance
+            goingRight = vx > 0
+        } else if abs(dx) > 1 || abs(dy) > 1 {
+            horizontal = abs(dx) > abs(dy) * horizontalDominance
+            goingRight = dx > 0
+        } else {
+            return nil
+        }
+        guard horizontal else {
+            return nil
+        }
+
+        let forward = context.rtl ? goingRight : !goingRight
+        if forward, !context.canGoForward {
+            return nil
+        }
+        if !forward, !context.canGoBackward {
+            return nil
+        }
+        return forward ? .forward : .backward
+    }
+
+    static func shouldTriggerIndirectScroll(sample: PageCurlPanSample, ended: Bool) -> Bool {
+        let dx = abs(finite(sample.translationX))
+        let vx = abs(finite(sample.velocityX))
+        if ended {
+            return dx >= indirectScrollEndedDistance || vx >= indirectScrollEndedVelocity
+        }
+        return dx >= indirectScrollDistance || vx >= indirectScrollVelocity
+    }
+
     static func shouldBegin(sample: PageCurlPanSample, context: PageCurlPanContext) -> PageCurlPanBegin {
         guard context.acceptsGesture, context.interactiveCurlEnabled else {
             return .rejectDisabled

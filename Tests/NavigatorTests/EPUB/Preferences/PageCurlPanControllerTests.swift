@@ -24,7 +24,8 @@ class PageCurlPanControllerTests: XCTestCase {
         var overlayMade: (any PageTurnOverlayView)?
         var didFinish = 0
         var didCancel = 0
-        var sampleImage: UIImage?
+        var outgoingImage: UIImage?
+        var incomingImage: UIImage?
 
         func curlPanContext(in view: UIView) -> PageCurlPanContext {
             PageCurlPanContext(
@@ -48,14 +49,14 @@ class PageCurlPanControllerTests: XCTestCase {
         func curlPanTouchSequenceEnded() { sequencesEnded += 1 }
         func curlPanDidBegin(direction: PageCurlTurnDirection) -> Bool { accepts }
         func curlPanCaptureOutgoing() async -> (image: UIImage, background: UIColor)? {
-            sampleImage.map { ($0, .black) }
+            outgoingImage.map { ($0, .black) }
         }
         func curlPanRevealIncoming(
             direction: PageCurlTurnDirection,
             outgoing: UIImage,
             background: UIColor
         ) async -> PageCurlPanFrame? {
-            guard let img = sampleImage else { return nil }
+            guard let img = incomingImage else { return nil }
             return PageCurlPanFrame(
                 outgoing: outgoing,
                 incoming: img,
@@ -99,8 +100,8 @@ class PageCurlPanControllerTests: XCTestCase {
     }
 
     /// Slide shares the curl's pan controller and installs `PageSlideView`
-    /// through the overlay factory, then tears down cleanly on `abortDrag`.
-    func testSlideDragInstallsPageSlideViewAndAbortsCleanly() async {
+    /// through the overlay factory, arms it with distinct pages, then tears down cleanly on `abortDrag`.
+    func testSlideDragInstallsPageSlideViewArmsAndAbortsCleanly() async {
         let bounds = CGRect(x: 0, y: 0, width: 402, height: 874)
         let window = UIWindow(frame: bounds)
         let host = UIView(frame: bounds)
@@ -108,8 +109,12 @@ class PageCurlPanControllerTests: XCTestCase {
         window.makeKeyAndVisible()
 
         let renderer = UIGraphicsImageRenderer(size: CGSize(width: 20, height: 20))
-        let img = renderer.image { ctx in
-            UIColor.black.setFill()
+        let outgoing = renderer.image { ctx in
+            UIColor.red.setFill()
+            ctx.fill(CGRect(x: 0, y: 0, width: 20, height: 20))
+        }
+        let incoming = renderer.image { ctx in
+            UIColor.blue.setFill()
             ctx.fill(CGRect(x: 0, y: 0, width: 20, height: 20))
         }
 
@@ -118,22 +123,118 @@ class PageCurlPanControllerTests: XCTestCase {
         delegate.accepts = true
         delegate.hostView = host
         delegate.makeSlide = true
-        delegate.sampleImage = img
+        delegate.outgoingImage = outgoing
+        delegate.incomingImage = incoming
         controller.delegate = delegate
         controller.attach(to: host)
 
         controller.begin(controller.recognizer)
-        // Let the prepare task arm the slide overlay.
-        for _ in 0 ..< 20 where !controller.isCovering {
+        // Wait for `beginInteractive` to actually arm the overlay, not merely cover attachment.
+        for _ in 0 ..< 50 where !controller.isArmedForTesting {
             try? await Task.sleep(nanoseconds: 10_000_000)
         }
-        XCTAssertTrue(delegate.overlayMade is PageSlideView)
+        let slide = delegate.overlayMade as? PageSlideView
+        XCTAssertNotNil(slide)
         XCTAssertTrue(controller.isCovering)
+        XCTAssertTrue(controller.isArmedForTesting)
+        XCTAssertEqual(slide?.isCoverHiddenForTesting, true)
+        XCTAssertTrue(slide?.cardImageForTesting === outgoing)
+        XCTAssertTrue(slide?.underImageForTesting === incoming)
 
         await controller.abortDrag()
         XCTAssertFalse(controller.turnInFlight)
         XCTAssertFalse(controller.isCovering)
+        XCTAssertFalse(controller.isArmedForTesting)
         XCTAssertEqual(delegate.didCancel, 1)
         XCTAssertEqual(delegate.didFinish, 1)
+        XCTAssertNil(slide?.superview)
+        XCTAssertNil(slide?.cardImageForTesting)
+        XCTAssertNil(slide?.underImageForTesting)
+    }
+
+    private final class ScrollDelegate: PageSlideScrollDelegate {
+        var rtl = false
+        var canGoForward = true
+        var canGoBackward = true
+        var enabled = true
+        var accepts = true
+        var turns: [PageCurlTurnDirection] = []
+
+        func slideScrollContext(in view: UIView) -> PageCurlPanContext {
+            PageCurlPanContext(
+                rtl: rtl,
+                viewWidth: view.bounds.width,
+                viewHeight: view.bounds.height,
+                canGoForward: canGoForward,
+                canGoBackward: canGoBackward,
+                hasSelection: false,
+                interactiveCurlEnabled: enabled,
+                zoomed: false,
+                acceptsGesture: accepts
+            )
+        }
+
+        func slideScrollTurn(direction: PageCurlTurnDirection) {
+            turns.append(direction)
+        }
+    }
+
+    func testSlideScrollControllerAcceptsTrackpadScrollsAndTriggersOncePerGesture() {
+        let host = UIView(frame: CGRect(x: 0, y: 0, width: 1024, height: 768))
+        let controller = PageSlideScrollController()
+        let delegate = ScrollDelegate()
+        controller.delegate = delegate
+        controller.attach(to: host)
+        controller.isEnabled = true
+
+        if #available(iOS 13.4, *) {
+            XCTAssertEqual(controller.recognizer.allowedScrollTypesMask, .all)
+        }
+        let touchTypes = Set(controller.recognizer.allowedTouchTypes.map(\.intValue))
+        XCTAssertFalse(touchTypes.contains(UITouch.TouchType.direct.rawValue))
+        XCTAssertFalse(touchTypes.contains(UITouch.TouchType.indirectPointer.rawValue))
+        XCTAssertTrue(touchTypes.contains(UITouch.TouchType.indirect.rawValue))
+
+        // Continuous trackpad horizontal swipe: triggers once despite multiple momentum frames.
+        let forwardSwipe = PageCurlPanSample(
+            translationX: -28, translationY: 2, velocityX: -320, velocityY: 10, locationX: 8, locationY: 400
+        )
+        controller.handle(state: .began, sample: forwardSwipe, in: host)
+        controller.handle(state: .changed, sample: forwardSwipe, in: host)
+        controller.handle(state: .changed, sample: forwardSwipe, in: host)
+        controller.handle(state: .ended, sample: forwardSwipe, in: host)
+        XCTAssertEqual(delegate.turns, [.forward])
+
+        // Next gesture in the opposite direction (even with cursor in left bezel) turns backward.
+        let backwardSwipe = PageCurlPanSample(
+            translationX: 24, translationY: 0, velocityX: 240, velocityY: 0, locationX: 4, locationY: 400
+        )
+        controller.handle(state: .began, sample: backwardSwipe, in: host)
+        controller.handle(state: .ended, sample: backwardSwipe, in: host)
+        XCTAssertEqual(delegate.turns, [.forward, .backward])
+
+        // Small discrete scroll tick commits on .ended; tiny zeroed nudge does not.
+        let discreteTick = PageCurlPanSample(
+            translationX: -8, translationY: 0, velocityX: 0, velocityY: 0, locationX: 500, locationY: 400
+        )
+        controller.handle(state: .began, sample: discreteTick, in: host)
+        XCTAssertEqual(delegate.turns.count, 2)
+        controller.handle(state: .ended, sample: discreteTick, in: host)
+        XCTAssertEqual(delegate.turns, [.forward, .backward, .forward])
+
+        let cancelledNudge = PageCurlPanSample(
+            translationX: 0, translationY: 0, velocityX: 0, velocityY: 0, locationX: 500, locationY: 400
+        )
+        controller.handle(state: .began, sample: cancelledNudge, in: host)
+        controller.handle(state: .ended, sample: cancelledNudge, in: host)
+        XCTAssertEqual(delegate.turns.count, 3)
+
+        // Vertical trackpad scroll never turns.
+        let vertical = PageCurlPanSample(
+            translationX: -5, translationY: -80, velocityX: -20, velocityY: -400, locationX: 500, locationY: 400
+        )
+        controller.handle(state: .began, sample: vertical, in: host)
+        controller.handle(state: .ended, sample: vertical, in: host)
+        XCTAssertEqual(delegate.turns.count, 3)
     }
 }

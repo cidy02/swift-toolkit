@@ -15,13 +15,16 @@ struct PageSlideFrame: Equatable {
     /// Origin of the full-page snapshot inside the card's clipped view.
     /// `(0, 0)` on one page; `(-homeRect.minX, 0)` on the right half of a spread.
     var cardImageOrigin: CGPoint
-    /// Clipped rect of the unturned outgoing half in a two-page spread, or nil
-    /// on one page. Shrinks to zero width once the moving card passes the spine.
+    /// Clipped rect of the complementary half in a two-page spread, or nil on
+    /// one page. Forward: shrinks the unturned outgoing half as the exiting card
+    /// sweeps past the spine. Backward: grows the incoming complementary half
+    /// behind the entering card's spine edge.
     var staticHalfClipFrame: CGRect?
-    /// Origin of the full-page outgoing snapshot inside `staticHalfClipFrame`.
+    /// Origin of the full-page snapshot (`outgoing` forward, `incoming` backward)
+    /// inside `staticHalfClipFrame`.
     var staticHalfImageOrigin: CGPoint
-    /// True for a one-page backward turn: the previous page enters as the lifted
-    /// card over the still current page.
+    /// True for a backward turn (one page or two pages): the previous page
+    /// enters as the lifted card over the still current spread.
     var usesIncomingAsCard: Bool
     /// Animated continuous corner radius of the lifted card.
     var cornerRadius: CGFloat
@@ -84,6 +87,20 @@ enum PageSlideGeometry {
         return 1 - u * u * u
     }
 
+    /// Slide plays every backward turn reversed — the previous page (or the
+    /// previous spread's entering half) comes in as the lifted card over the
+    /// still current spread, on both one page and two pages. Curl keeps
+    /// `PageCurlGeometry.playsReversed` untouched.
+    static func playsReversed(forward: Bool) -> Bool {
+        !forward
+    }
+
+    /// +1 when the lifted card's home is on the +x side (LTR: full page or right
+    /// half) and moves toward -x as `cardOffset` grows; -1 in RTL.
+    static func peelSign(rtl: Bool) -> CGFloat {
+        rtl ? -1 : 1
+    }
+
     static func isDark(background: PageCurlRGB) -> Bool {
         let r = clampUnit(background.r)
         let g = clampUnit(background.g)
@@ -136,12 +153,18 @@ enum PageSlideGeometry {
     ///   - Backward (`reversed == true`): previous (incoming) page enters from the
     ///     leading edge as the lifted card over the still current (outgoing) page.
     /// - Two pages (`spine == .center(s)`):
-    ///   - The turning half (right page for LTR forward / RTL backward; left page
-    ///     for LTR backward / RTL forward) lifts and slides across the still spread.
+    ///   - Forward (`reversed == false`): the trailing half of the outgoing
+    ///     spread (right page in LTR, left page in RTL) lifts and slides across
+    ///     the still incoming spread; the unturned outgoing half stays clipped
+    ///     until the moving card sweeps over it.
+    ///   - Backward (`reversed == true`): the entering half of the previous
+    ///     spread (right page from the left edge in LTR, left page from the
+    ///     right edge in RTL) slides in as the lifted card over the still
+    ///     current spread, revealing the other half of the previous spread
+    ///     behind its spine edge until progress `1` lands on the full previous
+    ///     spread.
     ///   - Outer corners match the display corner radius; the spine edge stays
     ///     square (`0` radius) so the binding seam meets cleanly at rest.
-    ///   - The unturned half of the outgoing spread stays fixed until the moving
-    ///     card sweeps over it, then the incoming spread is revealed behind the card.
     static func layout(
         progress: CGFloat,
         bounds: CGRect,

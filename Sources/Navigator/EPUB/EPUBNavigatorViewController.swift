@@ -495,6 +495,11 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         pan.attach(to: paginationView!)
         curlPan = pan
 
+        let scroll = PageSlideScrollController()
+        scroll.delegate = self
+        scroll.attach(to: paginationView!)
+        slideScroll = scroll
+
         applySettings()
 
         _reloadSpreads()
@@ -743,6 +748,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
     private var paginationView: PaginationView?
     private var curlPan: PageCurlPanController?
+    private var slideScroll: PageSlideScrollController?
     /// Spread and reload generation captured when the finger curl began.
     /// Commit and cancel no-op once a reload has replaced that spread.
     private var curlSessionGeneration: UInt = 0
@@ -877,6 +883,15 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
     private var interactiveTurnEnabled: Bool {
         PageCurlPanStateMachine.allowsInteractiveTurn(
+            preference: settings.pageTransition,
+            scrolls: settings.scroll,
+            reduceMotion: UIAccessibility.isReduceMotionEnabled,
+            voiceOverRunning: UIAccessibility.isVoiceOverRunning
+        )
+    }
+
+    private var indirectSlideEnabled: Bool {
+        PageCurlPanStateMachine.allowsIndirectSlideTurn(
             preference: settings.pageTransition,
             scrolls: settings.scroll,
             reduceMotion: UIAccessibility.isReduceMotionEnabled,
@@ -1176,6 +1191,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         paginationView?.scrolls = settings.scroll
         paginationView?.transitionBackgroundColor = settings.effectiveBackgroundColor.uiColor
         curlPan?.isEnabled = interactive
+        slideScroll?.isEnabled = indirectSlideEnabled
         applySpreadPanPolicy(interactiveCurl: interactive)
         if settings.pageTransition == .curl {
             PageCurlView.prewarm()
@@ -1209,9 +1225,9 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         if !interactiveTurnEnabled {
             curlPan?.abort(keepingCover: true)
         }
-        if UIAccessibility.isReduceMotionEnabled {
-            paginationView?.cancelActiveCurl()
-            paginationView?.releaseCurlCancelSuppression()
+        if UIAccessibility.isReduceMotionEnabled || UIAccessibility.isVoiceOverRunning {
+            (paginationView?.currentView as? EPUBSpreadView)?.stopActiveCurlForAccessibility()
+            paginationView?.stopActiveCurlForAccessibility()
         }
         invalidateCurlPrerender("accessibility")
         applySettings()
@@ -1915,7 +1931,15 @@ extension EPUBNavigatorViewController: PageCurlPanDelegate {
         let prefix = curlSessionTransition == .slide ? "slide-spine" : "curl-spine"
         log(.info, "\(prefix) columns=\(columns) division=\(divisionText) spine=\(spine) forward=\(forward)")
         PageCurlDebug.log("\(prefix) columns=\(columns) division=\(divisionText) spine=\(spine) forward=\(forward)")
-        let peel = PageCurlGeometry.peelSign(spine: spine, rtl: rtl, forward: forward)
+        let peel: CGFloat
+        let reversed: Bool
+        if curlSessionTransition == .slide {
+            peel = PageSlideGeometry.peelSign(rtl: rtl)
+            reversed = PageSlideGeometry.playsReversed(forward: forward)
+        } else {
+            peel = PageCurlGeometry.peelSign(spine: spine, rtl: rtl, forward: forward)
+            reversed = PageCurlGeometry.playsReversed(renderedColumns: columns, forward: forward)
+        }
         let spreadDirection = spreadDirection(for: direction)
 
         if spread.canGo(to: spreadDirection), let reflow = spread as? EPUBReflowableSpreadView {
@@ -1939,7 +1963,7 @@ extension EPUBNavigatorViewController: PageCurlPanDelegate {
                 peelSign: peel,
                 realVerso: columns >= 2,
                 withinResource: true,
-                reversed: PageCurlGeometry.playsReversed(renderedColumns: columns, forward: forward)
+                reversed: reversed
             )
         }
 
@@ -1954,7 +1978,7 @@ extension EPUBNavigatorViewController: PageCurlPanDelegate {
             peelSign: peel,
             realVerso: columns >= 2,
             withinResource: false,
-            reversed: PageCurlGeometry.playsReversed(renderedColumns: columns, forward: forward)
+            reversed: reversed
         )
     }
 
@@ -2154,6 +2178,44 @@ extension EPUBNavigatorViewController: PageCurlPanDelegate {
         let forward = turn == .forward
         let rtl = viewModel.readingProgression == .rtl
         return PageCurlPanStateMachine.spreadGoesRight(forward: forward, rtl: rtl) ? .right : .left
+    }
+}
+
+extension EPUBNavigatorViewController: PageSlideScrollDelegate {
+    func slideScrollContext(in view: UIView) -> PageCurlPanContext {
+        let rtl = viewModel.readingProgression == .rtl
+        let spread = paginationView?.currentView as? EPUBSpreadView
+        let scale = spread?.scrollView.zoomScale ?? 1
+        let minimum = spread?.scrollView.minimumZoomScale ?? 1
+        return PageCurlPanContext(
+            rtl: rtl,
+            viewWidth: view.bounds.width,
+            viewHeight: view.bounds.height,
+            canGoForward: canCurl(forward: true),
+            canGoBackward: canCurl(forward: false),
+            hasSelection: currentSelection != nil,
+            interactiveCurlEnabled: indirectSlideEnabled,
+            zoomed: scale > minimum + 0.01,
+            acceptsGesture: state == .idle
+        )
+    }
+
+    func slideScrollTurn(direction: PageCurlTurnDirection) {
+        guard state == .idle else {
+            return
+        }
+        Task { @MainActor [weak self] in
+            guard let self else {
+                return
+            }
+            let options = NavigatorGoOptions(animated: true)
+            switch direction {
+            case .forward:
+                _ = await self.goForward(options: options)
+            case .backward:
+                _ = await self.goBackward(options: options)
+            }
+        }
     }
 }
 

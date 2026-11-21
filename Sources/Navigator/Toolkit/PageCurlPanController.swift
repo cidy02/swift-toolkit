@@ -133,6 +133,11 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
         !aborted && curlView?.superview != nil
     }
 
+    /// True once `beginInteractive` has succeeded and the overlay is tracking.
+    var isArmedForTesting: Bool {
+        phase == .armed && metalArmed
+    }
+
     /// Detach, reload, rotation, Reduce Motion, VoiceOver, background, or a
     /// posture change. The cover comes off immediately. A spring already
     /// running is cut, and `finish` will not commit onto a navigator that
@@ -589,5 +594,132 @@ private final class PageCurlPanRecognizer: UIPanGestureRecognizer {
     override func reset() {
         super.reset()
         onReset?()
+    }
+}
+
+@MainActor
+protocol PageSlideScrollDelegate: AnyObject {
+    func slideScrollContext(in view: UIView) -> PageCurlPanContext
+    func slideScrollTurn(direction: PageCurlTurnDirection)
+}
+
+/// Indirect horizontal paging (iPad trackpad two-finger scroll and mouse scroll
+/// wheel) for paged Slide while native scrolling is disabled for direct drags.
+/// Direct finger touches stay on `PageCurlPanController`; click-drag pointer
+/// selection (`.indirectPointer`) stays untouched.
+@MainActor
+final class PageSlideScrollController: NSObject, UIGestureRecognizerDelegate {
+    let recognizer: UIPanGestureRecognizer
+    weak var delegate: PageSlideScrollDelegate?
+
+    var isEnabled: Bool = false {
+        didSet {
+            recognizer.isEnabled = isEnabled
+            if !isEnabled {
+                resetSequence()
+            }
+        }
+    }
+
+    private var hasTriggered = false
+    private var lockedDirection: PageCurlTurnDirection?
+
+    override init() {
+        recognizer = UIPanGestureRecognizer()
+        super.init()
+        recognizer.addTarget(self, action: #selector(handleScroll(_:)))
+        recognizer.delegate = self
+        recognizer.delaysTouchesBegan = false
+        recognizer.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.indirect.rawValue)]
+        if #available(iOS 13.4, *) {
+            recognizer.allowedScrollTypesMask = .all
+        }
+        recognizer.isEnabled = false
+    }
+
+    func attach(to view: UIView) {
+        view.addGestureRecognizer(recognizer)
+    }
+
+    func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+        guard isEnabled,
+              let pan = gestureRecognizer as? UIPanGestureRecognizer,
+              let view = pan.view,
+              let delegate
+        else {
+            return false
+        }
+        guard let direction = PageCurlPanStateMachine.indirectScrollDirection(
+            sample: sample(of: pan),
+            context: delegate.slideScrollContext(in: view)
+        ) else {
+            return false
+        }
+        lockedDirection = direction
+        return true
+    }
+
+    @objc private func handleScroll(_ gesture: UIPanGestureRecognizer) {
+        handle(state: gesture.state, sample: sample(of: gesture), in: gesture.view)
+    }
+
+    /// Internal for tests: UIKit does not let a test set a recognizer's state.
+    func handle(state: UIGestureRecognizer.State, sample: PageCurlPanSample, in view: UIView?) {
+        switch state {
+        case .began:
+            hasTriggered = false
+            maybeTrigger(sample: sample, in: view, ended: false)
+        case .changed:
+            guard !hasTriggered else {
+                return
+            }
+            maybeTrigger(sample: sample, in: view, ended: false)
+        case .ended:
+            if !hasTriggered {
+                maybeTrigger(sample: sample, in: view, ended: true)
+            }
+            resetSequence()
+        case .cancelled, .failed:
+            resetSequence()
+        default:
+            break
+        }
+    }
+
+    private func maybeTrigger(sample: PageCurlPanSample, in view: UIView?, ended: Bool) {
+        guard isEnabled, let view, let delegate else {
+            return
+        }
+        let context = delegate.slideScrollContext(in: view)
+        guard let direction = PageCurlPanStateMachine.indirectScrollDirection(
+            sample: sample,
+            context: context
+        ) ?? (ended ? lockedDirection : nil) else {
+            return
+        }
+        guard PageCurlPanStateMachine.shouldTriggerIndirectScroll(sample: sample, ended: ended) else {
+            return
+        }
+        hasTriggered = true
+        delegate.slideScrollTurn(direction: direction)
+    }
+
+    private func resetSequence() {
+        hasTriggered = false
+        lockedDirection = nil
+    }
+
+    private func sample(of pan: UIPanGestureRecognizer) -> PageCurlPanSample {
+        let translation = pan.translation(in: pan.view)
+        let velocity = pan.velocity(in: pan.view)
+        let location = pan.location(in: pan.view)
+        return PageCurlPanSample(
+            translationX: translation.x,
+            translationY: translation.y,
+            velocityX: velocity.x,
+            velocityY: velocity.y,
+            locationX: location.x,
+            locationY: location.y
+        )
     }
 }

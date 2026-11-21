@@ -639,6 +639,10 @@ class EPUBSpreadView: UIView, Loggable, PageView {
     /// progression suppression to a reflow hold (there is none).
     func stopActiveCurlForLifecycle() {}
 
+    /// Reduce Motion or VoiceOver turned on mid-turn: stop animation while
+    /// keeping the still cover until the turn's own cleanup removes it.
+    func stopActiveCurlForAccessibility() {}
+
     /// See `EPUBReflowableSpreadView`. The fixed-layout spread has no curl cover.
     func releaseCurlCancelSuppression() {}
 

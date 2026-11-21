@@ -87,6 +87,22 @@ final class PageSlideView: UIView, PageTurnOverlayView {
     private var interactiveContinuation: CheckedContinuation<Void, Never>?
     private var lifecycleStops = 0
 
+    var currentProgress: CGFloat { progress }
+    var cardFrameForTesting: CGRect { cardShadowView.frame }
+    var staticHalfClipFrameForTesting: CGRect? {
+        staticHalfClipView.isHidden ? nil : staticHalfClipView.frame
+    }
+    var isCoverHiddenForTesting: Bool { coverView.isHidden }
+    var underImageForTesting: UIImage? { underImageView.image }
+    var cardImageForTesting: UIImage? { cardImageView.image }
+    var staticHalfImageForTesting: UIImage? { staticHalfImageView.image }
+    var cornerRadiusForTesting: CGFloat { cardClipView.layer.cornerRadius }
+    var shadowOpacityForTesting: Float { cardShadowView.layer.shadowOpacity }
+    var elevationTintAlphaForTesting: CGFloat { elevationTintView.alpha }
+    /// Test hook called after each display-link tick so tests can observe live
+    /// tap and spring frames without racing sleeps.
+    var onClockTickForTesting: ((CGFloat) -> Void)?
+
     private enum InteractivePhase {
         case none
         case track
@@ -373,11 +389,12 @@ final class PageSlideView: UIView, PageTurnOverlayView {
         self.peelSign = peelSign
         self.reversed = reversed
         resolvedCornerRadius = resolveDisplayCornerRadius()
-        // Reversed (1-page backward): incoming enters as the lifted card over still outgoing.
-        // Otherwise: outgoing (full page or turning half) lifts and slides over still incoming.
+        // Reversed (backward): incoming enters as the lifted card (and its
+        // complementary half on two-page spreads) over the still outgoing spread.
+        // Forward: outgoing lifts and slides over the still incoming spread.
         underImageView.image = reversed ? outgoing : incoming
         cardImageView.image = reversed ? incoming : outgoing
-        staticHalfImageView.image = outgoing
+        staticHalfImageView.image = reversed ? incoming : outgoing
         PageCurlDebug.log(
             "slide-begin spine=\(spine) peel=\(String(format: "%.0f", peelSign)) "
                 + "reversed=\(reversed) radius=\(String(format: "%.1f", resolvedCornerRadius)) "
@@ -548,6 +565,7 @@ final class PageSlideView: UIView, PageTurnOverlayView {
         let t = tapDuration > 0 ? elapsed / tapDuration : 1
         progress = PageSlideGeometry.tapEaseOut(CGFloat(min(1, t)))
         applyLayout()
+        onClockTickForTesting?(progress)
         if t >= 1 {
             progress = 1
             applyLayout()
@@ -573,6 +591,7 @@ final class PageSlideView: UIView, PageTurnOverlayView {
             progress = springTarget
         }
         applyLayout()
+        onClockTickForTesting?(progress)
         if landed {
             endInteractive()
         }

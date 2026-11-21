@@ -98,6 +98,89 @@ class PageCurlPanStateMachineTests: XCTestCase {
         ))
     }
 
+    func testIndirectSlideTurnAllowsPagedSlideOnlyAndRespectsGuards() {
+        XCTAssertTrue(PageCurlPanStateMachine.allowsIndirectSlideTurn(
+            preference: .slide, scrolls: false, reduceMotion: false, voiceOverRunning: false
+        ))
+        XCTAssertFalse(PageCurlPanStateMachine.allowsIndirectSlideTurn(
+            preference: .curl, scrolls: false, reduceMotion: false, voiceOverRunning: false
+        ))
+        XCTAssertFalse(PageCurlPanStateMachine.allowsIndirectSlideTurn(
+            preference: .fade, scrolls: false, reduceMotion: false, voiceOverRunning: false
+        ))
+        XCTAssertFalse(PageCurlPanStateMachine.allowsIndirectSlideTurn(
+            preference: .none, scrolls: false, reduceMotion: false, voiceOverRunning: false
+        ))
+        XCTAssertFalse(PageCurlPanStateMachine.allowsIndirectSlideTurn(
+            preference: .slide, scrolls: true, reduceMotion: false, voiceOverRunning: false
+        ))
+        XCTAssertFalse(PageCurlPanStateMachine.allowsIndirectSlideTurn(
+            preference: .slide, scrolls: false, reduceMotion: true, voiceOverRunning: false
+        ))
+        XCTAssertFalse(PageCurlPanStateMachine.allowsIndirectSlideTurn(
+            preference: .slide, scrolls: false, reduceMotion: false, voiceOverRunning: true
+        ))
+
+        // LTR / RTL direction mapping, including cursor resting in the left dismiss bezel.
+        XCTAssertEqual(
+            PageCurlPanStateMachine.indirectScrollDirection(
+                sample: sample(translationX: -20, velocityX: -200, locationX: 5),
+                context: context(rtl: false)
+            ),
+            .forward
+        )
+        XCTAssertEqual(
+            PageCurlPanStateMachine.indirectScrollDirection(
+                sample: sample(translationX: 20, velocityX: 200, locationX: 5),
+                context: context(rtl: false)
+            ),
+            .backward
+        )
+        XCTAssertEqual(
+            PageCurlPanStateMachine.indirectScrollDirection(
+                sample: sample(translationX: 20, velocityX: 200, locationX: 385),
+                context: context(rtl: true)
+            ),
+            .forward
+        )
+        XCTAssertEqual(
+            PageCurlPanStateMachine.indirectScrollDirection(
+                sample: sample(translationX: -20, velocityX: -200, locationX: 385),
+                context: context(rtl: true)
+            ),
+            .backward
+        )
+        // Vertical, boundaries, selection, zoomed, disabled, busy are rejected.
+        XCTAssertNil(PageCurlPanStateMachine.indirectScrollDirection(
+            sample: sample(translationX: -10, translationY: -50, velocityX: -30, velocityY: -300),
+            context: context()
+        ))
+        XCTAssertNil(PageCurlPanStateMachine.indirectScrollDirection(
+            sample: sample(translationX: -20, velocityX: -200),
+            context: context(canGoForward: false)
+        ))
+        XCTAssertNil(PageCurlPanStateMachine.indirectScrollDirection(
+            sample: sample(translationX: 20, velocityX: 200),
+            context: context(canGoBackward: false)
+        ))
+        XCTAssertNil(PageCurlPanStateMachine.indirectScrollDirection(
+            sample: sample(translationX: -20, velocityX: -200),
+            context: context(hasSelection: true)
+        ))
+        XCTAssertNil(PageCurlPanStateMachine.indirectScrollDirection(
+            sample: sample(translationX: -20, velocityX: -200),
+            context: context(zoomed: true)
+        ))
+        XCTAssertNil(PageCurlPanStateMachine.indirectScrollDirection(
+            sample: sample(translationX: -20, velocityX: -200),
+            context: context(enabled: false)
+        ))
+        XCTAssertNil(PageCurlPanStateMachine.indirectScrollDirection(
+            sample: sample(translationX: -20, velocityX: -200),
+            context: context(acceptsGesture: false)
+        ))
+    }
+
     func testDistanceThresholdAndVelocityProjection() {
         // Strictly above 0.35. Sitting on the line is not a commit.
         XCTAssertEqual(

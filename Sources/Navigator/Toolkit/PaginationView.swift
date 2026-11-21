@@ -286,9 +286,17 @@ final class PaginationView: UIView, Loggable {
     /// compare against it so a reload cannot receive the stale turn.
     var turnGeneration: UInt { reloadGeneration }
     private weak var activeCurlView: (any PageTurnOverlayView)?
+    /// Set by `stopActiveCurlForAccessibility()` so the turn stops animating
+    /// while keeping `activeCurlView` tracked for reloads and still-cover cleanup.
+    private var activeCurlStoppedForAccessibility = false
     /// A posture cancel removed the cover. The turn's defer must not clear
     /// progression suppression a reflow hold just took.
     private var curlCancelKeepsSuppression = false
+    /// Test hooks defaulting to live UIAccessibility state.
+    var reduceMotionProvider: () -> Bool = { UIAccessibility.isReduceMotionEnabled }
+    var voiceOverProvider: () -> Bool = { UIAccessibility.isVoiceOverRunning }
+    var isSuppressingProgressionForTesting: Bool { suppressProgressionDuringLoad }
+    var activeOverlayForTesting: (any PageTurnOverlayView)? { activeCurlView }
 
     /// Reloads the pagination with the given total number of pages and current index.
     ///
@@ -330,6 +338,18 @@ final class PaginationView: UIView, Loggable {
         activeCurlView?.releaseResources()
         activeCurlView?.removeFromSuperview()
         activeCurlView = nil
+        activeCurlStoppedForAccessibility = false
+    }
+
+    /// Stops an active cross-resource curl or slide when Reduce Motion or
+    /// VoiceOver turns on, keeping the still cover and progression suppression
+    /// intact until the incoming chapter finishes loading and painting.
+    func stopActiveCurlForAccessibility() {
+        guard let overlay = activeCurlView else {
+            return
+        }
+        activeCurlStoppedForAccessibility = true
+        overlay.freezeOnCover()
     }
 
     /// Drops the suppression a curl cancel kept, when no reflow hold took it.
@@ -487,7 +507,7 @@ final class PaginationView: UIView, Loggable {
         // A locator seek inside the current resource keeps the 3.9.0 path.
         // Page transitions apply when the resource index changes.
         if currentIndex == index {
-            let shouldAnimate = options.animated && !UIAccessibility.isReduceMotionEnabled
+            let shouldAnimate = options.animated && !reduceMotionProvider()
             await scrollToView(at: index, location: location, animated: shouldAnimate)
             return true
         }
@@ -497,9 +517,9 @@ final class PaginationView: UIView, Loggable {
             PageTransitionPolicy.Request(
                 preference: pageTransition,
                 animated: options.animated,
-                reduceMotion: UIAccessibility.isReduceMotionEnabled,
+                reduceMotion: reduceMotionProvider(),
                 scrolls: scrolls,
-                voiceOverRunning: UIAccessibility.isVoiceOverRunning,
+                voiceOverRunning: voiceOverProvider(),
                 resourceDistance: distance,
                 overrideRaw: options.pageTransitionOverride
             )
@@ -622,6 +642,35 @@ final class PaginationView: UIView, Loggable {
         return view
     }
 
+    private func resolvedOverlayTransition(for style: PageTransition, distance: Int) -> PageTransition {
+        PageTransitionPolicy.rendered(PageTransitionPolicy.resolve(
+            PageTransitionPolicy.Request(
+                preference: style,
+                animated: true,
+                reduceMotion: reduceMotionProvider(),
+                scrolls: scrolls,
+                voiceOverRunning: voiceOverProvider(),
+                resourceDistance: distance,
+                overrideRaw: nil
+            )
+        ))
+    }
+
+    private func fallbackNeighborTurnAfterPreparation(
+        at index: Int,
+        location: PageLocation,
+        resolved: PageTransition
+    ) async {
+        switch resolved {
+        case .fade:
+            await crossfadeToView(at: index, location: location)
+        case .none:
+            await slideToView(at: index, location: location, animated: false)
+        case .slide, .curl:
+            await slideToView(at: index, location: location, animated: true)
+        }
+    }
+
     /// Neighbour resource curl or lifted-card slide. The outgoing cover stays up,
     /// opaque, until the incoming spread has loaded and painted, then the overlay runs.
     private func turnToViewWithOverlay(at index: Int, location: PageLocation, style: PageTransition) async {
@@ -639,7 +688,11 @@ final class PaginationView: UIView, Loggable {
             guard pageTurnAttached(generation) else {
                 return
             }
-            await slideToView(at: index, location: location, animated: true)
+            await fallbackNeighborTurnAfterPreparation(
+                at: index,
+                location: location,
+                resolved: resolvedOverlayTransition(for: style, distance: 1)
+            )
             return
         }
 
@@ -652,6 +705,12 @@ final class PaginationView: UIView, Loggable {
         guard pageTurnAttached(generation) else {
             return
         }
+        let prepared = resolvedOverlayTransition(for: style, distance: 1)
+        if prepared != style {
+            await fallbackNeighborTurnAfterPreparation(at: index, location: location, resolved: prepared)
+            return
+        }
+
         let rtl = readingProgression == .rtl
         let forward = index > currentIndex
         let spine = PageCurlSpine.resolve(
@@ -670,6 +729,13 @@ final class PaginationView: UIView, Loggable {
         overlay.showCover(outgoing, background: background)
         addSubview(overlay)
         activeCurlView = overlay
+        activeCurlStoppedForAccessibility = false
+        let running = { [weak self, weak overlay] in
+            overlay != nil
+                && overlay?.superview != nil
+                && self?.activeCurlView === overlay
+                && self?.activeCurlStoppedForAccessibility == false
+        }
 
         var ownsFlags = false
         defer {
@@ -677,6 +743,7 @@ final class PaginationView: UIView, Loggable {
             curlCancelKeepsSuppression = false
             if activeCurlView === overlay {
                 activeCurlView = nil
+                activeCurlStoppedForAccessibility = false
             }
             overlay.releaseResources()
             overlay.removeFromSuperview()
@@ -704,30 +771,56 @@ final class PaginationView: UIView, Loggable {
         let fromOffset = scrollView.contentOffset
         setCurrentIndex(index, location: location)
         await preparePageInViewport(at: index, fromOffset: fromOffset)
-        guard pageTurnAttached(generation) else {
+        guard pageTurnAttached(generation), overlay.superview != nil else {
             return
         }
+        let afterPrepare = resolvedOverlayTransition(for: style, distance: 1)
+        if !running() || afterPrepare != style {
+            if afterPrepare == .fade {
+                await PageTransitionAnimator.fade(overlay, to: 0, duration: PageTransitionAnimator.fadeDuration)
+            }
+            return
+        }
+
         let shot = await PageCurlSnapshotter.capture(
             of: loadedViews[index] ?? self,
             backgroundColor: background
         )
-        guard pageTurnAttached(generation) else {
+        guard pageTurnAttached(generation), overlay.superview != nil else {
             return
         }
+        let beforeAnimate = resolvedOverlayTransition(for: style, distance: 1)
+        if !running() || beforeAnimate != style {
+            if beforeAnimate == .fade {
+                await PageTransitionAnimator.fade(overlay, to: 0, duration: PageTransitionAnimator.fadeDuration)
+            }
+            return
+        }
+
         switch PageCurlGeometry.incomingReveal(snapshotSucceeded: shot != nil) {
         case .crossfade:
             await PageTransitionAnimator.fade(overlay, to: 0, duration: PageTransitionAnimator.fadeDuration)
         case .cylinder:
-            guard let shot, UIApplication.shared.applicationState == .active else {
+            guard let shot,
+                  UIApplication.shared.applicationState == .active,
+                  running(),
+                  resolvedOverlayTransition(for: style, distance: 1) == style
+            else {
                 return
             }
+            let peelSign = style == .slide
+                ? PageSlideGeometry.peelSign(rtl: rtl)
+                : PageCurlGeometry.peelSign(spine: spine, rtl: rtl, forward: forward)
+            let reversed = style == .slide
+                ? PageSlideGeometry.playsReversed(forward: forward)
+                : PageCurlGeometry.playsReversed(renderedColumns: columns, forward: forward)
             await overlay.runTap(
                 outgoing: outgoing,
                 incoming: shot,
                 spine: spine,
-                peelSign: PageCurlGeometry.peelSign(spine: spine, rtl: rtl, forward: forward),
+                peelSign: peelSign,
                 realVerso: columns >= 2,
-                reversed: PageCurlGeometry.playsReversed(renderedColumns: columns, forward: forward),
+                reversed: reversed,
                 duration: style == .slide ? PageSlideGeometry.tapDuration : PageCurlGeometry.tapDuration
             )
         }
