@@ -69,7 +69,16 @@ class PageCurlPanControllerTests: XCTestCase {
             )
         }
         func curlPanPrerenderBeyond(direction: PageCurlTurnDirection, withinResource: Bool) async {}
-        func curlPanCommit(direction: PageCurlTurnDirection, withinResource: Bool) async {}
+        var commitLands = true
+        var commits = 0
+        var committedTurns: [PageCurlTurnDirection] = []
+        var onCommit: (() -> Void)?
+        func curlPanCommit(direction: PageCurlTurnDirection, withinResource: Bool) async -> Bool {
+            commits += 1
+            onCommit?()
+            return commitLands
+        }
+        func curlPanDidCommitTurn(direction: PageCurlTurnDirection) { committedTurns.append(direction) }
         func curlPanCancel(direction: PageCurlTurnDirection, withinResource: Bool) async { didCancel += 1 }
         func curlPanDidFinish() { didFinish += 1 }
     }
@@ -150,6 +159,98 @@ class PageCurlPanControllerTests: XCTestCase {
         XCTAssertNil(slide?.superview)
         XCTAssertNil(slide?.cardImageForTesting)
         XCTAssertNil(slide?.underImageForTesting)
+    }
+
+    /// An armed Slide drag, ready to be released. `finish` is what the recognizer's
+    /// end state runs.
+    private func armedSlideDrag() async -> (PageCurlPanController, Delegate) {
+        let bounds = CGRect(x: 0, y: 0, width: 402, height: 874)
+        let window = UIWindow(frame: bounds)
+        let host = UIView(frame: bounds)
+        window.addSubview(host)
+        window.makeKeyAndVisible()
+        let renderer = UIGraphicsImageRenderer(size: CGSize(width: 20, height: 20))
+        let delegate = Delegate()
+        delegate.accepts = true
+        delegate.hostView = host
+        delegate.makeSlide = true
+        delegate.outgoingImage = renderer.image { $0.fill(CGRect(x: 0, y: 0, width: 20, height: 20)) }
+        delegate.incomingImage = renderer.image { $0.fill(CGRect(x: 0, y: 0, width: 20, height: 20)) }
+        let controller = PageCurlPanController()
+        controller.delegate = delegate
+        controller.attach(to: host)
+        controller.begin(controller.recognizer)
+        for _ in 0 ..< 100 where !controller.isArmedForTesting {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        windows.append(window)
+        return (controller, delegate)
+    }
+
+    private var windows: [UIWindow] = []
+
+    func testACommittedDragReportsItsTurnExactlyOnce() async {
+        let (controller, delegate) = await armedSlideDrag()
+        XCTAssertTrue(controller.isArmedForTesting)
+        await controller.finish(commit: true, velocity: 0)
+        XCTAssertEqual(delegate.commits, 1)
+        XCTAssertEqual(delegate.committedTurns, [.forward])
+        XCTAssertEqual(delegate.didCancel, 0)
+        XCTAssertEqual(delegate.didFinish, 1)
+        // A second release of the same drag does nothing.
+        await controller.finish(commit: true, velocity: 0)
+        XCTAssertEqual(delegate.committedTurns, [.forward])
+    }
+
+    func testADragThatSnapsBackReportsNoTurn() async {
+        let (controller, delegate) = await armedSlideDrag()
+        await controller.finish(commit: false, velocity: 0)
+        XCTAssertEqual(delegate.commits, 0)
+        XCTAssertEqual(delegate.didCancel, 1)
+        XCTAssertTrue(delegate.committedTurns.isEmpty)
+    }
+
+    func testACommitThatDoesNotLandReportsNoTurn() async {
+        // The spread the drag prepared was replaced (reload): nothing turned.
+        let (controller, delegate) = await armedSlideDrag()
+        delegate.commitLands = false
+        await controller.finish(commit: true, velocity: 0)
+        XCTAssertEqual(delegate.commits, 1)
+        XCTAssertTrue(delegate.committedTurns.isEmpty)
+    }
+
+    func testAStopDuringTheCommitReportsNoTurn() async {
+        // Reload, background, Reduce Motion or VoiceOver cuts the turn while it lands.
+        let (controller, delegate) = await armedSlideDrag()
+        delegate.onCommit = { controller.abort() }
+        await controller.finish(commit: true, velocity: 0)
+        XCTAssertEqual(delegate.commits, 1)
+        XCTAssertTrue(delegate.committedTurns.isEmpty)
+        XCTAssertFalse(controller.turnInFlight)
+    }
+
+    func testAStopBeforeTheReleaseReportsNoTurnAndTheDragCancels() async {
+        let (controller, delegate) = await armedSlideDrag()
+        controller.abort()
+        await controller.finish(commit: true, velocity: 0)
+        XCTAssertEqual(delegate.commits, 0)
+        XCTAssertTrue(delegate.committedTurns.isEmpty)
+    }
+
+    func testAGoMarkedAsUserInputCarriesItsSource() {
+        var options = NavigatorGoOptions(animated: true)
+        XCTAssertNil(options.userTurnSource)
+        for source in [UserPageTurnSource.drag, .trackpad, .tap, .key] {
+            options.userTurnSource = source
+            XCTAssertEqual(options.userTurnSource, source)
+            XCTAssertTrue(options.animated)
+        }
+        options.userTurnSource = nil
+        XCTAssertNil(options.userTurnSource)
+        // Another option is not a source.
+        var other = NavigatorGoOptions()
+        other.otherOptions["userTurnSource"] = .string("somethingElse")
+        XCTAssertNil(other.userTurnSource)
     }
 
     private final class ScrollDelegate: PageSlideScrollDelegate {

@@ -587,14 +587,15 @@ final class PaginationView: UIView, Loggable {
     }
 
     /// Lands on the neighbour under a curl that has already finished. No second animation.
-    func commitCurlNeighbor(forward: Bool) async {
+    @discardableResult
+    func commitCurlNeighbor(forward: Bool) async -> Bool {
         let generation = reloadGeneration
         guard pageTurnAttached(generation) else {
-            return
+            return false
         }
         let index = neighborIndex(forward: forward)
         guard (0 ..< pageCount).contains(index) else {
-            return
+            return false
         }
         let location: PageLocation = forward ? .start : .end
         isAnimatingContentOffset = true
@@ -604,12 +605,13 @@ final class PaginationView: UIView, Loggable {
         setCurrentIndex(index, location: location)
         await preparePageInViewport(at: index, fromOffset: from)
         guard generation == reloadGeneration else {
-            return
+            return false
         }
         suppressProgressionDuringLoad = false
         loadedViews[index]?.setSuppressingProgressionUpdates(false)
         isAnimatingContentOffset = false
         scrollView.isScrollEnabled = isScrollEnabled
+        return true
     }
 
     private func neighborIndex(forward: Bool) -> Int {

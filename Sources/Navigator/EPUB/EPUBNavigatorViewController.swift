@@ -17,10 +17,33 @@ import WebKit
     // MARK: - WebView Customization
 
     func navigator(_ navigator: EPUBNavigatorViewController, setupUserScripts userContentController: WKUserContentController)
+
+    // MARK: - User page turns
+
+    /// Called exactly once when a turn the user started has landed on the new page.
+    ///
+    /// Reported: a Slide or Curl drag released past its commit point (`.drag`), a
+    /// trackpad or mouse-wheel Slide turn (`.trackpad`), and an accepted
+    /// `goForward` / `goBackward` the host marked with
+    /// `NavigatorGoOptions.userTurnSource` (`.tap`, `.key`).
+    ///
+    /// Never reported: a drag that snaps back, a turn aborted by a reload, rotation,
+    /// backgrounding or an accessibility change, `go(to:)`, a link, or a relayout.
+    func navigator(
+        _ navigator: EPUBNavigatorViewController,
+        didCommitUserPageTurn direction: UserPageTurnDirection,
+        source: UserPageTurnSource
+    )
 }
 
 public extension EPUBNavigatorDelegate {
     func navigator(_ navigator: EPUBNavigatorViewController, setupUserScripts userContentController: WKUserContentController) {}
+
+    func navigator(
+        _ navigator: EPUBNavigatorViewController,
+        didCommitUserPageTurn direction: UserPageTurnDirection,
+        source: UserPageTurnSource
+    ) {}
 }
 
 public typealias EPUBContentInsets = (top: CGFloat, bottom: CGFloat)
@@ -702,7 +725,11 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     }
 
     /// Goes to the next or previous page in the given scroll direction.
-    private func go(to direction: EPUBSpreadView.Direction, options: NavigatorGoOptions) async -> Bool {
+    private func go(
+        to direction: EPUBSpreadView.Direction,
+        turn: UserPageTurnDirection,
+        options: NavigatorGoOptions
+    ) async -> Bool {
         guard
             let paginationView = paginationView,
             on(.move(direction))
@@ -721,6 +748,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                 return false
             }
             on(.moved)
+            reportUserTurn(turn, options: options)
             return true
         }
 
@@ -741,7 +769,18 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             return false
         }
         on(.moved)
+        if moved {
+            reportUserTurn(turn, options: options)
+        }
         return moved
+    }
+
+    /// Reports a landed move the host marked as the user's (see `NavigatorGoOptions.userTurnSource`).
+    private func reportUserTurn(_ turn: UserPageTurnDirection, options: NavigatorGoOptions) {
+        guard let source = options.userTurnSource else {
+            return
+        }
+        delegate?.navigator(self, didCommitUserPageTurn: turn, source: source)
     }
 
     // MARK: - Pagination and spreads
@@ -1014,7 +1053,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                 return .left
             }
         }()
-        return await go(to: direction, options: options)
+        return await go(to: direction, turn: .forward, options: options)
     }
 
     @discardableResult
@@ -1027,7 +1066,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                 return .right
             }
         }()
-        return await go(to: direction, options: options)
+        return await go(to: direction, turn: .backward, options: options)
     }
 
     // MARK: - SelectableNavigator
@@ -2000,16 +2039,28 @@ extension EPUBNavigatorViewController: PageCurlPanDelegate {
         curlDragBeyond = image
     }
 
-    func curlPanCommit(direction: PageCurlTurnDirection, withinResource: Bool) async {
+    func curlPanCommit(direction: PageCurlTurnDirection, withinResource: Bool) async -> Bool {
         guard curlSessionCurrent else {
-            return
+            return false
         }
         if withinResource {
             await (curlSessionSpread as? EPUBReflowableSpreadView)?.commitCurlIncoming()
+            // A reload during the await replaced the spread this drag turned.
+            guard curlSessionCurrent else {
+                return false
+            }
             storeCommittedCurlPages(direction: direction)
-            return
+            return true
         }
-        await paginationView?.commitCurlNeighbor(forward: direction == .forward)
+        return await paginationView?.commitCurlNeighbor(forward: direction == .forward) ?? false
+    }
+
+    func curlPanDidCommitTurn(direction: PageCurlTurnDirection) {
+        delegate?.navigator(
+            self,
+            didCommitUserPageTurn: direction == .forward ? .forward : .backward,
+            source: .drag
+        )
     }
 
     func curlPanCancel(direction: PageCurlTurnDirection, withinResource: Bool) async {
@@ -2208,7 +2259,8 @@ extension EPUBNavigatorViewController: PageSlideScrollDelegate {
             guard let self else {
                 return
             }
-            let options = NavigatorGoOptions(animated: true)
+            var options = NavigatorGoOptions(animated: true)
+            options.userTurnSource = .trackpad
             switch direction {
             case .forward:
                 _ = await self.goForward(options: options)

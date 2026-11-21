@@ -71,6 +71,45 @@ public struct NavigatorGoOptions: Hashable {
     }
 }
 
+/// Where a committed user page turn came from.
+public enum UserPageTurnSource: String, Hashable, Sendable {
+    /// A finger drag (Slide or Curl) released past its commit point.
+    case drag
+    /// A trackpad or mouse-wheel scroll that turned the page.
+    case trackpad
+    /// An edge tap. Only reported when the host marks its `goForward` / `goBackward`
+    /// call with `NavigatorGoOptions.userTurnSource`: the navigator cannot tell an
+    /// edge tap from a programmatic move.
+    case tap
+    /// A hardware key or page-turner. Marked by the host like `tap`.
+    case key
+}
+
+/// Which way a committed user page turn moved, in reading order.
+public enum UserPageTurnDirection: String, Hashable, Sendable {
+    case forward
+    case backward
+}
+
+extension NavigatorGoOptions {
+    static let userTurnSourceKey = "userTurnSource"
+
+    /// Marks a `goForward` / `goBackward` as the user's own input. A marked move that
+    /// the navigator accepts is reported once through
+    /// `EPUBNavigatorDelegate.navigator(_:didCommitUserPageTurn:source:)`. Unmarked
+    /// moves, `go(to:)`, links and relayouts are never reported.
+    public var userTurnSource: UserPageTurnSource? {
+        get { otherOptions[Self.userTurnSourceKey]?.string.flatMap(UserPageTurnSource.init(rawValue:)) }
+        set {
+            if let newValue {
+                otherOptions[Self.userTurnSourceKey] = .string(newValue.rawValue)
+            } else {
+                otherOptions.removeValue(forKey: Self.userTurnSourceKey)
+            }
+        }
+    }
+}
+
 public extension Navigator {
     @discardableResult
     func go(to locator: Locator, options: NavigatorGoOptions = NavigatorGoOptions()) async -> Bool {

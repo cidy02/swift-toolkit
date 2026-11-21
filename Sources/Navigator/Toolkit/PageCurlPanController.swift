@@ -41,12 +41,19 @@ protocol PageCurlPanDelegate: AnyObject {
     ) async -> PageCurlPanFrame?
     /// Runs alongside the committing spring, before `curlPanCommit`.
     func curlPanPrerenderBeyond(direction: PageCurlTurnDirection, withinResource: Bool) async
-    func curlPanCommit(direction: PageCurlTurnDirection, withinResource: Bool) async
+    /// Lands the committed turn. True once the page under the cover is the new one;
+    /// false when the spread it was prepared on is gone (reload, detach).
+    func curlPanCommit(direction: PageCurlTurnDirection, withinResource: Bool) async -> Bool
+    /// The drag's turn has landed and nothing aborted it: reported exactly once per
+    /// committed drag, never for a snap-back or an aborted one.
+    func curlPanDidCommitTurn(direction: PageCurlTurnDirection)
     func curlPanCancel(direction: PageCurlTurnDirection, withinResource: Bool) async
     func curlPanDidFinish()
 }
 
 extension PageCurlPanDelegate {
+    func curlPanDidCommitTurn(direction: PageCurlTurnDirection) {}
+
     func curlPanMakeOverlayView(frame: CGRect) -> any PageTurnOverlayView {
         PageCurlView(frame: frame)
     }
@@ -478,7 +485,8 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
         }
     }
 
-    private func finish(commit: Bool, velocity: CGFloat) async {
+    /// Internal for tests: UIKit does not let a test release a recognizer.
+    func finish(commit: Bool, velocity: CGFloat) async {
         guard phase != .idle, phase != .finishing else { return }
         phase = .finishing
         let width = delegate?.curlPanHostView()?.bounds.width ?? 1
@@ -509,11 +517,16 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
         // onto a navigator that reloaded while the leaf was moving. The delegate
         // also drops the call when the spread it prepared is gone.
         let landed = willCommit && !aborted
+        var turned = false
         if landed {
-            await delegate?.curlPanCommit(direction: direction, withinResource: withinResource)
+            turned = await delegate?.curlPanCommit(direction: direction, withinResource: withinResource) ?? false
         } else if revealed {
             await delegate?.curlPanCancel(direction: direction, withinResource: withinResource)
         }
+        // Read before `aborted` is cleared: a turn a stop (reload, background,
+        // Reduce Motion, VoiceOver) cut while it landed is an aborted turn, not a user turn.
+        let reportTurn = turned && !aborted
+        let turnDirection = direction
         tearDown()
         delegate?.curlPanDidFinish()
         phase = .idle
@@ -522,6 +535,9 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
         pendingRelease = nil
         aborted = false
         resumeAbortWaiter()
+        if reportTurn {
+            delegate?.curlPanDidCommitTurn(direction: turnDirection)
+        }
     }
 
     private func failBeforeReveal() async {
