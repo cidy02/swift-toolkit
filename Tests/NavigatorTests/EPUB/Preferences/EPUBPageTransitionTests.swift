@@ -129,6 +129,15 @@ class EPUBPageTransitionTests: XCTestCase {
 
         XCTAssertEqual(resolve(animated: false), .none)
         XCTAssertEqual(resolve(reduceMotion: true), .none)
+        // Reduce Motion turns a requested Slide into Fast Fade; Curl, Fast Fade and
+        // None stay instant, and explicit unanimated calls still win.
+        XCTAssertEqual(resolve(preference: .slide, reduceMotion: true), .fade)
+        XCTAssertEqual(resolve(preference: .slide, reduceMotion: true, resourceDistance: 4), .fade)
+        XCTAssertEqual(resolve(preference: .slide, animated: false, reduceMotion: true), .none)
+        XCTAssertEqual(resolve(preference: .slide, reduceMotion: true, scrolls: true), .none)
+        XCTAssertEqual(resolve(preference: .slide, reduceMotion: true, voiceOverRunning: true), .none)
+        XCTAssertEqual(resolve(preference: .fade, reduceMotion: true), .none)
+        XCTAssertEqual(resolve(preference: .curl, reduceMotion: true), .none)
         XCTAssertEqual(resolve(scrolls: true), .none)
         XCTAssertEqual(resolve(voiceOverRunning: true), .none)
         XCTAssertEqual(resolve(preference: .none), .none)
