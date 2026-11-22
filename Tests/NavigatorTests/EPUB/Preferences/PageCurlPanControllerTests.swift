@@ -5,6 +5,7 @@
 //
 
 @testable import ReadiumNavigator
+import ReadiumShared
 import UIKit
 import UIKit.UIGestureRecognizerSubclass
 import XCTest
@@ -339,6 +340,86 @@ class PageCurlPanControllerTests: XCTestCase {
         controller.handle(state: .began, sample: vertical, in: host)
         controller.handle(state: .ended, sample: vertical, in: host)
         XCTAssertEqual(delegate.turns.count, 3)
+    }
+
+    @MainActor private final class TurnRecorder: EPUBNavigatorDelegate {
+        var turns: [(direction: UserPageTurnDirection, source: UserPageTurnSource)] = []
+
+        func navigator(_ navigator: Navigator, presentError error: NavigatorError) {}
+        func navigator(_ navigator: Navigator, locationDidChange locator: Locator) {}
+        func navigator(
+            _ navigator: EPUBNavigatorViewController,
+            didCommitUserPageTurn direction: UserPageTurnDirection,
+            source: UserPageTurnSource
+        ) {
+            turns.append((direction, source))
+        }
+    }
+
+    /// An accepted trackpad swipe, driven through the navigator's own installed Slide
+    /// recognizer controller, must land the page and tell the host exactly once, as a
+    /// `.trackpad` forward turn. (Drops `options.userTurnSource = .trackpad` or the
+    /// callback and this fails; the indirect-controller tests above stop at a fake delegate.)
+    @MainActor
+    func testAcceptedTrackpadSwipeThroughTheNavigatorReportsOneTrackpadTurn() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kudos-trackpad-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        for name in ["a", "b"] {
+            let html = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><html xmlns=\"http://www.w3.org/1999/xhtml\">"
+                + "<head><title>\(name)</title></head><body><p>Chapter \(name)</p></body></html>"
+            try html.write(to: directory.appendingPathComponent("\(name).xhtml"), atomically: true, encoding: .utf8)
+        }
+        let container = try await DirectoryContainer(directory: XCTUnwrap(FileURL(url: directory)))
+        let publication = Publication(
+            manifest: Manifest(
+                metadata: Metadata(title: "Trackpad"),
+                readingOrder: [
+                    Link(href: "a.xhtml", mediaType: .xhtml),
+                    Link(href: "b.xhtml", mediaType: .xhtml),
+                ]
+            ),
+            container: container
+        )
+        let navigator = try EPUBNavigatorViewController(
+            publication: publication,
+            initialLocation: nil,
+            config: .init(preferences: EPUBPreferences(pageTransition: .slide))
+        )
+        let recorder = TurnRecorder()
+        navigator.delegate = recorder
+
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
+        window.rootViewController = navigator
+        window.makeKeyAndVisible()
+        defer { window.isHidden = true }
+
+        // Wait for the first chapter to load and the controller to be armed.
+        var armed = false
+        for _ in 0 ..< 100 where !armed {
+            try await Task.sleep(nanoseconds: 50_000_000)
+            armed = navigator.slideScrollForTesting?.isEnabled == true && navigator.currentLocation != nil
+        }
+        let scroll = try XCTUnwrap(navigator.slideScrollForTesting)
+        XCTAssertTrue(armed, "Navigator must arm the trackpad Slide controller (Reduce Motion / VoiceOver off in the test host)")
+        guard armed else { return }
+
+        let swipe = PageCurlPanSample(
+            translationX: -40, translationY: 1, velocityX: -400, velocityY: 0, locationX: 200, locationY: 400
+        )
+        scroll.handle(state: .began, sample: swipe, in: navigator.view)
+        scroll.handle(state: .changed, sample: swipe, in: navigator.view)
+        scroll.handle(state: .ended, sample: swipe, in: navigator.view)
+
+        for _ in 0 ..< 100 where recorder.turns.isEmpty {
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        // Let any (wrong) second report surface before asserting "exactly once".
+        try await Task.sleep(nanoseconds: 300_000_000)
+        XCTAssertEqual(recorder.turns.count, 1)
+        XCTAssertEqual(recorder.turns.first?.direction, .forward)
+        XCTAssertEqual(recorder.turns.first?.source, .trackpad)
     }
 
     private final class SyntheticPanGestureRecognizer: UIPanGestureRecognizer {

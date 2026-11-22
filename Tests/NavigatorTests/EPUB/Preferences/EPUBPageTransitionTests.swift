@@ -314,6 +314,54 @@ class EPUBPageTransitionTests: XCTestCase {
         var suppressingDuringFade: Bool
     }
 
+    /// Watches a cover fade while it runs. The observer fires before the animator, so
+    /// a fade that became an instant cut (alpha set directly) shows no partial frame.
+    @MainActor
+    private final class FadeProbe {
+        struct MidFlight {
+            var presentationOpacity: Float?
+            var attached: Bool
+            var suppressing: Bool
+        }
+
+        var startedAt: CFTimeInterval?
+        var midFlight: [MidFlight] = []
+
+        func begin(_ view: UIView, pagination: PaginationView, duration: TimeInterval) {
+            startedAt = CACurrentMediaTime()
+            Task { @MainActor [weak view, weak pagination] in
+                try? await Task.sleep(nanoseconds: UInt64(duration * 0.4 * 1_000_000_000))
+                guard let view, let pagination else { return }
+                self.midFlight.append(MidFlight(
+                    presentationOpacity: view.layer.presentation()?.opacity,
+                    attached: view.superview === pagination,
+                    suppressing: pagination.isSuppressingProgressionForTesting
+                ))
+            }
+        }
+
+        func assertRealFade(duration: TimeInterval, finishedAt: CFTimeInterval, _ context: String) {
+            XCTAssertEqual(midFlight.count, 1, "Mid-fade sample missing (\(context))")
+            if let frame = midFlight.first {
+                XCTAssertTrue(frame.attached, "Cover must still be attached mid-fade (\(context))")
+                XCTAssertTrue(frame.suppressing, "Progression must stay suppressed mid-fade (\(context))")
+                let opacity = frame.presentationOpacity ?? -1
+                XCTAssertTrue(
+                    opacity > 0.02 && opacity < 0.98,
+                    "Cover must be partially transparent mid-fade, not cut (opacity \(opacity), \(context))"
+                )
+            }
+            if let startedAt {
+                XCTAssertGreaterThanOrEqual(
+                    finishedAt - startedAt, duration * 0.8,
+                    "Fast Fade must last about its duration, not cut (\(context))"
+                )
+            } else {
+                XCTFail("Fade never started (\(context))")
+            }
+        }
+    }
+
     @MainActor
     private func waitUntil(
         timeout: TimeInterval = 3,
@@ -387,7 +435,10 @@ class EPUBPageTransitionTests: XCTestCase {
             pagination.voiceOverProvider = { voiceOver }
 
             var fades: [ObservedFade] = []
+            let probe = FadeProbe()
+            var finishedAt: CFTimeInterval = 0
             pagination.onFadeCoverForTesting = { view, alpha, duration in
+                probe.begin(view, pagination: pagination, duration: duration)
                 fades.append(ObservedFade(
                     view: view,
                     targetAlpha: alpha,
@@ -411,7 +462,10 @@ class EPUBPageTransitionTests: XCTestCase {
 
             var turnCompleted = false
             let turn = Task { @MainActor in
-                defer { turnCompleted = true }
+                defer {
+                    turnCompleted = true
+                    finishedAt = CACurrentMediaTime()
+                }
                 return await pagination.goToIndex(1, location: .start, options: NavigatorGoOptions(animated: true))
             }
             defer {
@@ -421,6 +475,7 @@ class EPUBPageTransitionTests: XCTestCase {
                     gate.resume(returning: 1)
                 }
                 turn.cancel()
+                pagination.onFadeCoverForTesting = nil
                 pagination.removeFromSuperview()
             }
 
@@ -476,6 +531,7 @@ class EPUBPageTransitionTests: XCTestCase {
                     XCTAssertEqual(fade.view.alpha, 0, accuracy: 0.001, "Fast Fade must animate cover alpha to 0")
                     XCTAssertNil(fade.view.superview)
                 }
+                probe.assertRealFade(duration: PageTransitionAnimator.fadeDuration, finishedAt: finishedAt, "\(testCase)")
             } else {
                 XCTAssertTrue(
                     fades.isEmpty,
@@ -502,7 +558,10 @@ class EPUBPageTransitionTests: XCTestCase {
             pagination.voiceOverProvider = { voiceOver }
 
             var fades: [ObservedFade] = []
+            let probe = FadeProbe()
+            var finishedAt: CFTimeInterval = 0
             pagination.onFadeCoverForTesting = { view, alpha, duration in
+                probe.begin(view, pagination: pagination, duration: duration)
                 fades.append(ObservedFade(
                     view: view,
                     targetAlpha: alpha,
@@ -526,7 +585,10 @@ class EPUBPageTransitionTests: XCTestCase {
 
             var turnCompleted = false
             let turn = Task { @MainActor in
-                defer { turnCompleted = true }
+                defer {
+                    turnCompleted = true
+                    finishedAt = CACurrentMediaTime()
+                }
                 return await pagination.goToIndex(1, location: .start, options: NavigatorGoOptions(animated: true))
             }
             defer {
@@ -536,6 +598,7 @@ class EPUBPageTransitionTests: XCTestCase {
                     gate.resume()
                 }
                 turn.cancel()
+                pagination.onFadeCoverForTesting = nil
                 pagination.removeFromSuperview()
             }
 
@@ -598,6 +661,7 @@ class EPUBPageTransitionTests: XCTestCase {
                     XCTAssertTrue(fade.suppressingDuringFade)
                     XCTAssertEqual(overlay?.alpha ?? -1, 0, accuracy: 0.001, "Fast Fade must animate overlay alpha to 0")
                 }
+                probe.assertRealFade(duration: PageTransitionAnimator.fadeDuration, finishedAt: finishedAt, "\(testCase)")
             } else {
                 XCTAssertTrue(
                     fades.isEmpty,
