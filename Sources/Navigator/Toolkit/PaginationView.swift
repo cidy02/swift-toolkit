@@ -297,6 +297,7 @@ final class PaginationView: UIView, Loggable {
     var voiceOverProvider: () -> Bool = { UIAccessibility.isVoiceOverRunning }
     var isSuppressingProgressionForTesting: Bool { suppressProgressionDuringLoad }
     var activeOverlayForTesting: (any PageTurnOverlayView)? { activeCurlView }
+    var onFadeCoverForTesting: ((UIView, CGFloat, TimeInterval) -> Void)?
 
     /// Reloads the pagination with the given total number of pages and current index.
     ///
@@ -779,7 +780,7 @@ final class PaginationView: UIView, Loggable {
         let afterPrepare = resolvedOverlayTransition(for: style, distance: 1)
         if !running() || afterPrepare != style {
             if afterPrepare == .fade {
-                await PageTransitionAnimator.fade(overlay, to: 0, duration: PageTransitionAnimator.fadeDuration)
+                await fadeCover(overlay, to: 0, duration: PageTransitionAnimator.fadeDuration)
             }
             return
         }
@@ -794,14 +795,14 @@ final class PaginationView: UIView, Loggable {
         let beforeAnimate = resolvedOverlayTransition(for: style, distance: 1)
         if !running() || beforeAnimate != style {
             if beforeAnimate == .fade {
-                await PageTransitionAnimator.fade(overlay, to: 0, duration: PageTransitionAnimator.fadeDuration)
+                await fadeCover(overlay, to: 0, duration: PageTransitionAnimator.fadeDuration)
             }
             return
         }
 
         switch PageCurlGeometry.incomingReveal(snapshotSucceeded: shot != nil) {
         case .crossfade:
-            await PageTransitionAnimator.fade(overlay, to: 0, duration: PageTransitionAnimator.fadeDuration)
+            await fadeCover(overlay, to: 0, duration: PageTransitionAnimator.fadeDuration)
         case .cylinder:
             guard let shot,
                   UIApplication.shared.applicationState == .active,
@@ -904,7 +905,12 @@ final class PaginationView: UIView, Loggable {
         let fromOffset = scrollView.contentOffset
         setCurrentIndex(index, location: location)
         await preparePageInViewport(at: index, fromOffset: fromOffset)
-        await PageTransitionAnimator.fade(cover, to: 0, duration: PageTransitionAnimator.fadeDuration)
+        await fadeCover(cover, to: 0, duration: PageTransitionAnimator.fadeDuration)
+    }
+
+    private func fadeCover(_ view: UIView, to alpha: CGFloat, duration: TimeInterval) async {
+        onFadeCoverForTesting?(view, alpha, duration)
+        await PageTransitionAnimator.fade(view, to: alpha, duration: duration)
     }
 
     /// Historical jump: fade the whole pagination view out, move, fade in.

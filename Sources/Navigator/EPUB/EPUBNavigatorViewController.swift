@@ -788,6 +788,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     private var paginationView: PaginationView?
     private var curlPan: PageCurlPanController?
     private var slideScroll: PageSlideScrollController?
+    var slideScrollForTesting: PageSlideScrollController? { slideScroll }
     /// Spread and reload generation captured when the finger curl began.
     /// Commit and cancel no-op once a reload has replaced that spread.
     private var curlSessionGeneration: UInt = 0

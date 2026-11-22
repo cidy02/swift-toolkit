@@ -638,7 +638,6 @@ final class PageSlideScrollController: NSObject, UIGestureRecognizerDelegate {
     }
 
     private var hasTriggered = false
-    private var lockedDirection: PageCurlTurnDirection?
 
     override init() {
         recognizer = UIPanGestureRecognizer()
@@ -665,14 +664,10 @@ final class PageSlideScrollController: NSObject, UIGestureRecognizerDelegate {
         else {
             return false
         }
-        guard let direction = PageCurlPanStateMachine.indirectScrollDirection(
+        return PageCurlPanStateMachine.indirectScrollDirection(
             sample: sample(of: pan),
             context: delegate.slideScrollContext(in: view)
-        ) else {
-            return false
-        }
-        lockedDirection = direction
-        return true
+        ) != nil
     }
 
     @objc private func handleScroll(_ gesture: UIPanGestureRecognizer) {
@@ -710,7 +705,7 @@ final class PageSlideScrollController: NSObject, UIGestureRecognizerDelegate {
         guard let direction = PageCurlPanStateMachine.indirectScrollDirection(
             sample: sample,
             context: context
-        ) ?? (ended ? lockedDirection : nil) else {
+        ) else {
             return
         }
         guard PageCurlPanStateMachine.shouldTriggerIndirectScroll(sample: sample, ended: ended) else {
@@ -722,7 +717,6 @@ final class PageSlideScrollController: NSObject, UIGestureRecognizerDelegate {
 
     private func resetSequence() {
         hasTriggered = false
-        lockedDirection = nil
     }
 
     private func sample(of pan: UIPanGestureRecognizer) -> PageCurlPanSample {

@@ -257,6 +257,8 @@ class PageCurlPanControllerTests: XCTestCase {
         var rtl = false
         var canGoForward = true
         var canGoBackward = true
+        var hasSelection = false
+        var zoomed = false
         var enabled = true
         var accepts = true
         var turns: [PageCurlTurnDirection] = []
@@ -268,9 +270,9 @@ class PageCurlPanControllerTests: XCTestCase {
                 viewHeight: view.bounds.height,
                 canGoForward: canGoForward,
                 canGoBackward: canGoBackward,
-                hasSelection: false,
+                hasSelection: hasSelection,
                 interactiveCurlEnabled: enabled,
-                zoomed: false,
+                zoomed: zoomed,
                 acceptsGesture: accepts
             )
         }
@@ -337,5 +339,116 @@ class PageCurlPanControllerTests: XCTestCase {
         controller.handle(state: .began, sample: vertical, in: host)
         controller.handle(state: .ended, sample: vertical, in: host)
         XCTAssertEqual(delegate.turns.count, 3)
+    }
+
+    private final class SyntheticPanGestureRecognizer: UIPanGestureRecognizer {
+        var syntheticTranslation: CGPoint = .zero
+        var syntheticVelocity: CGPoint = .zero
+        var syntheticLocation: CGPoint = .zero
+
+        override func translation(in view: UIView?) -> CGPoint { syntheticTranslation }
+        override func velocity(in view: UIView?) -> CGPoint { syntheticVelocity }
+        override func location(in view: UIView?) -> CGPoint { syntheticLocation }
+    }
+
+    /// A short horizontal trackpad start that turns vertical, acquires a text
+    /// selection, zooms, or hits a boundary before release must not turn on `.ended`.
+    /// Exercises `gestureRecognizerShouldBegin` so recognition-time state is populated.
+    func testSlideScrollControllerRejectsReleaseAfterTurningVerticalOrSelectingText() {
+        let host = UIView(frame: CGRect(x: 0, y: 0, width: 1024, height: 768))
+        let controller = PageSlideScrollController()
+        let delegate = ScrollDelegate()
+        controller.delegate = delegate
+        controller.attach(to: host)
+        controller.isEnabled = true
+
+        let pan = SyntheticPanGestureRecognizer()
+        host.addGestureRecognizer(pan)
+        pan.syntheticLocation = CGPoint(x: 500, y: 400)
+
+        let shortHorizontalStart = PageCurlPanSample(
+            translationX: -8, translationY: 0, velocityX: -40, velocityY: 0, locationX: 500, locationY: 400
+        )
+
+        func recognizeShortHorizontalStart() {
+            pan.syntheticTranslation = CGPoint(x: -8, y: 0)
+            pan.syntheticVelocity = CGPoint(x: -40, y: 0)
+            XCTAssertTrue(controller.gestureRecognizerShouldBegin(pan))
+        }
+
+        // 1. Starts 8 pt horizontal (below 12 pt early commit), then turns vertical (8 pt H, 30 pt V).
+        recognizeShortHorizontalStart()
+        controller.handle(state: .began, sample: shortHorizontalStart, in: host)
+        XCTAssertTrue(delegate.turns.isEmpty)
+        controller.handle(
+            state: .changed,
+            sample: PageCurlPanSample(
+                translationX: -8, translationY: -20, velocityX: 0, velocityY: -80, locationX: 500, locationY: 380
+            ),
+            in: host
+        )
+        controller.handle(
+            state: .ended,
+            sample: PageCurlPanSample(
+                translationX: -8, translationY: -30, velocityX: 0, velocityY: 0, locationX: 500, locationY: 370
+            ),
+            in: host
+        )
+        XCTAssertTrue(delegate.turns.isEmpty, "Gesture that ended mostly vertical must not turn the page")
+
+        // 2. Starts horizontal, then a text selection appears before release.
+        recognizeShortHorizontalStart()
+        controller.handle(state: .began, sample: shortHorizontalStart, in: host)
+        delegate.hasSelection = true
+        controller.handle(
+            state: .ended,
+            sample: PageCurlPanSample(
+                translationX: -8, translationY: 0, velocityX: 0, velocityY: 0, locationX: 500, locationY: 400
+            ),
+            in: host
+        )
+        XCTAssertTrue(delegate.turns.isEmpty, "Selection appearing before release must block the turn")
+        delegate.hasSelection = false
+
+        // 3. Starts horizontal, then the page becomes zoomed before release.
+        recognizeShortHorizontalStart()
+        controller.handle(state: .began, sample: shortHorizontalStart, in: host)
+        delegate.zoomed = true
+        controller.handle(
+            state: .ended,
+            sample: PageCurlPanSample(
+                translationX: -8, translationY: 0, velocityX: 0, velocityY: 0, locationX: 500, locationY: 400
+            ),
+            in: host
+        )
+        XCTAssertTrue(delegate.turns.isEmpty, "Zooming before release must block the turn")
+        delegate.zoomed = false
+
+        // 4. Starts horizontal, then forward navigation becomes unavailable before release.
+        recognizeShortHorizontalStart()
+        controller.handle(state: .began, sample: shortHorizontalStart, in: host)
+        delegate.canGoForward = false
+        controller.handle(
+            state: .ended,
+            sample: PageCurlPanSample(
+                translationX: -8, translationY: 0, velocityX: 0, velocityY: 0, locationX: 500, locationY: 400
+            ),
+            in: host
+        )
+        XCTAssertTrue(delegate.turns.isEmpty, "Unavailable direction before release must block the turn")
+        delegate.canGoForward = true
+
+        // 5. Genuine short horizontal gesture released with near-zero velocity still turns once.
+        recognizeShortHorizontalStart()
+        controller.handle(state: .began, sample: shortHorizontalStart, in: host)
+        XCTAssertTrue(delegate.turns.isEmpty)
+        controller.handle(
+            state: .ended,
+            sample: PageCurlPanSample(
+                translationX: -8, translationY: 0, velocityX: 0, velocityY: 0, locationX: 500, locationY: 400
+            ),
+            in: host
+        )
+        XCTAssertEqual(delegate.turns, [.forward])
     }
 }

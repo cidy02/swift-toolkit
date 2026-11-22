@@ -276,6 +276,7 @@ class EPUBPageTransitionTests: XCTestCase {
     private final class MockPageView: UIView, PageView {
         var onRenderedColumnCount: (() async -> Int)?
         var onReadyForPresentation: (() async -> Void)?
+        private(set) var didAwaitNextPaint = false
         private(set) var isSuppressing = false
 
         func go(to location: PageLocation, animated: Bool) async {}
@@ -286,7 +287,9 @@ class EPUBPageTransitionTests: XCTestCase {
             }
         }
 
-        func awaitNextPaint() async {}
+        func awaitNextPaint() async {
+            didAwaitNextPaint = true
+        }
 
         func setSuppressingProgressionUpdates(_ suppressing: Bool) {
             isSuppressing = suppressing
@@ -298,6 +301,32 @@ class EPUBPageTransitionTests: XCTestCase {
             }
             return 1
         }
+    }
+
+    private struct ObservedFade {
+        var view: UIView
+        var targetAlpha: CGFloat
+        var duration: TimeInterval
+        var destinationPainted: Bool
+        var currentIndex: Int
+        var attachedToPagination: Bool
+        var isSlideOverlay: Bool
+        var suppressingDuringFade: Bool
+    }
+
+    @MainActor
+    private func waitUntil(
+        timeout: TimeInterval = 3,
+        poll: (() -> Void)? = nil,
+        _ condition: () -> Bool
+    ) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !condition() && Date() < deadline {
+            poll?()
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+        poll?()
+        return condition()
     }
 
     @MainActor
@@ -343,13 +372,33 @@ class EPUBPageTransitionTests: XCTestCase {
 
     @MainActor
     func testAccessibilityChangeDuringSlidePreparationSkipsCardAnimation() async {
-        for toggleVoiceOver in [false, true] {
-            let (window, pagination, delegate, page0, _) = makePaginationHarness(transition: .slide)
+        let cases: [(transition: PageTransition, voiceOver: Bool, expectsFade: Bool)] = [
+            (.slide, false, true),
+            (.slide, true, false),
+            (.curl, false, false),
+            (.curl, true, false),
+        ]
+        for testCase in cases {
+            let (window, pagination, delegate, page0, page1) = makePaginationHarness(transition: testCase.transition)
             _ = (window, delegate)
             var reduceMotion = false
             var voiceOver = false
             pagination.reduceMotionProvider = { reduceMotion }
             pagination.voiceOverProvider = { voiceOver }
+
+            var fades: [ObservedFade] = []
+            pagination.onFadeCoverForTesting = { view, alpha, duration in
+                fades.append(ObservedFade(
+                    view: view,
+                    targetAlpha: alpha,
+                    duration: duration,
+                    destinationPainted: page1.didAwaitNextPaint,
+                    currentIndex: pagination.currentIndex,
+                    attachedToPagination: view.superview === pagination,
+                    isSlideOverlay: view is PageSlideView,
+                    suppressingDuringFade: pagination.isSuppressingProgressionForTesting
+                ))
+            }
 
             var columnGate: CheckedContinuation<Int, Never>?
             var columnEntered = false
@@ -360,51 +409,111 @@ class EPUBPageTransitionTests: XCTestCase {
                 }
             }
 
+            var turnCompleted = false
             let turn = Task { @MainActor in
-                await pagination.goToIndex(1, location: .start, options: NavigatorGoOptions(animated: true))
+                defer { turnCompleted = true }
+                return await pagination.goToIndex(1, location: .start, options: NavigatorGoOptions(animated: true))
             }
-            for _ in 0 ..< 50 where !columnEntered {
-                try? await Task.sleep(nanoseconds: 5_000_000)
+            defer {
+                page0.onRenderedColumnCount = nil
+                if let gate = columnGate {
+                    columnGate = nil
+                    gate.resume(returning: 1)
+                }
+                turn.cancel()
+                pagination.removeFromSuperview()
             }
-            XCTAssertTrue(columnEntered, "Turn must suspend in preparation before mounting overlay")
+
+            _ = await waitUntil(timeout: 1) { columnEntered || turnCompleted }
+            XCTAssertTrue(columnEntered, "Turn must suspend in preparation before mounting overlay (\(testCase))")
+            guard columnEntered else { continue }
             XCTAssertNil(pagination.activeOverlayForTesting)
 
             // Flip accessibility ON while preparation is suspended (before overlay exists).
-            if toggleVoiceOver {
+            if testCase.voiceOver {
                 voiceOver = true
             } else {
                 reduceMotion = true
             }
             pagination.stopActiveCurlForAccessibility()
-            columnGate?.resume(returning: 1)
-
-            // While the fallback finishes, no PageSlideView card overlay may mount.
-            var sawSlideOverlay = false
-            while !turn.isCancelled {
-                if pagination.subviews.contains(where: { $0 is PageSlideView }) {
-                    sawSlideOverlay = true
-                }
-                if pagination.currentIndex == 1 && !pagination.isSuppressingProgressionForTesting {
-                    break
-                }
-                try? await Task.sleep(nanoseconds: 5_000_000)
+            if let gate = columnGate {
+                columnGate = nil
+                gate.resume(returning: 1)
             }
+
+            // While the fallback finishes, no PageSlideView / PageCurlView card overlay may mount.
+            var sawOverlay = false
+            let finished = await waitUntil(timeout: 3, poll: {
+                if pagination.subviews.contains(where: { $0 is PageSlideView || $0 is PageCurlView }) {
+                    sawOverlay = true
+                }
+            }) {
+                turnCompleted
+            }
+            XCTAssertTrue(finished, "Turn timed out before completing (\(testCase))")
+            guard finished else { continue }
+
             let moved = await turn.value
             XCTAssertTrue(moved)
-            XCTAssertFalse(sawSlideOverlay, "Slide card must not animate after accessibility changed during preparation (voiceOver=\(toggleVoiceOver))")
+            XCTAssertEqual(pagination.currentIndex, 1)
+            XCTAssertFalse(
+                sawOverlay,
+                "Card/curl overlay must not mount after accessibility changed during preparation (\(testCase))"
+            )
             XCTAssertFalse(pagination.isSuppressingProgressionForTesting)
-            pagination.removeFromSuperview()
+            XCTAssertFalse(page1.isSuppressing)
+
+            if testCase.expectsFade {
+                XCTAssertEqual(fades.count, 1, "Slide interrupted by Reduce Motion must run one Fast Fade (\(testCase))")
+                if let fade = fades.first {
+                    XCTAssertEqual(fade.targetAlpha, 0, accuracy: 0.001)
+                    XCTAssertEqual(fade.duration, PageTransitionAnimator.fadeDuration, accuracy: 0.001)
+                    XCTAssertTrue(fade.destinationPainted, "Fast Fade must run after the destination chapter paints")
+                    XCTAssertEqual(fade.currentIndex, 1)
+                    XCTAssertTrue(fade.attachedToPagination)
+                    XCTAssertFalse(fade.isSlideOverlay)
+                    XCTAssertTrue(fade.suppressingDuringFade)
+                    XCTAssertEqual(fade.view.alpha, 0, accuracy: 0.001, "Fast Fade must animate cover alpha to 0")
+                    XCTAssertNil(fade.view.superview)
+                }
+            } else {
+                XCTAssertTrue(
+                    fades.isEmpty,
+                    "VoiceOver and Curl must reveal immediately without Fast Fade (\(testCase))"
+                )
+            }
         }
     }
 
     @MainActor
     func testAccessibilityStopWhileNextChapterLoadsKeepsCoverAndSuppressionUntilReady() async {
-        for transition in [PageTransition.slide, .curl] {
-            let (window, pagination, delegate, _, page1) = makePaginationHarness(transition: transition)
+        let cases: [(transition: PageTransition, voiceOver: Bool, expectsFade: Bool)] = [
+            (.slide, false, true),
+            (.slide, true, false),
+            (.curl, false, false),
+            (.curl, true, false),
+        ]
+        for testCase in cases {
+            let (window, pagination, delegate, _, page1) = makePaginationHarness(transition: testCase.transition)
             _ = (window, delegate)
             var reduceMotion = false
+            var voiceOver = false
             pagination.reduceMotionProvider = { reduceMotion }
-            pagination.voiceOverProvider = { false }
+            pagination.voiceOverProvider = { voiceOver }
+
+            var fades: [ObservedFade] = []
+            pagination.onFadeCoverForTesting = { view, alpha, duration in
+                fades.append(ObservedFade(
+                    view: view,
+                    targetAlpha: alpha,
+                    duration: duration,
+                    destinationPainted: page1.didAwaitNextPaint,
+                    currentIndex: pagination.currentIndex,
+                    attachedToPagination: view.superview === pagination,
+                    isSlideOverlay: view is PageSlideView,
+                    suppressingDuringFade: pagination.isSuppressingProgressionForTesting
+                ))
+            }
 
             var readyGate: CheckedContinuation<Void, Never>?
             var readyEntered = false
@@ -415,13 +524,24 @@ class EPUBPageTransitionTests: XCTestCase {
                 }
             }
 
+            var turnCompleted = false
             let turn = Task { @MainActor in
-                await pagination.goToIndex(1, location: .start, options: NavigatorGoOptions(animated: true))
+                defer { turnCompleted = true }
+                return await pagination.goToIndex(1, location: .start, options: NavigatorGoOptions(animated: true))
             }
-            for _ in 0 ..< 50 where !readyEntered {
-                try? await Task.sleep(nanoseconds: 5_000_000)
+            defer {
+                page1.onReadyForPresentation = nil
+                if let gate = readyGate {
+                    readyGate = nil
+                    gate.resume()
+                }
+                turn.cancel()
+                pagination.removeFromSuperview()
             }
-            XCTAssertTrue(readyEntered, "Next chapter must be loading under the outgoing cover")
+
+            _ = await waitUntil(timeout: 1) { readyEntered || turnCompleted }
+            XCTAssertTrue(readyEntered, "Next chapter must be loading under the outgoing cover (\(testCase))")
+            guard readyEntered else { continue }
             let overlay = pagination.activeOverlayForTesting
             XCTAssertNotNil(overlay)
             XCTAssertTrue(overlay?.superview === pagination)
@@ -431,28 +551,60 @@ class EPUBPageTransitionTests: XCTestCase {
             var slideTicks = 0
             (overlay as? PageSlideView)?.onClockTickForTesting = { _ in slideTicks += 1 }
 
-            // Reduce Motion flips ON while the incoming chapter is still loading.
-            reduceMotion = true
+            // Accessibility flips ON while the incoming chapter is still loading.
+            if testCase.voiceOver {
+                voiceOver = true
+            } else {
+                reduceMotion = true
+            }
             pagination.stopActiveCurlForAccessibility()
 
             // Still cover and progression suppression MUST stay up while chapter 2 loads.
-            XCTAssertTrue(overlay?.superview === pagination, "Cover must stay attached while chapter loads (\(transition))")
+            XCTAssertTrue(overlay?.superview === pagination, "Cover must stay attached while chapter loads (\(testCase))")
             if let slide = overlay as? PageSlideView {
                 XCTAssertFalse(slide.isCoverHiddenForTesting)
             }
             XCTAssertTrue(pagination.isSuppressingProgressionForTesting)
             XCTAssertTrue(page1.isSuppressing)
+            XCTAssertTrue(fades.isEmpty, "Cover must not fade before the destination chapter paints")
 
             // Now let chapter 2 finish loading and painting.
-            readyGate?.resume()
+            if let gate = readyGate {
+                readyGate = nil
+                gate.resume()
+            }
+            let finished = await waitUntil(timeout: 3) { turnCompleted }
+            XCTAssertTrue(finished, "Turn timed out after destination became ready (\(testCase))")
+            guard finished else { continue }
+
             let moved = await turn.value
             XCTAssertTrue(moved)
-            XCTAssertEqual(slideTicks, 0, "Stopped Slide must not lift/animate a card after Reduce Motion turned on")
+            XCTAssertEqual(pagination.currentIndex, 1)
+            XCTAssertEqual(slideTicks, 0, "Stopped Slide must not lift/animate a card after accessibility turned on")
             XCTAssertNil(overlay?.superview, "Turn cleanup must remove the cover once chapter is ready")
             XCTAssertNil(pagination.activeOverlayForTesting)
             XCTAssertFalse(pagination.isSuppressingProgressionForTesting)
             XCTAssertFalse(page1.isSuppressing)
-            pagination.removeFromSuperview()
+
+            if testCase.expectsFade {
+                XCTAssertEqual(fades.count, 1, "Slide stopped by Reduce Motion must reveal via one Fast Fade (\(testCase))")
+                if let fade = fades.first {
+                    XCTAssertTrue(fade.view === overlay)
+                    XCTAssertEqual(fade.targetAlpha, 0, accuracy: 0.001)
+                    XCTAssertEqual(fade.duration, PageTransitionAnimator.fadeDuration, accuracy: 0.001)
+                    XCTAssertTrue(fade.destinationPainted, "Fast Fade must run after the destination chapter paints")
+                    XCTAssertEqual(fade.currentIndex, 1)
+                    XCTAssertTrue(fade.attachedToPagination)
+                    XCTAssertTrue(fade.suppressingDuringFade)
+                    XCTAssertEqual(overlay?.alpha ?? -1, 0, accuracy: 0.001, "Fast Fade must animate overlay alpha to 0")
+                }
+            } else {
+                XCTAssertTrue(
+                    fades.isEmpty,
+                    "VoiceOver and Curl must reveal immediately without Fast Fade (\(testCase))"
+                )
+                XCTAssertEqual(overlay?.alpha ?? -1, 1, accuracy: 0.001)
+            }
         }
     }
 
@@ -464,6 +616,9 @@ class EPUBPageTransitionTests: XCTestCase {
         pagination.reduceMotionProvider = { reduceMotion }
         pagination.voiceOverProvider = { false }
 
+        var fadeCount = 0
+        pagination.onFadeCoverForTesting = { _, _, _ in fadeCount += 1 }
+
         var readyGate: CheckedContinuation<Void, Never>?
         var readyEntered = false
         page1.onReadyForPresentation = {
@@ -473,12 +628,24 @@ class EPUBPageTransitionTests: XCTestCase {
             }
         }
 
+        var turnCompleted = false
         let turn = Task { @MainActor in
-            await pagination.goToIndex(1, location: .start, options: NavigatorGoOptions(animated: true))
+            defer { turnCompleted = true }
+            return await pagination.goToIndex(1, location: .start, options: NavigatorGoOptions(animated: true))
         }
-        for _ in 0 ..< 50 where !readyEntered {
-            try? await Task.sleep(nanoseconds: 5_000_000)
+        defer {
+            page1.onReadyForPresentation = nil
+            if let gate = readyGate {
+                readyGate = nil
+                gate.resume()
+            }
+            turn.cancel()
+            pagination.removeFromSuperview()
         }
+
+        _ = await waitUntil(timeout: 1) { readyEntered || turnCompleted }
+        XCTAssertTrue(readyEntered)
+        guard readyEntered else { return }
         let overlay = pagination.activeOverlayForTesting
         XCTAssertNotNil(overlay)
 
@@ -491,8 +658,14 @@ class EPUBPageTransitionTests: XCTestCase {
         XCTAssertNil(overlay?.superview)
         XCTAssertNil(pagination.activeOverlayForTesting)
 
-        readyGate?.resume()
+        if let gate = readyGate {
+            readyGate = nil
+            gate.resume()
+        }
+        let finished = await waitUntil(timeout: 3) { turnCompleted }
+        XCTAssertTrue(finished)
+        guard finished else { return }
         _ = await turn.value
-        pagination.removeFromSuperview()
+        XCTAssertEqual(fadeCount, 0)
     }
 }
