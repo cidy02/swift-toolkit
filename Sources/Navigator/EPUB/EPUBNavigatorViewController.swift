@@ -1390,7 +1390,11 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         cover.backgroundColor = background
         cover.frame = host.bounds
         cover.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-        cover.isUserInteractionEnabled = false
+        // Absorbs touches: while it is up the pagination view sits on the
+        // neighbour resource, so a tap must not reach that hidden page (a link,
+        // a selection). Drags still begin: the turn recognisers live on `host`,
+        // and their touch-down cancels the warm-up, which removes this cover.
+        cover.isUserInteractionEnabled = true
         host.addSubview(cover)
         curlWarmCover = cover
         defer {
@@ -1436,6 +1440,13 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     }
 
     var curlWarmCoverUpForTesting: Bool { curlWarmCover?.superview != nil }
+    /// Test hook: a touch in the middle of the page lands on the warm-up cover.
+    var curlWarmCoverTakesTouchesForTesting: Bool {
+        guard let host = paginationView, let cover = curlWarmCover else {
+            return false
+        }
+        return host.hitTest(CGPoint(x: host.bounds.midX, y: host.bounds.midY), with: nil) === cover
+    }
     var liveColumnOffsetForTesting: CGFloat? {
         (paginationView?.currentView as? EPUBSpreadView)?.scrollView.contentOffset.x
     }

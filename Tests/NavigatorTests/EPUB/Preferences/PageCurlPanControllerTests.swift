@@ -535,6 +535,8 @@ class PageCurlPanControllerTests: XCTestCase {
         let started = try await waitUntil { navigator.curlWarmCaptureStartedForTesting }
         XCTAssertTrue(started)
         XCTAssertTrue(navigator.curlWarmCoverUpForTesting)
+        // The pagination view sits on the hidden neighbour under the cover: a tap must land on the cover, not on that page.
+        XCTAssertTrue(navigator.curlWarmCoverTakesTouchesForTesting, "a touch during the warm-up reaches the hidden neighbour")
 
         var finished = false
         Task { @MainActor in
