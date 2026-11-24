@@ -1346,6 +1346,9 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             return
         }
         await spread.readyForPresentation()
+        // A page that has only just been positioned or loaded may still be
+        // painting; its fingerprint must match the touch-down shot's.
+        await spread.awaitNextPaint()
         guard canWarmCurl(spread) else {
             return
         }
@@ -1570,9 +1573,13 @@ extension EPUBNavigatorViewController: EPUBSpreadViewDelegate {
         return insets
     }
 
+    func spreadViewDidBecomeReady(_ spreadView: EPUBSpreadView) {
+        // The page on screen, or a neighbour that can now be captured.
+        scheduleCurlWarm()
+    }
+
     func spreadViewDidLoad(_ spreadView: EPUBSpreadView) async {
         invalidateCurlPrerender("spread-load")
-        scheduleCurlWarm()
         let templates = config.decorationTemplates.reduce(into: [String: JSONValue]()) { styles, item in
             styles[item.key.rawValue] = .object(item.value.jsonObject)
         }

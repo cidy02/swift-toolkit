@@ -14,6 +14,9 @@ protocol EPUBSpreadViewDelegate: AnyObject {
     /// Called when the spread view finished loading.
     func spreadViewDidLoad(_ spreadView: EPUBSpreadView) async
 
+    /// Called when the spread view is loaded and painted, so a snapshot of it is safe.
+    func spreadViewDidBecomeReady(_ spreadView: EPUBSpreadView)
+
     /// Called when the user tapped on an external link.
     func spreadView(_ spreadView: EPUBSpreadView, didTapOnExternalURL url: URL)
 
@@ -433,6 +436,7 @@ class EPUBSpreadView: UIView, Loggable, PageView {
                 return
             }
             markSpreadReadyForPresentation()
+            delegate?.spreadViewDidBecomeReady(self)
         }
     }
 
