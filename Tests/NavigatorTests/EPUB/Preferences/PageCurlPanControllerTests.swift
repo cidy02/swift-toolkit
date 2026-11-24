@@ -422,6 +422,61 @@ class PageCurlPanControllerTests: XCTestCase {
         XCTAssertEqual(recorder.turns.first?.source, .trackpad)
     }
 
+    /// BUG-14: the first drag after opening, and after a chapter change, used to
+    /// find an empty neighbour cache and scroll, paint and snapshot between the
+    /// finger and the first frame. The cache must hold the next resource's page
+    /// before any gesture, and again after the resource changes.
+    @MainActor
+    func testNeighbourAcrossAResourceBoundaryIsCachedBeforeAnyGesture() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kudos-warm-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        for name in ["a", "b", "c"] {
+            let html = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><html xmlns=\"http://www.w3.org/1999/xhtml\">"
+                + "<head><title>\(name)</title></head><body><p>Chapter \(name)</p></body></html>"
+            try html.write(to: directory.appendingPathComponent("\(name).xhtml"), atomically: true, encoding: .utf8)
+        }
+        let container = try await DirectoryContainer(directory: XCTUnwrap(FileURL(url: directory)))
+        let publication = Publication(
+            manifest: Manifest(
+                metadata: Metadata(title: "Warm"),
+                readingOrder: ["a", "b", "c"].map { Link(href: "\($0).xhtml", mediaType: .xhtml) }
+            ),
+            container: container
+        )
+        let navigator = try EPUBNavigatorViewController(
+            publication: publication,
+            initialLocation: nil,
+            config: .init(preferences: EPUBPreferences(pageTransition: .curl))
+        )
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
+        window.rootViewController = navigator
+        window.makeKeyAndVisible()
+        defer { window.isHidden = true }
+
+        func waitFor(_ turns: [PageCurlTurnDirection]) async throws -> Bool {
+            for _ in 0 ..< 200 {
+                if turns.allSatisfy({ navigator.curlPrerenderHasNeighborForTesting($0) }) {
+                    return true
+                }
+                try await Task.sleep(nanoseconds: 50_000_000)
+            }
+            return false
+        }
+
+        // First chapter: only the next resource exists. No gesture has happened.
+        let first = try await waitFor([.forward])
+        XCTAssertTrue(first, "the next chapter's page is cached before the first drag")
+        XCTAssertFalse(navigator.curlPrerenderHasNeighborForTesting(.backward))
+
+        // Into the second chapter: both resources are neighbours.
+        let moved = await navigator.goForward(options: NavigatorGoOptions(animated: false))
+        XCTAssertTrue(moved)
+        let second = try await waitFor([.forward, .backward])
+        XCTAssertTrue(second, "both neighbours are cached again after the resource change")
+    }
+
     private final class SyntheticPanGestureRecognizer: UIPanGestureRecognizer {
         var syntheticTranslation: CGPoint = .zero
         var syntheticVelocity: CGPoint = .zero

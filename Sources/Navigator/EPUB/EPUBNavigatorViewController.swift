@@ -673,6 +673,11 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             if anchorNavigation(for: event).cancelsPendingRestore {
                 reflowPosition.cancelForNavigation()
             }
+            // Loaded, moved or jumped: the page on screen is settled, so its
+            // neighbours can be cached for the next drag.
+            if !wasIdle, state == .idle {
+                scheduleCurlWarm()
+            }
         }
         return accepted
     }
@@ -730,6 +735,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         turn: UserPageTurnDirection,
         options: NavigatorGoOptions
     ) async -> Bool {
+        await settleCurlWarm()
         guard
             let paginationView = paginationView,
             on(.move(direction))
@@ -800,6 +806,10 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     /// Bumped by every change that can alter a page's pixels. A bitmap taken
     /// under an older generation is never stored or shown from the cache.
     private var curlContentGeneration = 0
+    /// Fills `curlPrerender` for both neighbours of the page on screen, behind a
+    /// still cover, so the first drag after opening or after a chapter change
+    /// finds them. Cancelled by touch-down, navigation and invalidation.
+    private var curlWarmTask: Task<Void, Never>?
     /// The page under the finger at the latest touch-down, taken before the
     /// pan is recognised. Dropped when that touch turns out to be a tap.
     private var curlTouchDownShot: Task<CurlPageShot?, Never>?
@@ -1019,6 +1029,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
     public func go(to locator: Locator, options: NavigatorGoOptions) async -> Bool {
         let locator = publication.normalizeLocator(locator)
+        await settleCurlWarm()
 
         guard
             let paginationView = paginationView,
@@ -1285,8 +1296,116 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             PageCurlDebug.log("curl-cache invalidate reason=\(reason) bytes=\(curlPrerender.byteCount)")
         }
         curlPrerender.invalidate()
+        curlWarmTask?.cancel()
         cancelCurlTouchDownShot()
         PageCurlView.dropPreloadedTextures()
+    }
+
+    /// Called from the ready, resource-change and turn-committed events. Only
+    /// the styles that read the cache (Curl, Slide) warm it; scroll mode, Fast
+    /// Fade, None, Reduce Motion and VoiceOver never do.
+    private func scheduleCurlWarm() {
+        curlWarmTask?.cancel()
+        guard isViewLoaded, interactiveTurnEnabled else {
+            return
+        }
+        let previous = curlWarmTask
+        curlWarmTask = Task { @MainActor [weak self] in
+            // The previous run puts its column back before this one scrolls.
+            await previous?.value
+            await self?.runCurlWarm()
+        }
+    }
+
+    /// A touch or a navigation is starting: stop warming and wait until the
+    /// column is back and the cover is off. Bounded by one scroll-and-paint.
+    private func settleCurlWarm() async {
+        guard let task = curlWarmTask else {
+            return
+        }
+        task.cancel()
+        await task.value
+    }
+
+    private func canWarmCurl(_ spread: EPUBReflowableSpreadView) -> Bool {
+        !Task.isCancelled
+            && state == .idle
+            && paginationView?.currentView === spread
+            && spread.isSpreadReadyForPresentation
+            && curlPan?.turnInFlight != true
+            && curlTouchDownShot == nil
+            && currentSelection == nil
+            && !reflowPosition.isHolding
+            && UIApplication.shared.applicationState == .active
+    }
+
+    private func runCurlWarm() async {
+        guard let host = paginationView,
+              let spread = host.currentView as? EPUBReflowableSpreadView
+        else {
+            return
+        }
+        await spread.readyForPresentation()
+        guard canWarmCurl(spread) else {
+            return
+        }
+        let key = curlPageKey(for: spread)
+        // A neighbour inside the resource, or the next resource when it is
+        // already loaded. Never starts a load: that could outlast a touch.
+        let targets: [PageCurlTurnDirection] = [.forward, .backward].filter { turn in
+            guard !curlPrerender.has(turn, key: key) else {
+                return false
+            }
+            return spread.canGo(to: spreadDirection(for: turn)) || host.isNeighborReadyForCurl(forward: turn == .forward)
+        }
+        guard !targets.isEmpty else {
+            return
+        }
+        let background = viewModel.settings.effectiveBackgroundColor.uiColor
+        guard let shot = await PageCurlSnapshotter.capture(of: spread, backgroundColor: background, afterScreenUpdates: false),
+              canWarmCurl(spread), curlPageKey(for: spread) == key
+        else {
+            return
+        }
+        let fingerprint = await Self.fingerprint(of: shot)
+        guard canWarmCurl(spread), curlPageKey(for: spread) == key else {
+            return
+        }
+        let cover = UIImageView(image: shot)
+        cover.backgroundColor = background
+        cover.frame = host.bounds
+        cover.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        cover.isUserInteractionEnabled = false
+        host.addSubview(cover)
+        defer { cover.removeFromSuperview() }
+        for turn in targets {
+            guard canWarmCurl(spread), curlPageKey(for: spread) == key else {
+                break
+            }
+            let image: UIImage?
+            if spread.canGo(to: spreadDirection(for: turn)) {
+                image = await spread.warmCurlNeighbor(
+                    direction: spreadDirection(for: turn),
+                    background: background,
+                    covered: { !Task.isCancelled }
+                )
+            } else {
+                image = await host.captureNeighborForCurl(forward: turn == .forward, background: background)
+            }
+            guard let image, !Task.isCancelled, curlPageKey(for: spread) == key else {
+                continue
+            }
+            curlPrerender.set(image, for: turn, key: key, current: fingerprint)
+            PageCurlLatency.mark("warm", "direction=\(turn) bytes=\(curlPrerender.byteCount)")
+        }
+    }
+
+    /// Test hook: the cache holds this neighbour for the page on screen.
+    func curlPrerenderHasNeighborForTesting(_ turn: PageCurlTurnDirection) -> Bool {
+        guard let spread = paginationView?.currentView as? EPUBSpreadView else {
+            return false
+        }
+        return curlPrerender.has(turn, key: curlPageKey(for: spread))
     }
 
     /// The shot's task checks for this before it uploads anything, so a
@@ -1453,6 +1572,7 @@ extension EPUBNavigatorViewController: EPUBSpreadViewDelegate {
 
     func spreadViewDidLoad(_ spreadView: EPUBSpreadView) async {
         invalidateCurlPrerender("spread-load")
+        scheduleCurlWarm()
         let templates = config.decorationTemplates.reduce(into: [String: JSONValue]()) { styles, item in
             styles[item.key.rawValue] = .object(item.value.jsonObject)
         }
@@ -1719,6 +1839,7 @@ extension EPUBNavigatorViewController: PaginationViewDelegate {
 
     func paginationViewDidUpdateViews(_ paginationView: PaginationView) {
         invalidateCurlPrerender("views")
+        scheduleCurlWarm()
         // Note that you should set the delegate before you load views
         // otherwise, when open the publication, you may miss the first
         // invocation.
@@ -1878,10 +1999,15 @@ extension EPUBNavigatorViewController: PageCurlPanDelegate {
         let background = viewModel.settings.effectiveBackgroundColor.uiColor
         let key = curlPageKey(for: spread)
         let preloadMetal = settings.pageTransition == .curl
+        let warming = curlWarmTask
+        warming?.cancel()
         let forward = preloadMetal && curlPrerender.key == key
             ? (try? curlPrerender.neighbor(.forward, key: key, onScreen: curlPrerender.current).get())
             : nil
         curlTouchDownShot = Task { @MainActor [weak spread] in
+            // A warm-up in flight puts its column back first, or the shot
+            // would show the neighbour.
+            await warming?.value
             guard let spread, let image = await PageCurlSnapshotter.capture(
                 of: spread,
                 backgroundColor: background,
@@ -1924,6 +2050,7 @@ extension EPUBNavigatorViewController: PageCurlPanDelegate {
         guard let spread = paginationView?.currentView as? EPUBSpreadView else {
             return nil
         }
+        await settleCurlWarm()
         // Left in `curlTouchDownShot` while it is awaited, so an invalidation
         // (resign active, memory) can still cancel it before it uploads.
         let pending = curlTouchDownShot
@@ -2007,7 +2134,15 @@ extension EPUBNavigatorViewController: PageCurlPanDelegate {
             )
         }
 
-        guard let incoming = await paginationView?.captureNeighborForCurl(forward: forward, background: background) else {
+        // The next resource's page, taken while the reader sat idle.
+        let cached = cachedCurlNeighbor(direction, on: spread)
+        let captured: UIImage?
+        if let cached {
+            captured = cached
+        } else {
+            captured = await paginationView?.captureNeighborForCurl(forward: forward, background: background)
+        }
+        guard let incoming = captured else {
             return nil
         }
         return PageCurlPanFrame(

@@ -147,6 +147,14 @@ struct PageCurlPrerenderCache {
         }
     }
 
+    /// Whether the neighbour in `direction` is held for this exact page.
+    func has(_ direction: PageCurlTurnDirection, key: PageCurlPageKey) -> Bool {
+        guard self.key == key else {
+            return false
+        }
+        return (direction == .forward ? forward : backward) != nil
+    }
+
     /// The neighbour, if it was taken under `key` and the page on screen
     /// still looks like the one it was taken next to.
     func neighbor(

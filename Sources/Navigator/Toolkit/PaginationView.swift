@@ -551,6 +551,13 @@ final class PaginationView: UIView, Loggable {
         (0 ..< pageCount).contains(neighborIndex(forward: forward))
     }
 
+    /// The neighbour resource is already loaded and painted, so capturing it
+    /// for a curl does not start a load. A warm-up only captures such a neighbour.
+    func isNeighborReadyForCurl(forward: Bool) -> Bool {
+        let index = neighborIndex(forward: forward)
+        return (loadedViews[index] as? EPUBSpreadView)?.isSpreadReadyForPresentation == true
+    }
+
     /// Bitmap of the neighbour, taken on screen under the caller's opaque cover,
     /// without changing `currentIndex`. The offset is restored before returning.
     func captureNeighborForCurl(forward: Bool, background: UIColor) async -> UIImage? {

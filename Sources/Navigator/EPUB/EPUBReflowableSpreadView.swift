@@ -642,6 +642,30 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         return image
     }
 
+    /// Bitmap of the column beside the one on screen, for a cache that is
+    /// warmed before any drag. The caller's cover hides the scroll; `covered`
+    /// turns false to stop early. The column is always put back, and the
+    /// progression the peek produced is dropped.
+    func warmCurlNeighbor(
+        direction: Direction,
+        background: UIColor,
+        covered: () -> Bool
+    ) async -> UIImage? {
+        await awaitPendingCurlScroll()
+        guard curlTargetOffset == nil, pageDelta(for: direction) != nil else {
+            return nil
+        }
+        setSuppressingProgressionUpdates(true)
+        let image = await prerenderCurlBeyond(
+            direction: direction,
+            target: scrollView.contentOffset.x,
+            background: background,
+            covered: covered
+        )
+        discardSuppressedProgression()
+        return image
+    }
+
     /// `target` is the column the turn lands on, already scrolled to.
     private func prerenderCurlBeyond(
         direction: Direction,

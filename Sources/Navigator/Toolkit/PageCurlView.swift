@@ -866,9 +866,11 @@ private final class PageCurlRenderer {
     /// main actor only waits. A bitmap preloaded at touch-down is already
     /// (or nearly) a texture.
     func prepare(outgoing: UIImage, incoming: UIImage) async -> Bool {
+        let pipelineStart = CACurrentMediaTime()
         guard await ensurePipeline() else {
             return false
         }
+        PageCurlLatency.mark("pipeline-wait", "ms=\(PageCurlLatency.ms(CACurrentMediaTime() - pipelineStart))")
         let outgoingUpload = Self.upload(outgoing, loader: loader)
         let incomingUpload = Self.upload(incoming, loader: loader)
         self.outgoing = await outgoingUpload.value
