@@ -810,6 +810,10 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     /// still cover, so the first drag after opening or after a chapter change
     /// finds them. Cancelled by touch-down, navigation and invalidation.
     private var curlWarmTask: Task<Void, Never>?
+    /// The page the warm-up photographed, for the first touch-down on it: the
+    /// same pixels, without a second WebKit snapshot between finger and curl.
+    /// Dropped by any invalidation and by the touch that uses it.
+    private var curlWarmShot: CurlPageShot?
     /// The page under the finger at the latest touch-down, taken before the
     /// pan is recognised. Dropped when that touch turns out to be a tap.
     private var curlTouchDownShot: Task<CurlPageShot?, Never>?
@@ -1296,6 +1300,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             PageCurlDebug.log("curl-cache invalidate reason=\(reason) bytes=\(curlPrerender.byteCount)")
         }
         curlPrerender.invalidate()
+        curlWarmShot = nil
         curlWarmTask?.cancel()
         cancelCurlTouchDownShot()
         PageCurlView.dropPreloadedTextures()
@@ -1374,6 +1379,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         guard canWarmCurl(spread), curlPageKey(for: spread) == key else {
             return
         }
+        curlWarmShot = CurlPageShot(image: shot, background: background, key: key, fingerprint: fingerprint)
         let cover = UIImageView(image: shot)
         cover.backgroundColor = background
         cover.frame = host.bounds
@@ -2011,10 +2017,18 @@ extension EPUBNavigatorViewController: PageCurlPanDelegate {
         let forward = preloadMetal && curlPrerender.key == key
             ? (try? curlPrerender.neighbor(.forward, key: key, onScreen: curlPrerender.current).get())
             : nil
-        curlTouchDownShot = Task { @MainActor [weak spread] in
+        curlTouchDownShot = Task { @MainActor [weak spread, weak self] in
             // A warm-up in flight puts its column back first, or the shot
             // would show the neighbour.
             await warming?.value
+            if let warm = self?.curlWarmShot, warm.key == key, warm.background == background, !Task.isCancelled {
+                self?.curlWarmShot = nil
+                PageCurlLatency.mark("touch-outgoing", "warm-shot")
+                if preloadMetal {
+                    PageCurlView.preloadTextures([warm.image] + (forward.map { [$0] } ?? []))
+                }
+                return warm
+            }
             guard let spread, let image = await PageCurlSnapshotter.capture(
                 of: spread,
                 backgroundColor: background,
