@@ -1028,6 +1028,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             location != notifiedCurrentLocation
         {
             notifiedCurrentLocation = location
+            expDelivered += 1
             delegate.navigator(self, locationDidChange: location)
         }
         if state == .idle {
@@ -1435,6 +1436,8 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         }
     }
 
+    private(set) var expDelivered = 0
+    var currentSpreadForTesting: EPUBSpreadView? { paginationView?.currentView as? EPUBSpreadView }
     var curlWarmCoverUpForTesting: Bool { curlWarmCover?.superview != nil }
     var liveColumnOffsetForTesting: CGFloat? {
         (paginationView?.currentView as? EPUBSpreadView)?.scrollView.contentOffset.x
@@ -1611,6 +1614,16 @@ extension EPUBNavigatorViewController: EPUBSpreadViewDelegate {
     }
 
     func spreadViewDidBecomeReady(_ spreadView: EPUBSpreadView) {
+        if OffscreenSnapshotExperiment.enabled, !OffscreenSnapshotExperiment.ran,
+           spreadView === paginationView?.currentView, let reflow = spreadView as? EPUBReflowableSpreadView
+        {
+            Task { @MainActor [weak self, weak reflow] in
+                guard let reflow else { return }
+                await OffscreenSnapshotExperiment.run(spread: reflow) { tag in
+                    "\(tag) offset=\(reflow.scrollView.contentOffset.x) loc=\(String(describing: self?.currentLocation?.locations.progression)) delivered=\(self?.expDelivered ?? -1)"
+                }
+            }
+        }
         // The page on screen, or a neighbour that can now be captured.
         scheduleCurlWarm()
     }
