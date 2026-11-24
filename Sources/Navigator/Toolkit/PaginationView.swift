@@ -558,28 +558,77 @@ final class PaginationView: UIView, Loggable {
         return (loadedViews[index] as? EPUBSpreadView)?.isSpreadReadyForPresentation == true
     }
 
+    /// Token of the abortable (warm-up) capture in flight, nil when none.
+    private var warmCaptureToken: Int?
+    private var warmCaptureSeq = 0
+    private var warmCaptureMovedOffset = false
+    private weak var warmCaptureNeighbor: (UIView & PageView)?
+
+    /// Puts everything an abortable capture changed back, synchronously, and
+    /// makes it finish into nothing. Called by a touch, a navigation or a relayout.
+    func cancelWarmNeighborCapture() {
+        guard warmCaptureToken != nil else {
+            return
+        }
+        warmCaptureToken = nil
+        warmCaptureNeighbor?.setSuppressingProgressionUpdates(false)
+        warmCaptureNeighbor = nil
+        if warmCaptureMovedOffset {
+            warmCaptureMovedOffset = false
+            scrollView.contentOffset = CGPoint(x: xOffsetForIndex(currentIndex), y: scrollView.contentOffset.y)
+            isAnimatingContentOffset = false
+        }
+    }
+
     /// Bitmap of the neighbour, taken on screen under the caller's opaque cover,
     /// without changing `currentIndex`. The offset is restored before returning.
-    func captureNeighborForCurl(forward: Bool, background: UIColor) async -> UIImage? {
+    /// `abortable` (the idle warm-up): `cancelWarmNeighborCapture` restores at once.
+    func captureNeighborForCurl(forward: Bool, background: UIColor, abortable: Bool = false) async -> UIImage? {
         let generation = reloadGeneration
         let index = neighborIndex(forward: forward)
         guard (0 ..< pageCount).contains(index) else {
             return nil
         }
         let location: PageLocation = forward ? .start : .end
+        var mine = 0
+        if abortable {
+            warmCaptureSeq &+= 1
+            mine = warmCaptureSeq
+            warmCaptureToken = mine
+        }
+        func aborted() -> Bool {
+            abortable && warmCaptureToken != mine
+        }
         guard let neighbor = await ensureLoadedForCurl(at: index, location: location) else {
+            if abortable, !aborted() { warmCaptureToken = nil }
             return nil
         }
-        guard generation == reloadGeneration else {
+        guard generation == reloadGeneration, !aborted() else {
+            if aborted() { neighbor.setSuppressingProgressionUpdates(false) }
             return nil
         }
         let saved = scrollView.contentOffset
         isAnimatingContentOffset = true
         neighbor.setSuppressingProgressionUpdates(true)
+        if abortable {
+            warmCaptureNeighbor = neighbor
+            warmCaptureMovedOffset = true
+        }
         defer {
-            // A reload already owns the new spread. Restoring this offset
-            // would move that spread, or write flags it just cleared.
-            if generation == reloadGeneration {
+            if abortable {
+                if warmCaptureToken == mine {
+                    warmCaptureToken = nil
+                    warmCaptureNeighbor = nil
+                    warmCaptureMovedOffset = false
+                    if generation == reloadGeneration {
+                        neighbor.setSuppressingProgressionUpdates(false)
+                        scrollView.contentOffset = CGPoint(x: xOffsetForIndex(currentIndex), y: saved.y)
+                        isAnimatingContentOffset = false
+                    }
+                }
+            } else if generation == reloadGeneration {
+                // A reload already owns the new spread. Restoring this offset
+                // would move that spread, or write flags it just cleared.
                 neighbor.setSuppressingProgressionUpdates(false)
                 scrollView.contentOffset = CGPoint(x: xOffsetForIndex(currentIndex), y: saved.y)
                 isAnimatingContentOffset = false
@@ -588,10 +637,11 @@ final class PaginationView: UIView, Loggable {
         scrollView.contentOffset = CGPoint(x: xOffsetForIndex(index), y: saved.y)
         layoutIfNeeded()
         await neighbor.awaitNextPaint()
-        guard generation == reloadGeneration else {
+        guard generation == reloadGeneration, !aborted() else {
             return nil
         }
-        return await PageCurlSnapshotter.capture(of: neighbor, backgroundColor: background)
+        let image = await PageCurlSnapshotter.capture(of: neighbor, backgroundColor: background)
+        return aborted() ? nil : image
     }
 
     /// Lands on the neighbour under a curl that has already finished. No second animation.

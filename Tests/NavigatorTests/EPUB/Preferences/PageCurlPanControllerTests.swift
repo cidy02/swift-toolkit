@@ -422,19 +422,23 @@ class PageCurlPanControllerTests: XCTestCase {
         XCTAssertEqual(recorder.turns.first?.source, .trackpad)
     }
 
-    /// BUG-14: the first drag after opening, and after a chapter change, used to
-    /// find an empty neighbour cache and scroll, paint and snapshot between the
-    /// finger and the first frame. The cache must hold the next resource's page
-    /// before any gesture, and again after the resource changes.
+    @MainActor private final class LocationRecorder: EPUBNavigatorDelegate {
+        var locations: [Locator] = []
+        func navigator(_ navigator: Navigator, presentError error: NavigatorError) {}
+        func navigator(_ navigator: Navigator, locationDidChange locator: Locator) { locations.append(locator) }
+    }
+
+    /// Chapter `a` is many pages long; `b` and `c` are one page each.
     @MainActor
-    func testNeighbourAcrossAResourceBoundaryIsCachedBeforeAnyGesture() async throws {
+    private func makeWarmNavigator() async throws -> (EPUBNavigatorViewController, UIWindow, LocationRecorder) {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("kudos-warm-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: directory) }
-        for name in ["a", "b", "c"] {
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        for (name, paragraphs) in [("a", 150), ("b", 1), ("c", 1)] {
+            let body = (1 ... paragraphs).map { "<p>Chapter \(name) paragraph \($0). The city never switched its streetlamps off.</p>" }.joined()
             let html = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><html xmlns=\"http://www.w3.org/1999/xhtml\">"
-                + "<head><title>\(name)</title></head><body><p>Chapter \(name)</p></body></html>"
+                + "<head><title>\(name)</title></head><body>\(body)</body></html>"
             try html.write(to: directory.appendingPathComponent("\(name).xhtml"), atomically: true, encoding: .utf8)
         }
         let container = try await DirectoryContainer(directory: XCTUnwrap(FileURL(url: directory)))
@@ -450,31 +454,96 @@ class PageCurlPanControllerTests: XCTestCase {
             initialLocation: nil,
             config: .init(preferences: EPUBPreferences(pageTransition: .curl))
         )
+        let recorder = LocationRecorder()
+        navigator.delegate = recorder
         let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
         window.rootViewController = navigator
         window.makeKeyAndVisible()
-        defer { window.isHidden = true }
+        addTeardownBlock { @MainActor in window.isHidden = true }
+        return (navigator, window, recorder)
+    }
 
-        func waitFor(_ turns: [PageCurlTurnDirection]) async throws -> Bool {
-            for _ in 0 ..< 200 {
-                if turns.allSatisfy({ navigator.curlPrerenderHasNeighborForTesting($0) }) {
-                    return true
-                }
-                try await Task.sleep(nanoseconds: 50_000_000)
-            }
-            return false
+    @MainActor
+    private func waitUntil(_ seconds: Double = 10, _ condition: () -> Bool) async throws -> Bool {
+        let deadline = Date().addingTimeInterval(seconds)
+        while Date() < deadline {
+            if condition() { return true }
+            try await Task.sleep(nanoseconds: 20_000_000)
         }
+        return condition()
+    }
 
-        // First chapter: only the next resource exists. No gesture has happened.
-        let first = try await waitFor([.forward])
-        XCTAssertTrue(first, "the next chapter's page is cached before the first drag")
-        XCTAssertFalse(navigator.curlPrerenderHasNeighborForTesting(.backward))
-
-        // Into the second chapter: both resources are neighbours.
-        let moved = await navigator.goForward(options: NavigatorGoOptions(animated: false))
+    /// BUG-14: the first drag after opening, and after a chapter change, used to
+    /// find an empty neighbour cache and load, paint and snapshot between the
+    /// finger and the first frame. The next resource's page is cached before any
+    /// gesture, and again after a resource change.
+    @MainActor
+    func testNeighbourAcrossAResourceBoundaryIsCachedBeforeAnyGesture() async throws {
+        let (navigator, _, _) = try await makeWarmNavigator()
+        _ = try await waitUntil { navigator.currentLocation != nil }
+        let moved = await navigator.go(to: Link(href: "b.xhtml", mediaType: .xhtml), options: NavigatorGoOptions(animated: false))
         XCTAssertTrue(moved)
-        let second = try await waitFor([.forward, .backward])
-        XCTAssertTrue(second, "both neighbours are cached again after the resource change")
+        let both = try await waitUntil {
+            navigator.curlPrerenderHasNeighborForTesting(.forward) && navigator.curlPrerenderHasNeighborForTesting(.backward)
+        }
+        XCTAssertTrue(both, "both neighbouring chapters are cached after the resource change, without any gesture")
+    }
+
+    /// The warm-up must be invisible to every observer: with a multi-page chapter on
+    /// screen the live column never moves, no location other than the settled one is
+    /// published, and no in-chapter neighbour is taken (that needs the live column).
+    @MainActor
+    func testWarmUpNeverMovesTheLiveColumnOrPublishesAnotherLocation() async throws {
+        let (navigator, _, recorder) = try await makeWarmNavigator()
+        // Sampled from the first frame on, so a warm-up at any moment is seen.
+        var offsets = Set<CGFloat>()
+        var progressions = Set<Double>()
+        var neighbourCached = false
+        for _ in 0 ..< 300 {
+            offsets.insert(navigator.liveColumnOffsetForTesting ?? 0)
+            if let progression = navigator.currentLocation?.locations.progression { progressions.insert(progression) }
+            neighbourCached = neighbourCached || navigator.curlPrerenderHasNeighborForTesting(.forward)
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertEqual(offsets, [0], "the live column stayed on the first page")
+        XCTAssertEqual(progressions.count, 1, "one settled location, never the neighbour's")
+        XCTAssertFalse(neighbourCached, "an in-chapter neighbour is not warmed")
+        XCTAssertEqual(Set(recorder.locations.compactMap(\.locations.progression)).count, 1)
+    }
+
+    /// A preferences change while the warm-up is running must leave the reader on
+    /// the page it was on.
+    @MainActor
+    func testPreferencesChangeDuringWarmUpKeepsTheSettledPage() async throws {
+        let (navigator, _, _) = try await makeWarmNavigator()
+        _ = try await waitUntil { navigator.currentLocation != nil }
+        navigator.submitPreferences(EPUBPreferences(fontSize: 1.4, pageTransition: .curl))
+        try await Task.sleep(nanoseconds: 1_500_000_000)
+        XCTAssertEqual(navigator.liveColumnOffsetForTesting ?? 0, 0, accuracy: 0.5)
+        XCTAssertLessThan(navigator.currentLocation?.locations.progression ?? 0, 0.05)
+    }
+
+    /// A snapshot that never returns must not hold the cover or stall navigation.
+    @MainActor
+    func testStalledWarmUpCaptureNeitherHoldsTheCoverNorBlocksNavigation() async throws {
+        let (navigator, _, _) = try await makeWarmNavigator()
+        navigator.curlWarmCaptureForTesting = {
+            await withCheckedContinuation { (_: CheckedContinuation<UIImage?, Never>) in }
+        }
+        _ = try await waitUntil { navigator.currentLocation != nil }
+        _ = await navigator.go(to: Link(href: "b.xhtml", mediaType: .xhtml), options: NavigatorGoOptions(animated: false))
+        let started = try await waitUntil { navigator.curlWarmCaptureStartedForTesting }
+        XCTAssertTrue(started)
+        XCTAssertTrue(navigator.curlWarmCoverUpForTesting)
+
+        var finished = false
+        Task { @MainActor in
+            _ = await navigator.goForward(options: NavigatorGoOptions(animated: false))
+            finished = true
+        }
+        let done = try await waitUntil(3) { finished }
+        XCTAssertTrue(done, "goForward does not wait for the stalled warm-up")
+        XCTAssertFalse(navigator.curlWarmCoverUpForTesting, "the cover came off with the navigation")
     }
 
     private final class SyntheticPanGestureRecognizer: UIPanGestureRecognizer {
