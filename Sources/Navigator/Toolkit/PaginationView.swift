@@ -579,7 +579,12 @@ final class PaginationView: UIView, Loggable {
             return nil
         }
         // Cancelled (the pan controller's backstop) before the column moved: leave it alone.
-        guard generation == reloadGeneration, !Task.isCancelled else {
+        guard generation == reloadGeneration else {
+            return nil
+        }
+        guard !Task.isCancelled else {
+            // `ensureLoadedForCurl` set this; the `defer` below does not exist yet.
+            neighbor.setSuppressingProgressionUpdates(false)
             return nil
         }
         let saved = scrollView.contentOffset

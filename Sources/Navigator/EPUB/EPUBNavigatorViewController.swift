@@ -864,13 +864,6 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     /// Bumped by every change that can alter a page's pixels. A bitmap taken
     /// under an older generation is never stored or shown from the cache.
     private var curlContentGeneration = 0
-    /// Every store goes through here. Once any spoken-word mark has shown since the last
-    /// clear (not just while it shows now), what is stored may carry it, so it is tainted.
-    private func noteCurlStoreForTransientMarks() {
-        if transientMarksActive || curlTransientSeen {
-            curlPrerenderTainted = true
-        }
-    }
 
     /// A late shot of an earlier drag is dropped, not written into this one.
     private func keepCurlIncoming(_ shot: UIImage?, drag: Int) -> UIImage? {
@@ -881,16 +874,21 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
     func keepCurlIncomingForTesting(_ shot: UIImage?, drag: Int) -> UIImage? { keepCurlIncoming(shot, drag: drag) }
     var curlDragTokenForTesting: Int { curlDragToken }
-    var curlPrerenderTaintedForTesting: Bool { curlPrerenderTainted }
+    private var reflowForTesting: EPUBReflowableSpreadView? { paginationView?.currentView as? EPUBReflowableSpreadView }
+    func dispatchUnawaitedCurlScrollForTesting() -> Bool { reflowForTesting?.dispatchUnawaitedCurlScrollForTesting(direction: .right) ?? false }
+    func revertCurlForTesting() async { await reflowForTesting?.revertCurlIncoming() }
+    func pageScrollXForTesting() async -> Double? { await reflowForTesting?.pageScrollXForTesting() }
+    var curlContentGenerationForTesting: Int { curlContentGeneration }
+    var curlTransientSeenForTesting: Bool { curlTransientSeen }
     func beginDragTokenForTesting() { curlDragToken &+= 1 }
     var curlDragIncomingForTesting: UIImage? { curlDragIncoming }
 
     /// A tap curl landed while the cache holds nothing yet: same path the tap uses.
-    func storeTapCurlPagesForTesting() {
+    func storeTapCurlPagesForTesting(generation: Int? = nil) {
         guard let spread = paginationView?.currentView as? EPUBReflowableSpreadView else { return }
         let image = UIGraphicsImageRenderer(size: CGSize(width: 4, height: 4)).image { _ in }
         storeTapCurlPages(
-            PageCurlLandedPages(outgoing: image, incoming: image, beyond: image, forward: true, generation: curlContentGeneration),
+            PageCurlLandedPages(outgoing: image, incoming: image, beyond: image, forward: true, generation: generation ?? curlContentGeneration),
             on: spread
         )
     }
@@ -910,7 +908,6 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         guard let spread = paginationView?.currentView as? EPUBSpreadView else { return }
         let image = UIGraphicsImageRenderer(size: CGSize(width: 4, height: 4)).image { _ in }
         curlPrerender.set(image, for: .forward, key: curlPageKey(for: spread), current: current)
-        noteCurlStoreForTransientMarks()
     }
 
     /// Test hooks for the cache rules.
@@ -918,7 +915,6 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         guard let spread = paginationView?.currentView as? EPUBSpreadView else { return }
         let image = UIGraphicsImageRenderer(size: CGSize(width: 4, height: 4)).image { _ in }
         curlPrerender.set(image, for: .forward, key: curlPageKey(for: spread), current: nil)
-        noteCurlStoreForTransientMarks()
     }
 
     var curlPrerenderIsSeededForTesting: Bool {
@@ -928,10 +924,10 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     /// The transient groups that have marks on the page right now.
     private var activeTransientGroups: Set<DecorationGroup> = []
     private var transientMarksActive: Bool { !activeTransientGroups.isEmpty }
-    /// A transient mark has shown since the last clear that has also been painted away.
+    /// A transient mark has shown since the last full invalidate. While it is true nothing is
+    /// stored into the cache (turns still work, they just miss), so no stored page can carry a mark.
+    /// The clear, once painted, does one full invalidate and ends it.
     private var curlTransientSeen = false
-    /// Pages in the cache were taken while such a mark was showing, so one may carry it.
-    private var curlPrerenderTainted = false
     /// Decoration groups that only mark the page on screen for a moment (Read Aloud's
     /// spoken word). Changing one does not empty the page-turn cache.
     public var transientDecorationGroups: Set<DecorationGroup> = []
@@ -1242,19 +1238,14 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     public func apply(decorations: [Decoration], in group: DecorationGroup) {
         var clearedLastMark = false
         if transientDecorationGroups.contains(group) {
-            let wasActive = transientMarksActive
             if decorations.isEmpty {
                 activeTransientGroups.remove(group)
             } else {
                 activeTransientGroups.insert(group)
                 curlTransientSeen = true
             }
-            clearedLastMark = wasActive && !transientMarksActive
-            // The spoken word was cleared: a page taken while it showed may still carry it, and so
-            // may the one a drag or touch-down is holding right now (its generation is bumped too).
-            if clearedLastMark, curlPrerenderTainted || curlPan?.turnInFlight == true || curlTouchDownShot != nil {
-                invalidateCurlPrerender("transient-cleared")
-            }
+            // Also true for a second empty apply that supersedes the first one's task.
+            clearedLastMark = decorations.isEmpty && !transientMarksActive && curlTransientSeen
         }
         decorationTasks[group]?.cancel()
         var task: Task<Void, Never>?
@@ -1326,14 +1317,13 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                 await (self.paginationView?.currentView as? EPUBSpreadView)?.awaitNextPaint()
                 self.invalidateCurlPrerender("decorations-painted")
             }
-            // The clear script paints in `requestAnimationFrame`: anything taken before then still
-            // shows the mark. After it, the taint is over.
+            // The clear script paints in `requestAnimationFrame`: a page taken before then still
+            // shows the mark. After it, one full invalidate (it also bumps the generation, so a drag
+            // or tap that began in the gap stores nothing) ends the no-store rule.
             if clearedLastMark {
                 await (self.paginationView?.currentView as? EPUBSpreadView)?.awaitNextPaint()
                 if !Task.isCancelled, !self.transientMarksActive {
-                    if self.curlPrerenderTainted {
-                        self.invalidateCurlPrerender("transient-painted")
-                    }
+                    self.invalidateCurlPrerender("transient-painted")
                     self.curlTransientSeen = false
                 }
             }
@@ -1449,7 +1439,6 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             PageCurlDebug.log("curl-cache invalidate reason=\(reason) bytes=\(curlPrerender.byteCount)")
         }
         curlPrerender.invalidate()
-        curlPrerenderTainted = false
         cancelCurlTouchDownShot()
         PageCurlView.dropPreloadedTextures()
     }
@@ -2311,7 +2300,7 @@ extension EPUBNavigatorViewController: PageCurlPanDelegate {
     /// screen, the outgoing page is behind it, and the prerender (if any) is
     /// past it. Nothing is stored if anything changed during the drag.
     private func storeCommittedCurlPages(direction: PageCurlTurnDirection) {
-        guard curlDragGeneration == curlContentGeneration,
+        guard curlDragGeneration == curlContentGeneration, !curlTransientSeen,
               let spread = curlSessionSpread,
               let incoming = curlDragIncoming
         else {
@@ -2326,13 +2315,12 @@ extension EPUBNavigatorViewController: PageCurlPanDelegate {
             forward: direction == .forward ? beyond : behind,
             backward: direction == .forward ? behind : beyond
         )
-        noteCurlStoreForTransientMarks()
         fillCurlFingerprint(of: incoming, key: key)
     }
 
     /// A tap curl landed: same bookkeeping as a committed drag.
     private func storeTapCurlPages(_ pages: PageCurlLandedPages, on spread: EPUBReflowableSpreadView) {
-        guard pages.generation == curlContentGeneration, paginationView?.currentView === spread else {
+        guard pages.generation == curlContentGeneration, !curlTransientSeen, paginationView?.currentView === spread else {
             return
         }
         let key = curlPageKey(for: spread)
@@ -2342,14 +2330,13 @@ extension EPUBNavigatorViewController: PageCurlPanDelegate {
             forward: pages.forward ? pages.beyond : pages.outgoing,
             backward: pages.forward ? pages.outgoing : pages.beyond
         )
-        noteCurlStoreForTransientMarks()
         fillCurlFingerprint(of: pages.incoming, key: key)
     }
 
     /// A cancelled drag leaves the outgoing page on screen and has just
     /// rendered the neighbour it peeked at.
     private func storeCancelledCurlPages(direction: PageCurlTurnDirection) {
-        guard curlDragGeneration == curlContentGeneration,
+        guard curlDragGeneration == curlContentGeneration, !curlTransientSeen,
               let spread = curlSessionSpread,
               let incoming = curlDragIncoming,
               let outgoing = curlDragOutgoing
@@ -2361,7 +2348,6 @@ extension EPUBNavigatorViewController: PageCurlPanDelegate {
             return
         }
         curlPrerender.set(incoming, for: direction, key: key, current: outgoing.fingerprint)
-        noteCurlStoreForTransientMarks()
         if outgoing.fingerprint == nil {
             fillCurlFingerprint(of: outgoing.image, key: key)
         }

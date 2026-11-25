@@ -256,6 +256,9 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
         }
         aborted = true
         prepareTask?.cancel()
+        // A discarded capture stops at its next step instead of being waited out; `finish` still
+        // awaits it (briefly) and the revert puts the column back under the cover.
+        pendingCapture?.cancel()
         // Unblock `finishInteractive` and `drawAndWait`. The cover comes off
         // now before a reload installs a new spread under it; otherwise in
         // `tearDown`, once `finish` has put the column back.
@@ -436,6 +439,7 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
             return
         }
         pendingCapture = frame.pendingIncoming
+        if aborted { pendingCapture?.cancel() }
         withinResource = frame.withinResource
         revealed = true
         PageCurlLatency.mark("incoming-ready")

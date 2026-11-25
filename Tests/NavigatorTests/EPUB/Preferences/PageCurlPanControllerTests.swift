@@ -784,73 +784,106 @@ class PageCurlPanControllerTests: XCTestCase {
         return Decoration(id: id, locator: locator, style: .highlight(tint: .yellow))
     }
 
-    /// Stopping Read Aloud must not leave a highlight baked into a cached page.
+    /// Empties the cache and the generation moves on, so what a test stores next is its own.
     @MainActor
-    func testStoppingReadAloudClearsPagesTakenWhileItsMarkShowed() async throws {
-        let (navigator, _) = try await makeCacheNavigator()
-        navigator.transientDecorationGroups = ["tts"]
-        navigator.apply(decorations: [ttsMark()], in: "tts")
-        try await Task.sleep(nanoseconds: 400_000_000)
-        navigator.seedCurlPrerenderForTesting(current: page(10))
-        navigator.apply(decorations: [], in: "tts")
-        try await Task.sleep(nanoseconds: 600_000_000)
-        XCTAssertFalse(navigator.curlPrerenderIsSeededForTesting, "a page taken with the mark showing is dropped when it clears")
-
-        // A page taken with no mark showing survives a mark appearing and then clearing.
-        navigator.seedCurlPrerenderForTesting(current: page(10))
-        navigator.apply(decorations: [ttsMark()], in: "tts")
-        try await Task.sleep(nanoseconds: 400_000_000)
-        navigator.apply(decorations: [], in: "tts")
-        try await Task.sleep(nanoseconds: 600_000_000)
-        XCTAssertTrue(navigator.curlPrerenderIsSeededForTesting)
-    }
-
-    /// A tap curl's pages are tainted like a drag's.
-    @MainActor
-    func testAPageStoredByATapWhileTheMarkShowedIsDroppedWhenItClears() async throws {
-        let (navigator, _) = try await makeCacheNavigator()
-        navigator.transientDecorationGroups = ["tts"]
-        // Start from an empty cache so the tap's own store is what is under test.
+    private func emptyCache(_ navigator: EPUBNavigatorViewController) async throws {
         navigator.apply(decorations: [ttsMark("h")], in: "highlights")
         try await Task.sleep(nanoseconds: 600_000_000)
         XCTAssertFalse(navigator.curlPrerenderIsSeededForTesting)
+    }
+
+    /// Stopping Read Aloud ends in one full invalidate, once the clear has painted.
+    @MainActor
+    func testStoppingReadAloudClearsTheCacheOnceTheClearHasPainted() async throws {
+        let (navigator, _) = try await makeCacheNavigator()
+        navigator.transientDecorationGroups = ["tts"]
+        navigator.apply(decorations: [ttsMark()], in: "tts")
+        try await Task.sleep(nanoseconds: 400_000_000)
+        XCTAssertTrue(navigator.curlPrerenderIsSeededForTesting, "a mark appearing keeps the cache")
+        navigator.apply(decorations: [], in: "tts")
+        try await Task.sleep(nanoseconds: 600_000_000)
+        XCTAssertFalse(navigator.curlPrerenderIsSeededForTesting, "the cleared page may have been photographed with the mark")
+        XCTAssertFalse(navigator.curlTransientSeenForTesting)
+    }
+
+    /// Nothing is stored while a mark has shown: a tap's pages (like a drag's) would carry it.
+    @MainActor
+    func testNothingIsStoredWhileAMarkHasShown() async throws {
+        let (navigator, _) = try await makeCacheNavigator()
+        navigator.transientDecorationGroups = ["tts"]
+        try await emptyCache(navigator)
         navigator.apply(decorations: [ttsMark()], in: "tts")
         try await Task.sleep(nanoseconds: 400_000_000)
         navigator.storeTapCurlPagesForTesting()
-        XCTAssertTrue(navigator.curlPrerenderTaintedForTesting, "the tap's store is tainted while the mark shows")
-        navigator.apply(decorations: [], in: "tts")
-        try await Task.sleep(nanoseconds: 600_000_000)
-        XCTAssertFalse(navigator.curlPrerenderTaintedForTesting, "the clear emptied the cache")
-        XCTAssertFalse(navigator.curlPrerenderIsSeededForTesting)
-    }
-
-    /// The mark moving does not wash the taint out of what was stored while it showed.
-    @MainActor
-    func testAPageStoredWhileTheMarkShowedStaysTaintedWhenTheMarkMoves() async throws {
-        let (navigator, _) = try await makeCacheNavigator()
-        navigator.transientDecorationGroups = ["tts"]
-        navigator.apply(decorations: [ttsMark("a")], in: "tts")
-        try await Task.sleep(nanoseconds: 400_000_000)
-        navigator.seedCurlPrerenderForTesting(current: page(10))
+        XCTAssertFalse(navigator.curlPrerenderIsSeededForTesting, "no store while Read Aloud's mark has shown")
+        // Moving the mark does not change that.
         navigator.apply(decorations: [ttsMark("b")], in: "tts")
         try await Task.sleep(nanoseconds: 400_000_000)
-        XCTAssertTrue(navigator.curlPrerenderIsSeededForTesting, "a moving mark keeps the cache")
-        navigator.apply(decorations: [], in: "tts")
-        try await Task.sleep(nanoseconds: 600_000_000)
+        navigator.storeTapCurlPagesForTesting()
         XCTAssertFalse(navigator.curlPrerenderIsSeededForTesting)
     }
 
-    /// A page stored after the mark was cleared but before WebKit painted the clear still carries it.
+    /// A tap or drag that began before the clear painted lands with an old generation: not stored.
     @MainActor
-    func testAPageStoredBetweenTheClearAndItsPaintIsDropped() async throws {
+    func testATurnThatBeganBeforeTheClearPaintedStoresNothing() async throws {
         let (navigator, _) = try await makeCacheNavigator()
         navigator.transientDecorationGroups = ["tts"]
+        try await emptyCache(navigator)
+        navigator.apply(decorations: [ttsMark()], in: "tts")
+        try await Task.sleep(nanoseconds: 400_000_000)
+        let began = navigator.curlContentGenerationForTesting
+        navigator.apply(decorations: [], in: "tts")
+        try await Task.sleep(nanoseconds: 600_000_000)
+        XCTAssertNotEqual(navigator.curlContentGenerationForTesting, began, "the painted clear invalidated")
+        navigator.storeTapCurlPagesForTesting(generation: began)
+        XCTAssertFalse(navigator.curlPrerenderIsSeededForTesting)
+        // A turn begun after it stores normally: the rule is over.
+        navigator.storeTapCurlPagesForTesting()
+        XCTAssertTrue(navigator.curlPrerenderIsSeededForTesting)
+    }
+
+    /// Two empty applies back to back (Kudos sends both): the second must not strand the rule.
+    @MainActor
+    func testTwoBackToBackClearsStillEndTheNoStoreRule() async throws {
+        let (navigator, _) = try await makeCacheNavigator()
+        navigator.transientDecorationGroups = ["tts"]
+        try await emptyCache(navigator)
         navigator.apply(decorations: [ttsMark()], in: "tts")
         try await Task.sleep(nanoseconds: 400_000_000)
         navigator.apply(decorations: [], in: "tts")
-        navigator.seedCurlPrerenderForTesting(current: page(10))
-        try await Task.sleep(nanoseconds: 600_000_000)
-        XCTAssertFalse(navigator.curlPrerenderIsSeededForTesting)
+        navigator.apply(decorations: [], in: "tts")
+        try await Task.sleep(nanoseconds: 700_000_000)
+        XCTAssertFalse(navigator.curlTransientSeenForTesting, "not stuck")
+        navigator.storeTapCurlPagesForTesting()
+        XCTAssertTrue(navigator.curlPrerenderIsSeededForTesting, "stores work again")
+    }
+
+    /// A curl scroll still queued in a stalled web process is undone by the revert, not left to strand the page.
+    @MainActor
+    func testARevertUndoesAScrollThatIsStillQueued() async throws {
+        let (navigator, _) = try await makeCacheNavigator()
+        let beforeX = await navigator.pageScrollXForTesting()
+        let before = try XCTUnwrap(beforeX)
+        XCTAssertTrue(navigator.dispatchUnawaitedCurlScrollForTesting(), "the chapter has a next column")
+        // The native offset has not moved yet, so the old `correction == 0` revert did nothing.
+        await navigator.revertCurlForTesting()
+        try await Task.sleep(nanoseconds: 500_000_000)
+        let afterX = await navigator.pageScrollXForTesting()
+        let after = try XCTUnwrap(afterX)
+        XCTAssertEqual(after, before, accuracy: 1, "back on the page the turn began from")
+    }
+
+    /// Aborting does not wait out a discarded capture: it is cancelled and stops at its next step.
+    @MainActor
+    func testAbortCancelsTheDiscardedCaptureInsteadOfWaitingItOut() async throws {
+        let capture = SteppingCapture()
+        let gate = CaptureGate()
+        let (controller, _, spy) = await spyDrag(gate: gate, held: capture.task())
+        _ = try XCTUnwrap(spy)
+        let start = CACurrentMediaTime()
+        await controller.abortDrag()
+        XCTAssertLessThan(CACurrentMediaTime() - start, 1.0, "it did not wait for the 4.5 s backstop")
+        XCTAssertFalse(controller.turnInFlight)
     }
 
     /// A shot that outlives its drag is not written into the next one.

@@ -553,7 +553,7 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         let startOffset = scrollView.contentOffset.x
         curlTargetOffset = startOffset + delta
         setSuppressingProgressionUpdates(true)
-        await scrollByAwaitingPaint(delta)
+        await scrollByAwaitingPaint(delta, recordOrigin: true)
         PageCurlLatency.mark("incoming-scrolled")
         guard !Task.isCancelled else {
             return nil
@@ -581,7 +581,7 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
                 target: target
             )
             if correction != 0 {
-                await scrollByAwaitingPaint(correction)
+                await scrollByAwaitingPaint(correction, recordOrigin: true)
                 corrected = true
             }
         }
@@ -613,7 +613,7 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         curlTargetOffset = scrollView.contentOffset.x + delta
         setSuppressingProgressionUpdates(true)
         pendingCurlScroll = Task { @MainActor [weak self] in
-            await self?.scrollByAwaitingPaint(delta)
+            await self?.scrollByAwaitingPaint(delta, recordOrigin: true)
             PageCurlLatency.mark("incoming-scrolled-behind")
         }
         return true
@@ -699,14 +699,10 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         let target = curlTargetOffset
         curlDelta = 0
         curlTargetOffset = nil
-        if delta != 0, let target {
-            let correction = PageCurlGeometry.curlColumnCorrection(
-                offset: scrollView.contentOffset.x,
-                target: target - delta
-            )
-            if correction != 0 {
-                await scrollByAwaitingPaint(correction)
-            }
+        if delta != 0, target != nil {
+            // Not "scroll by the native correction": a scroll that is still queued has not moved the
+            // native offset, so the correction would be 0 and the late scroll would strand the page.
+            await scrollAwaitingPaint(Self.restoreCurlOriginScript, x: 0)
         }
         discardSuppressedProgression()
     }
@@ -727,6 +723,10 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         }
         curlTargetOffset = nil
         curlDelta = 0
+        // The turn landed: the recorded origin is no longer one to go back to.
+        Task { @MainActor [weak self] in
+            await self?.evaluateScript("delete window.__readiumCurlOriginX;")
+        }
         setSuppressingProgressionUpdates(false)
     }
 
@@ -813,11 +813,50 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         case timedOut
     }
 
-    private func scrollByAwaitingPaint(_ offsetX: CGFloat) async {
-        await scrollAwaitingPaint("window.scrollBy({ left: x, behavior: 'instant' });", x: offsetX)
+    /// `recordOrigin`: a scroll made for a curl remembers where the page was before the first one,
+    /// in the page's own coordinates, so a revert can restore it even when the scroll has been
+    /// queued in a stalled web process and the native offset has not moved yet.
+    private func scrollByAwaitingPaint(_ offsetX: CGFloat, recordOrigin: Bool = false) async {
+        let remember = recordOrigin
+            ? "if (window.__readiumCurlOriginX === undefined) { window.__readiumCurlOriginX = window.scrollX; } "
+            : ""
+        await scrollAwaitingPaint(
+            remember + "window.scrollBy({ left: x, behavior: 'instant' });",
+            x: offsetX,
+            skipFallbackWhenCancelled: recordOrigin
+        )
     }
 
-    private func scrollAwaitingPaint(_ scrollCall: String, x: CGFloat) async {
+    /// Test hook: a curl scroll dispatched and not awaited, the state a stalled web process leaves:
+    /// the native offset has not moved, the scroll is queued.
+    func dispatchUnawaitedCurlScrollForTesting(direction: Direction) -> Bool {
+        guard let delta = pageDelta(for: direction) else { return false }
+        curlDelta = delta
+        curlTargetOffset = scrollView.contentOffset.x + delta
+        setSuppressingProgressionUpdates(true)
+        webView.evaluateJavaScript(
+            "if (window.__readiumCurlOriginX === undefined) { window.__readiumCurlOriginX = window.scrollX; } "
+                + "window.scrollBy({ left: \(delta), behavior: 'instant' });"
+        )
+        return true
+    }
+
+    func pageScrollXForTesting() async -> Double? {
+        if case let .success(value) = await evaluateScript("window.scrollX") { return (value as? NSNumber)?.doubleValue }
+        return nil
+    }
+
+    /// Script that undoes every curl scroll made since the origin was recorded. Runs after them
+    /// in WebKit's queue, so a late scroll is put straight back.
+    static let restoreCurlOriginScript = """
+    if (window.__readiumCurlOriginX !== undefined) {
+      var dx = window.__readiumCurlOriginX - window.scrollX;
+      delete window.__readiumCurlOriginX;
+      if (dx !== 0) { window.scrollBy({ left: dx, behavior: 'instant' }); }
+    }
+    """
+
+    private func scrollAwaitingPaint(_ scrollCall: String, x: CGFloat, skipFallbackWhenCancelled: Bool = false) async {
         // Same retain as `ReadyResume.awaitFirst`. A weak box here never
         // resumes, so the fade cover stays up and the column looks unturned.
         let result: PaintScroll = await ReadyResume.awaitFirst { box in
@@ -849,7 +888,8 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         }
         // A timeout must not scroll a second time: the script may already have
         // moved by one page, and a fallback `scrollBy` would skip the next one.
-        if result == .failed {
+        // A cancelled capture must not start a new scroll; a revert (not cancel-aware) still may.
+        if result == .failed, !(skipFallbackWhenCancelled && Task.isCancelled) {
             let call = scrollCall.replacingOccurrences(of: "left: x", with: "left: \(x)")
             // Bounded like the paint wait: a web process that never answers must not hold the turn.
             await ReadyResume.awaitFirst { (box: ReadyResumeBox<Void>) in
