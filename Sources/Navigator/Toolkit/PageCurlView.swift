@@ -183,6 +183,9 @@ final class PageCurlView: UIView, PageTurnOverlayView {
         reversed: Bool = false,
         duration: TimeInterval = PageCurlGeometry.tapDuration
     ) async {
+        incomingIsPlaceholder = false
+        placeholderPending = false
+        incomingFadeStart = nil
         // A second call must not leak the first clock or its continuation.
         finishTap()
         endInteractive()
@@ -266,6 +269,10 @@ final class PageCurlView: UIView, PageTurnOverlayView {
     ) async -> Bool {
         finishTap()
         endInteractive()
+        // One-shot: a reused view starts from a real page unless told otherwise.
+        incomingIsPlaceholder = placeholderPending
+        placeholderPending = false
+        incomingFadeStart = nil
         self.spine = spine
         self.peelSign = peelSign
         self.realVerso = realVerso
@@ -393,7 +400,7 @@ final class PageCurlView: UIView, PageTurnOverlayView {
         // starts on the drag's own aim and keeps its angle.
         springPControl = PageCurlGeometry.mix(springPFrom, springPTo, 0.5)
         interactivePhase = .spring
-        if abs(progress - target) < 0.004, abs(velocity) < 0.02 {
+        if abs(progress - target) < 0.004, abs(velocity) < 0.02, incomingFadeSettled {
             progress = target
             drawInteractive()
             endInteractive()
@@ -549,19 +556,31 @@ final class PageCurlView: UIView, PageTurnOverlayView {
 
     /// The incoming bitmap of the next `beginInteractive` is a placeholder in the page colour.
     func expectIncomingPlaceholder() {
-        incomingIsPlaceholder = true
-        incomingFadeStart = nil
+        placeholderPending = true
     }
 
+    private var placeholderPending = false
+
     /// The real page has arrived: swap its texture in and fade it up from the page colour.
-    func replaceIncoming(_ image: UIImage, fade: Bool) async {
-        guard interactivePhase != .none, let renderer, await renderer.replaceIncoming(image),
-              interactivePhase != .none
-        else {
-            return
+    func replaceIncoming(_ image: UIImage, fade: Bool) async -> Bool {
+        guard interactivePhase != .none, let renderer else {
+            return true
+        }
+        guard await renderer.replaceIncoming(image) else {
+            // The texture could not be uploaded: the turn must not carry a blank page.
+            return false
+        }
+        guard interactivePhase != .none else {
+            return true
         }
         incomingIsPlaceholder = false
         incomingFadeStart = fade && !UIAccessibility.isReduceMotionEnabled ? CACurrentMediaTime() : nil
+        return true
+    }
+
+    /// The fade has run its course (or there was none): the leaf may land.
+    private var incomingFadeSettled: Bool {
+        incomingIsPlaceholder || incomingFade >= 1
     }
 
     /// Drawable aspect when the layer has a size, otherwise the view's.
@@ -705,7 +724,8 @@ final class PageCurlView: UIView, PageTurnOverlayView {
                 target: springTarget,
                 omega: springOmega
             )
-            if abs(progress - springTarget) < 0.004 || elapsed > 0.7 {
+            // The fade from the page colour is not cut short by a quick landing.
+            if (abs(progress - springTarget) < 0.004 && incomingFadeSettled) || elapsed > 0.7 {
                 progress = springTarget
                 landed = true
             }

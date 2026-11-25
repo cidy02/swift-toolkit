@@ -12,6 +12,8 @@ import WebKit
 /// A transparent grab would let the page underneath show through the leaf.
 @MainActor
 enum PageCurlSnapshotter {
+    static let snapshotDeadline: TimeInterval = 1.0
+
     static func capture(
         of view: UIView,
         backgroundColor: UIColor,
@@ -70,12 +72,19 @@ enum PageCurlSnapshotter {
         of web: WKWebView,
         afterScreenUpdates: Bool
     ) async -> UIImage? {
-        await withCheckedContinuation { continuation in
+        // Bounded: a web process that never answers must not hold a turn (and its cover) forever.
+        await ReadyResume.awaitFirst { (box: ReadyResumeBox<UIImage?>) in
+            Task { @MainActor in
+                try? await Task.sleep(seconds: Self.snapshotDeadline)
+                box.resume(returning: nil)
+            }
             let config = WKSnapshotConfiguration()
             config.rect = web.bounds
             config.afterScreenUpdates = afterScreenUpdates
             web.takeSnapshot(with: config) { image, _ in
-                continuation.resume(returning: image)
+                Task { @MainActor in
+                    box.resume(returning: image)
+                }
             }
         }
     }

@@ -450,6 +450,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
     override open func viewDidLoad() {
         super.viewDidLoad()
+        observeCurlTraits()
 
         // Will call `accessibilityScroll()` when VoiceOver reaches the end of
         // the current resource. We can use this to go to the next resource.
@@ -481,18 +482,12 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         curlPan?.abort(keepingCover: true)
         (paginationView?.currentView as? EPUBSpreadView)?.stopActiveCurlForLifecycle()
         // The cached pages stay: nothing about them changed. Only the work in
-        // flight goes, and the system appearance is remembered (see `didBecomeActive`).
-        appearanceAtResign = traitCollection.userInterfaceStyle
+        // flight goes. Appearance and text-size changes arrive as trait changes.
         cancelCurlTouchDownShot()
         PageCurlView.dropPreloadedTextures()
     }
 
     @objc private func didBecomeActive() {
-        // Dark/light changed while away: the pages were taken in the other one.
-        if let style = appearanceAtResign, style != traitCollection.userInterfaceStyle {
-            invalidateCurlPrerender("appearance-changed")
-        }
-        appearanceAtResign = nil
         isActive = true
 
         // The device may have rotated since the last time the app was active.
@@ -565,6 +560,35 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     override open func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
         viewModel.viewSizeWillChange(view.bounds.size)
+    }
+
+    /// Light/dark, text size, Bold Text, contrast or scale changed while active or away:
+    /// the cached pages were taken under the old traits.
+    private func observeCurlTraits() {
+        if #available(iOS 17.0, *) {
+            registerForTraitChanges([
+                UITraitUserInterfaceStyle.self,
+                UITraitPreferredContentSizeCategory.self,
+                UITraitLegibilityWeight.self,
+                UITraitAccessibilityContrast.self,
+                UITraitDisplayScale.self,
+            ]) { (self: EPUBNavigatorViewController, _) in
+                self.invalidateCurlPrerender("traits")
+            }
+        }
+    }
+
+    override open func traitCollectionDidChange(_ previous: UITraitCollection?) {
+        super.traitCollectionDidChange(previous)
+        if #unavailable(iOS 17.0), let previous,
+           previous.userInterfaceStyle != traitCollection.userInterfaceStyle
+            || previous.preferredContentSizeCategory != traitCollection.preferredContentSizeCategory
+            || previous.legibilityWeight != traitCollection.legibilityWeight
+            || previous.accessibilityContrast != traitCollection.accessibilityContrast
+            || previous.displayScale != traitCollection.displayScale
+        {
+            invalidateCurlPrerender("traits")
+        }
     }
 
     /// Hiding the reader keeps the curl's cached bitmaps; closing it frees them.
@@ -811,18 +835,46 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     /// Bumped by every change that can alter a page's pixels. A bitmap taken
     /// under an older generation is never stored or shown from the cache.
     private var curlContentGeneration = 0
+    private func noteCurlStoreForTransientMarks() {
+        if transientMarksActive {
+            curlPrerenderTainted = true
+        }
+    }
+
+    /// Test hook: whether a cached neighbour would be served against this on-screen fingerprint.
+    func curlCachedNeighborIsServedForTesting(_ turn: PageCurlTurnDirection, onScreen: PageCurlFingerprint?) -> Bool {
+        guard let spread = paginationView?.currentView as? EPUBSpreadView else { return false }
+        let key = curlPageKey(for: spread)
+        return (try? curlPrerender.neighbor(
+            turn,
+            key: key,
+            onScreen: transientMarksActive ? curlPrerender.current : onScreen
+        ).get()) != nil
+    }
+
+    func seedCurlPrerenderForTesting(current: PageCurlFingerprint?) {
+        guard let spread = paginationView?.currentView as? EPUBSpreadView else { return }
+        let image = UIGraphicsImageRenderer(size: CGSize(width: 4, height: 4)).image { _ in }
+        curlPrerender.set(image, for: .forward, key: curlPageKey(for: spread), current: current)
+        noteCurlStoreForTransientMarks()
+    }
+
     /// Test hooks for the cache rules.
     func seedCurlPrerenderForTesting() {
         guard let spread = paginationView?.currentView as? EPUBSpreadView else { return }
         let image = UIGraphicsImageRenderer(size: CGSize(width: 4, height: 4)).image { _ in }
         curlPrerender.set(image, for: .forward, key: curlPageKey(for: spread), current: nil)
+        noteCurlStoreForTransientMarks()
     }
 
     var curlPrerenderIsSeededForTesting: Bool {
         guard let spread = paginationView?.currentView as? EPUBSpreadView else { return false }
         return curlPrerender.has(.forward, key: curlPageKey(for: spread))
     }
-    private var appearanceAtResign: UIUserInterfaceStyle?
+    /// Spoken-word marks (a transient group) are on the page right now.
+    private var transientMarksActive = false
+    /// Pages in the cache were taken while such a mark was showing, so one may carry it.
+    private var curlPrerenderTainted = false
     /// Decoration groups that only mark the page on screen for a moment (Read Aloud's
     /// spoken word). Changing one does not empty the page-turn cache.
     public var transientDecorationGroups: Set<DecorationGroup> = []
@@ -1129,6 +1181,14 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     }
 
     public func apply(decorations: [Decoration], in group: DecorationGroup) {
+        if transientDecorationGroups.contains(group) {
+            let wasActive = transientMarksActive
+            transientMarksActive = !decorations.isEmpty
+            // The spoken word was cleared: a page taken while it showed may still carry it.
+            if wasActive, !transientMarksActive, curlPrerenderTainted {
+                invalidateCurlPrerender("transient-cleared")
+            }
+        }
         decorationTasks[group]?.cancel()
         var task: Task<Void, Never>?
         task = Task { [weak self] in
@@ -1311,6 +1371,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             PageCurlDebug.log("curl-cache invalidate reason=\(reason) bytes=\(curlPrerender.byteCount)")
         }
         curlPrerender.invalidate()
+        curlPrerenderTainted = false
         cancelCurlTouchDownShot()
         PageCurlView.dropPreloadedTextures()
     }
@@ -2154,7 +2215,9 @@ extension EPUBNavigatorViewController: PageCurlPanDelegate {
         let result = curlPrerender.neighbor(
             direction,
             key: curlPageKey(for: spread),
-            onScreen: curlDragOutgoing?.fingerprint
+            // A spoken-word mark moves between drags and changes the page's pixels without
+            // changing its content: the fingerprint would call every such page a different one.
+            onScreen: transientMarksActive ? curlPrerender.current : curlDragOutgoing?.fingerprint
         )
         switch result {
         case let .success(image):
@@ -2185,6 +2248,7 @@ extension EPUBNavigatorViewController: PageCurlPanDelegate {
             forward: direction == .forward ? beyond : behind,
             backward: direction == .forward ? behind : beyond
         )
+        noteCurlStoreForTransientMarks()
         fillCurlFingerprint(of: incoming, key: key)
     }
 
@@ -2218,6 +2282,7 @@ extension EPUBNavigatorViewController: PageCurlPanDelegate {
             return
         }
         curlPrerender.set(incoming, for: direction, key: key, current: outgoing.fingerprint)
+        noteCurlStoreForTransientMarks()
         if outgoing.fingerprint == nil {
             fillCurlFingerprint(of: outgoing.image, key: key)
         }

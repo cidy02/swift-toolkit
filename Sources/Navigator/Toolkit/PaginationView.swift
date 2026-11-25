@@ -560,7 +560,18 @@ final class PaginationView: UIView, Loggable {
             return nil
         }
         let location: PageLocation = forward ? .start : .end
-        guard let neighbor = await ensureLoadedForCurl(at: index, location: location) else {
+        // Bounded: a neighbour that never finishes loading must not hold the turn.
+        let loaded: (UIView & PageView)? = await ReadyResume.awaitFirst { box in
+            Task { @MainActor in
+                try? await Task.sleep(seconds: 1.0)
+                box.resume(returning: nil)
+            }
+            Task { @MainActor [weak self] in
+                box.resume(returning: await self?.ensureLoadedForCurl(at: index, location: location))
+            }
+        }
+        guard let neighbor = loaded else {
+            (loadedViews[index])?.setSuppressingProgressionUpdates(false)
             return nil
         }
         guard generation == reloadGeneration else {

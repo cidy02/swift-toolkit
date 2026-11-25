@@ -39,7 +39,7 @@ protocol PageTurnOverlayView: UIView {
     /// The incoming bitmap of the next `beginInteractive` is a placeholder in the page colour.
     func expectIncomingPlaceholder()
     /// The real page has arrived: swap it in, with a fade unless Reduce Motion is on.
-    func replaceIncoming(_ image: UIImage, fade: Bool) async
+    func replaceIncoming(_ image: UIImage, fade: Bool) async -> Bool
 }
 
 extension PageTurnOverlayView {
@@ -331,9 +331,9 @@ final class PageSlideView: UIView, PageTurnOverlayView {
 
     func expectIncomingPlaceholder() {}
 
-    func replaceIncoming(_ image: UIImage, fade: Bool) async {
+    func replaceIncoming(_ image: UIImage, fade: Bool) async -> Bool {
         guard interactivePhase != .none, isArmed else {
-            return
+            return true
         }
         let views = reversed ? [cardImageView, staticHalfImageView] : [underImageView]
         let animate = fade && !UIAccessibility.isReduceMotionEnabled
@@ -346,6 +346,7 @@ final class PageSlideView: UIView, PageTurnOverlayView {
                 view.image = image
             }
         }
+            return true
     }
 
     func finishInteractive(target: CGFloat, progressVelocity: CGFloat) async {

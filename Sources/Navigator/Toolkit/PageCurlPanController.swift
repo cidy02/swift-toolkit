@@ -133,6 +133,27 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
     /// before it commits or reverts, so the web view's column state is settled.
     private var incomingArrival: Task<Void, Never>?
     private var incomingFailed = false
+    /// The capture started for this drag, kept from the moment `curlPanRevealIncoming`
+    /// returns so that every way out of `prepare` waits for it before the cover comes off.
+    private var pendingCapture: Task<UIImage?, Never>?
+    /// The turn is being cancelled: a page that arrives now is not uploaded.
+    private var cancellingTurn = false
+    /// Longest `finish` waits for the real page. The capture's own steps are bounded
+    /// too (snapshot 1 s, neighbour load 1 s); this is the backstop that cannot wedge.
+    static var incomingDeadline: TimeInterval = 2.5
+
+    private func boundedWait(_ task: Task<UIImage?, Never>) async -> UIImage? {
+        let limit = Self.incomingDeadline
+        return await ReadyResume.awaitFirst { box in
+            Task { @MainActor in
+                try? await Task.sleep(seconds: limit)
+                box.resume(returning: nil)
+            }
+            Task { @MainActor in
+                box.resume(returning: await task.value)
+            }
+        }
+    }
 
     override init() {
         let pan = PageCurlPanRecognizer()
@@ -377,6 +398,11 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
         host.layoutIfNeeded()
         PageCurlLatency.mark("cover-up")
 
+        // A drag that has already been cancelled must not start a capture that moves the column.
+        if aborted || Task.isCancelled || pendingRelease?.commit == false {
+            await failBeforeReveal()
+            return
+        }
         guard let frame = await delegate.curlPanRevealIncoming(
             direction: direction,
             outgoing: shot.image,
@@ -385,6 +411,7 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
             await failBeforeReveal()
             return
         }
+        pendingCapture = frame.pendingIncoming
         withinResource = frame.withinResource
         revealed = true
         PageCurlLatency.mark("incoming-ready")
@@ -429,16 +456,21 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
         phase = .armed
         if let pending = frame.pendingIncoming {
             incomingArrival = Task { @MainActor [weak self, weak curl] in
-                let image = await pending.value
+                let image = await self?.boundedWait(pending)
                 // A late snapshot of a drag that ended, aborted or moved on is dropped.
                 guard let self, let curl, self.curlView === curl, !self.aborted, self.phase != .idle else {
                     return
                 }
                 PageCurlLatency.mark("incoming-arrived", "ok=\(image != nil)")
-                if let image {
-                    await curl.replaceIncoming(image, fade: true)
-                } else {
-                    // The page could not be taken: end the drag cleanly, back where it started.
+                var arrived = false
+                if let image, !self.cancellingTurn {
+                    // Released already (waiting here in `finish`): swap, no fade to cut short.
+                    arrived = await curl.replaceIncoming(image, fade: self.phase == .armed)
+                } else if image != nil {
+                    return
+                }
+                if !arrived {
+                    // The page could not be taken or uploaded: end the drag where it started.
                     self.incomingFailed = true
                     if self.phase == .armed, !self.endConsumed {
                         self.endConsumed = true
@@ -540,10 +572,18 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
         phase = .finishing
         // The real page is still being taken behind the placeholder: its column
         // scroll must finish before anything is committed or put back.
+        cancellingTurn = !commit || aborted
         if let arrival = incomingArrival {
             await arrival.value
             incomingArrival = nil
+        } else if let pending = pendingCapture {
+            // Left before arming (cancelled, aborted, Metal refused): the capture it
+            // started still has to finish, or it would move the column with no cover.
+            if await boundedWait(pending) == nil {
+                incomingFailed = true
+            }
         }
+        pendingCapture = nil
         let width = delegate?.curlPanHostView()?.bounds.width ?? 1
         let progressVelocity = width > 1 ? velocity / width : 0
         let willCommit = commit && !aborted && !incomingFailed
@@ -591,6 +631,8 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
         aborted = false
         incomingFailed = false
         incomingArrival = nil
+        pendingCapture = nil
+        cancellingTurn = false
         resumeAbortWaiter()
         if reportTurn {
             delegate?.curlPanDidCommitTurn(direction: turnDirection)

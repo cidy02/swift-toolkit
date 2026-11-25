@@ -29,6 +29,9 @@ class PageCurlPanControllerTests: XCTestCase {
         var incomingImage: UIImage?
         /// A capture that has not arrived: the turn starts on a placeholder.
         var heldCapture: Task<UIImage?, Never>?
+        /// The reveal itself is slow: the pan is still preparing while it waits.
+        var revealGate: (() async -> Void)?
+        var overlayFactory: ((CGRect) -> any PageTurnOverlayView)?
 
         func curlPanContext(in view: UIView) -> PageCurlPanContext {
             PageCurlPanContext(
@@ -44,6 +47,11 @@ class PageCurlPanControllerTests: XCTestCase {
 
         func curlPanHostView() -> UIView? { hostView }
         func curlPanMakeOverlayView(frame: CGRect) -> any PageTurnOverlayView {
+            if let overlayFactory {
+                let spy = overlayFactory(frame)
+                overlayMade = spy
+                return spy
+            }
             let view: any PageTurnOverlayView = makeSlide ? PageSlideView(frame: frame) : PageCurlView(frame: frame)
             overlayMade = view
             return view
@@ -59,6 +67,7 @@ class PageCurlPanControllerTests: XCTestCase {
             outgoing: UIImage,
             background: UIColor
         ) async -> PageCurlPanFrame? {
+            await revealGate?()
             if let held = heldCapture {
                 return PageCurlPanFrame(
                     outgoing: outgoing,
@@ -288,6 +297,160 @@ class PageCurlPanControllerTests: XCTestCase {
         XCTAssertEqual(delegate.didCancel, 1)
     }
 
+    /// Counts what the pan controller does to its overlay.
+    @MainActor private final class SpyOverlay: UIView, PageTurnOverlayView {
+        var replaced: [UIImage] = []
+        var replaceFades: [Bool] = []
+        var replaceResult = true
+        var released = false
+        func showCover(_ image: UIImage, background: UIColor) {}
+        func runTap(outgoing: UIImage, incoming: UIImage, spine: PageCurlSpine, peelSign: CGFloat, realVerso: Bool, reversed: Bool, duration: TimeInterval) async {}
+        func beginInteractive(outgoing: UIImage, incoming: UIImage, spine: PageCurlSpine, peelSign: CGFloat, realVerso: Bool, reversed: Bool, progress: CGFloat, grabUV: CGPoint, fingerUV: CGPoint) async -> Bool { true }
+        func track(progress: CGFloat, fingerUV: CGPoint) {}
+        func finishInteractive(target: CGFloat, progressVelocity: CGFloat) async {}
+        func freezeOnCover(showing image: UIImage?) {}
+        func releaseResources() { released = true }
+        func expectIncomingPlaceholder() {}
+        func replaceIncoming(_ image: UIImage, fade: Bool) async -> Bool {
+            replaced.append(image)
+            replaceFades.append(fade)
+            return replaceResult
+        }
+    }
+
+    private func spyDrag(gate: CaptureGate, revealGate: (() async -> Void)? = nil) async -> (PageCurlPanController, Delegate, SpyOverlay?) {
+        let bounds = CGRect(x: 0, y: 0, width: 402, height: 874)
+        let window = UIWindow(frame: bounds)
+        let host = UIView(frame: bounds)
+        window.addSubview(host)
+        window.makeKeyAndVisible()
+        windows.append(window)
+        let delegate = Delegate()
+        delegate.accepts = true
+        delegate.hostView = host
+        delegate.outgoingImage = UIGraphicsImageRenderer(size: CGSize(width: 20, height: 20)).image { $0.fill(CGRect(x: 0, y: 0, width: 20, height: 20)) }
+        delegate.heldCapture = gate.task()
+        delegate.revealGate = revealGate
+        delegate.overlayFactory = { SpyOverlay(frame: $0) }
+        let controller = PageCurlPanController()
+        controller.delegate = delegate
+        controller.attach(to: host)
+        controller.begin(controller.recognizer)
+        if revealGate == nil {
+            for _ in 0 ..< 100 where !controller.isArmedForTesting { try? await Task.sleep(nanoseconds: 10_000_000) }
+        } else {
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+        return (controller, delegate, delegate.overlayMade as? SpyOverlay)
+    }
+
+    /// P1: a drag cancelled while it is still preparing must keep the cover up until the capture
+    /// it started has finished. Without that the capture moves the live column uncovered.
+    @MainActor
+    func testACancelWhilePreparingKeepsTheCoverUntilTheStartedCaptureFinishes() async throws {
+        let capture = CaptureGate()
+        var openReveal: CheckedContinuation<Void, Never>?
+        let (controller, delegate, spy) = await spyDrag(gate: capture, revealGate: {
+            await withCheckedContinuation { openReveal = $0 }
+        })
+        let overlay = try XCTUnwrap(spy)
+        XCTAssertFalse(controller.isArmedForTesting, "still preparing: the reveal has not returned")
+        // Cancelled (the finger lifted early), then the reveal returns with its capture running.
+        let aborting = Task { @MainActor in await controller.abortDrag() }
+        try await Task.sleep(nanoseconds: 100_000_000)
+        openReveal?.resume()
+        try await Task.sleep(nanoseconds: 300_000_000)
+        XCTAssertNotNil(overlay.superview, "the cover stays while the capture is outstanding")
+        XCTAssertTrue(controller.turnInFlight)
+        await capture.release(UIImage())
+        await aborting.value
+        XCTAssertFalse(controller.turnInFlight)
+        XCTAssertNil(overlay.superview)
+        XCTAssertEqual(delegate.commits, 0)
+    }
+
+    /// P2: a capture that never returns cannot wedge the turn: it is bounded, the drag ends as a cancel.
+    @MainActor
+    func testACaptureThatNeverReturnsIsBoundedAndTheDragCancelsCleanly() async throws {
+        let saved = PageCurlPanController.incomingDeadline
+        PageCurlPanController.incomingDeadline = 0.3
+        defer { PageCurlPanController.incomingDeadline = saved }
+        let gate = CaptureGate()
+        let (controller, delegate, spy) = await spyDrag(gate: gate)
+        let overlay = try XCTUnwrap(spy)
+        let done = Task { @MainActor in await controller.finish(commit: true, velocity: 0) }
+        var finished = false
+        Task { @MainActor in await done.value; finished = true }
+        for _ in 0 ..< 200 where !finished { try? await Task.sleep(nanoseconds: 10_000_000) }
+        XCTAssertTrue(finished, "finish returned without the capture")
+        XCTAssertEqual(delegate.commits, 0, "a turn whose page never arrived is not committed")
+        XCTAssertEqual(delegate.didCancel, 1)
+        XCTAssertNil(overlay.superview)
+    }
+
+    /// A page that arrives after the turn was already being cancelled is not uploaded.
+    @MainActor
+    func testALateImageAfterACancelIsNotUploaded() async throws {
+        let gate = CaptureGate()
+        let (controller, _, spy) = await spyDrag(gate: gate)
+        let overlay = try XCTUnwrap(spy)
+        let release = Task { await gate.release(UIImage()) }
+        await controller.finish(commit: false, velocity: 0)
+        await release.value
+        XCTAssertTrue(overlay.replaced.isEmpty, "no texture upload for a turn that is cancelling")
+    }
+
+    /// A release that is a commit swaps the page in without a fade; a failed upload cancels.
+    @MainActor
+    func testACommitSwapsTheRealPageWithoutAFadeAndAFailedUploadCancels() async throws {
+        let gate = CaptureGate()
+        let (controller, delegate, spy) = await spyDrag(gate: gate)
+        let overlay = try XCTUnwrap(spy)
+        let real = UIImage()
+        let release = Task { await gate.release(real) }
+        await controller.finish(commit: true, velocity: 0)
+        await release.value
+        XCTAssertEqual(overlay.replaced.count, 1)
+        XCTAssertEqual(overlay.replaceFades, [false], "released: nothing to fade")
+        XCTAssertEqual(delegate.commits, 1)
+
+        let gate2 = CaptureGate()
+        let (controller2, delegate2, spy2) = await spyDrag(gate: gate2)
+        let overlay2 = try XCTUnwrap(spy2)
+        overlay2.replaceResult = false
+        let release2 = Task { await gate2.release(UIImage()) }
+        await controller2.finish(commit: true, velocity: 0)
+        await release2.value
+        XCTAssertEqual(delegate2.commits, 0, "a page that could not be uploaded is not committed")
+        XCTAssertEqual(delegate2.didCancel, 1)
+    }
+
+    /// A capture that fails after the finger committed cancels instead.
+    @MainActor
+    func testACaptureThatFailsAfterACommitReleaseCancels() async throws {
+        let gate = CaptureGate()
+        let (controller, delegate, _) = await spyDrag(gate: gate)
+        let release = Task { await gate.release(nil) }
+        await controller.finish(commit: true, velocity: 0)
+        await release.value
+        XCTAssertEqual(delegate.commits, 0)
+        XCTAssertEqual(delegate.didCancel, 1)
+    }
+
+    /// The placeholder is the page colour, custom paper included.
+    func testThePlaceholderIsThePageColour() throws {
+        let paper = UIColor(red: 0.98, green: 0.94, blue: 0.85, alpha: 1)
+        let image = PageCurlPlaceholder.image(background: paper)
+        let cg = try XCTUnwrap(image.cgImage)
+        var pixel = [UInt8](repeating: 0, count: 4)
+        let context = try XCTUnwrap(CGContext(data: &pixel, width: 1, height: 1, bitsPerComponent: 8, bytesPerRow: 4,
+                                              space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+        context.draw(cg, in: CGRect(x: 0, y: 0, width: 1, height: 1))
+        XCTAssertEqual(Double(pixel[0]), 0.98 * 255, accuracy: 3)
+        XCTAssertEqual(Double(pixel[1]), 0.94 * 255, accuracy: 3)
+        XCTAssertEqual(Double(pixel[2]), 0.85 * 255, accuracy: 3)
+    }
+
     func testACommittedDragReportsItsTurnExactlyOnce() async {
         let (controller, delegate) = await armedSlideDrag()
         XCTAssertTrue(controller.isArmedForTesting)
@@ -464,7 +627,7 @@ class PageCurlPanControllerTests: XCTestCase {
         window.makeKeyAndVisible()
         addTeardownBlock { @MainActor in window.isHidden = true }
         for _ in 0 ..< 200 where navigator.currentLocation == nil { try await Task.sleep(nanoseconds: 50_000_000) }
-        try await Task.sleep(nanoseconds: 800_000_000)
+        try await Task.sleep(nanoseconds: 2_000_000_000)
         navigator.seedCurlPrerenderForTesting()
         XCTAssertTrue(navigator.curlPrerenderIsSeededForTesting, "the seeded cache is readable under the current key")
         return (navigator, window)
@@ -494,6 +657,60 @@ class PageCurlPanControllerTests: XCTestCase {
         navigator.apply(decorations: [mark], in: "highlights")
         try await Task.sleep(nanoseconds: 600_000_000)
         XCTAssertFalse(navigator.curlPrerenderIsSeededForTesting, "a user highlight can be on the neighbour")
+    }
+
+    private func page(_ lines: Int) -> PageCurlFingerprint {
+        let image = UIGraphicsImageRenderer(size: CGSize(width: 60, height: 120)).image { ctx in
+            UIColor.white.setFill()
+            ctx.fill(CGRect(x: 0, y: 0, width: 60, height: 120))
+            UIColor.black.setFill()
+            for i in 0 ..< lines { ctx.fill(CGRect(x: 6, y: 8 + i * 6, width: 48, height: 2)) }
+        }
+        return PageCurlFingerprint.of(image.cgImage!)!
+    }
+
+    /// A moving spoken-word mark changes the page's pixels but not the page: the fingerprint must not call
+    /// the next drag a miss; without such a mark it still does.
+    @MainActor
+    func testASpokenWordMarkDoesNotMakeTheNextDragAFingerprintMiss() async throws {
+        let (navigator, _) = try await makeCacheNavigator()
+        navigator.transientDecorationGroups = ["tts"]
+        navigator.seedCurlPrerenderForTesting(current: page(10))
+        XCTAssertFalse(navigator.curlCachedNeighborIsServedForTesting(.forward, onScreen: page(2)), "a different page is a miss")
+        XCTAssertTrue(navigator.curlCachedNeighborIsServedForTesting(.forward, onScreen: page(10)))
+        let locator = Locator(href: RelativeURL(string: "a.xhtml")!, mediaType: .xhtml, locations: .init(progression: 0.0))
+        navigator.apply(decorations: [Decoration(id: "w", locator: locator, style: .highlight(tint: .yellow))], in: "tts")
+        try await Task.sleep(nanoseconds: 400_000_000)
+        XCTAssertTrue(navigator.curlCachedNeighborIsServedForTesting(.forward, onScreen: page(2)), "with the mark showing, the highlighted page still matches")
+    }
+
+    /// Stopping Read Aloud must not leave a highlight baked into a cached page.
+    @MainActor
+    func testStoppingReadAloudClearsPagesTakenWhileItsMarkShowed() async throws {
+        let (navigator, _) = try await makeCacheNavigator()
+        navigator.transientDecorationGroups = ["tts"]
+        let locator = Locator(href: RelativeURL(string: "a.xhtml")!, mediaType: .xhtml, locations: .init(progression: 0.0))
+        navigator.apply(decorations: [Decoration(id: "w", locator: locator, style: .highlight(tint: .yellow))], in: "tts")
+        try await Task.sleep(nanoseconds: 400_000_000)
+        navigator.seedCurlPrerenderForTesting(current: page(10))
+        navigator.apply(decorations: [], in: "tts")
+        try await Task.sleep(nanoseconds: 400_000_000)
+        XCTAssertFalse(navigator.curlPrerenderIsSeededForTesting, "a page taken with the mark showing is dropped when it clears")
+
+        // A page taken with no mark showing survives the first mark appearing and clearing.
+        navigator.seedCurlPrerenderForTesting(current: page(10))
+        navigator.apply(decorations: [], in: "tts")
+        try await Task.sleep(nanoseconds: 300_000_000)
+        XCTAssertTrue(navigator.curlPrerenderIsSeededForTesting)
+    }
+
+    /// Light/dark (and the other traits the page depends on) change while the app is active.
+    @MainActor
+    func testAnAppearanceChangeWhileActiveClearsTheCache() async throws {
+        let (navigator, window) = try await makeCacheNavigator()
+        window.overrideUserInterfaceStyle = window.traitCollection.userInterfaceStyle == .dark ? .light : .dark
+        try await Task.sleep(nanoseconds: 500_000_000)
+        XCTAssertFalse(navigator.curlPrerenderIsSeededForTesting)
     }
 
     @MainActor
