@@ -393,7 +393,7 @@ class PageCurlGeometryTests: XCTestCase {
         let blackType = 0 + (light.r - 0) * light.mix
         XCTAssertLessThan(blackType, 0.85)
         XCTAssertGreaterThan(blackType, 0.6)
-        XCTAssertTrue(PageCurlShader.source.contains("paperBack(sampleTex(outgoing, paperUV(q, aspect)), u)"))
+        XCTAssertTrue(PageCurlShader.source.contains("paperBack(sampleFront(outgoing, paperUV(q, aspect), u), u)"))
     }
 
     func testGrabAtACornerPeelsDiagonallyAndMidEdgeStaysVertical() {
@@ -1024,15 +1024,15 @@ class PageCurlGeometryTests: XCTestCase {
         XCTAssertEqual(PageCurlGeometry.incomingReveal(snapshotSucceeded: false), .crossfade)
     }
 
-    /// Fifteen floats, as `CurlUniforms` in the shader (no padding).
+    /// Twenty floats, as `CurlUniforms` in the shader (no padding).
     func testUniformStrideMatchesTheShaderStruct() {
-        XCTAssertEqual(MemoryLayout<PageCurlUniforms>.stride, 15 * 4)
-        XCTAssertEqual(MemoryLayout<PageCurlUniforms>.size, 15 * 4)
+        XCTAssertEqual(MemoryLayout<PageCurlUniforms>.stride, 20 * 4)
+        XCTAssertEqual(MemoryLayout<PageCurlUniforms>.size, 20 * 4)
         let fields = PageCurlShader.source.components(separatedBy: "struct CurlUniforms {")[1]
             .components(separatedBy: "};")[0]
             .components(separatedBy: ";")
             .filter { $0.contains("float ") }
-        XCTAssertEqual(fields.count, 15)
+        XCTAssertEqual(fields.count, 20)
     }
 
     func testCurlShaderCompiles() throws {
