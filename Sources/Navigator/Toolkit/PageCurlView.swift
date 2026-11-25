@@ -578,9 +578,10 @@ final class PageCurlView: UIView, PageTurnOverlayView {
         return true
     }
 
-    /// The fade has run its course (or there was none): the leaf may land.
+    /// The fade has run its course (or there was none): the leaf may land. A cancel
+    /// is already flat on the outgoing page, so it does not wait.
     private var incomingFadeSettled: Bool {
-        incomingIsPlaceholder || incomingFade >= 1
+        springTarget < 0.5 || incomingIsPlaceholder || incomingFade >= 1
     }
 
     /// Drawable aspect when the layer has a size, otherwise the view's.

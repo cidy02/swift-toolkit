@@ -241,6 +241,7 @@ final class PageSlideView: UIView, PageTurnOverlayView {
         duration: TimeInterval = PageSlideGeometry.tapDuration
     ) async {
         _ = realVerso
+        incomingFadeEnd = nil
         finishTap()
         endInteractive()
         guard isAttached else {
@@ -290,6 +291,7 @@ final class PageSlideView: UIView, PageTurnOverlayView {
         _ = realVerso
         _ = grabUV
         _ = fingerUV
+        incomingFadeEnd = nil
         finishTap()
         endInteractive()
         guard isAttached else {
@@ -339,14 +341,25 @@ final class PageSlideView: UIView, PageTurnOverlayView {
         let animate = fade && !UIAccessibility.isReduceMotionEnabled
         for view in views {
             if animate {
-                UIView.transition(with: view, duration: 0.18, options: [.transitionCrossDissolve, .allowUserInteraction]) {
+                UIView.transition(with: view, duration: Self.incomingFadeDuration, options: [.transitionCrossDissolve, .allowUserInteraction]) {
                     view.image = image
                 }
             } else {
                 view.image = image
             }
         }
-            return true
+        incomingFadeEnd = animate ? CACurrentMediaTime() + Self.incomingFadeDuration : nil
+        return true
+    }
+
+    private static let incomingFadeDuration: CFTimeInterval = 0.18
+    private var incomingFadeEnd: CFTimeInterval?
+
+    /// The cross-dissolve has run its course (or there was none): the page may land.
+    /// A cancel is already flat on the outgoing page, so it does not wait.
+    private func incomingFadeSettled(target: CGFloat) -> Bool {
+        guard target >= 0.5, let end = incomingFadeEnd else { return true }
+        return CACurrentMediaTime() >= end
     }
 
     func finishInteractive(target: CGFloat, progressVelocity: CGFloat) async {
@@ -365,7 +378,7 @@ final class PageSlideView: UIView, PageTurnOverlayView {
         springOmega = PageCurlPanStateMachine.omega(progressVelocity: velocity)
         springStart = CACurrentMediaTime()
         interactivePhase = .spring
-        if abs(progress - target) < 0.002, abs(velocity) < 0.02 {
+        if abs(progress - target) < 0.002, abs(velocity) < 0.02, incomingFadeSettled(target: target) {
             progress = target
             applyLayout()
             endInteractive()
@@ -396,6 +409,7 @@ final class PageSlideView: UIView, PageTurnOverlayView {
     func releaseResources() {
         stopClock()
         resumeWaiters()
+        incomingFadeEnd = nil
         isArmed = false
         underImageView.image = nil
         cardImageView.image = nil
@@ -610,7 +624,8 @@ final class PageSlideView: UIView, PageTurnOverlayView {
             target: springTarget,
             omega: springOmega
         )
-        let landed = abs(progress - springTarget) < 0.002 || elapsed > 0.7
+        // The dissolve from the page colour is not cut short by a quick landing.
+        let landed = (abs(progress - springTarget) < 0.002 && incomingFadeSettled(target: springTarget)) || elapsed > 0.7
         if landed {
             progress = springTarget
         }

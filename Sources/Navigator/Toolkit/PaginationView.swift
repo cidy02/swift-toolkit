@@ -553,6 +553,10 @@ final class PaginationView: UIView, Loggable {
 
     /// Bitmap of the neighbour, taken on screen under the caller's opaque cover,
     /// without changing `currentIndex`. The offset is restored before returning.
+    /// Longest the neighbour may take to load. `spreadDidLoad` alone sleeps 0.5 s on a backward
+    /// (end-of-chapter) landing, so this leaves a slow device 1.5 s for WebKit.
+    static let neighborLoadDeadline: TimeInterval = 2.0
+
     func captureNeighborForCurl(forward: Bool, background: UIColor) async -> UIImage? {
         let generation = reloadGeneration
         let index = neighborIndex(forward: forward)
@@ -563,7 +567,7 @@ final class PaginationView: UIView, Loggable {
         // Bounded: a neighbour that never finishes loading must not hold the turn.
         let loaded: (UIView & PageView)? = await ReadyResume.awaitFirst { box in
             Task { @MainActor in
-                try? await Task.sleep(seconds: 1.0)
+                try? await Task.sleep(seconds: Self.neighborLoadDeadline)
                 box.resume(returning: nil)
             }
             Task { @MainActor [weak self] in
@@ -574,7 +578,8 @@ final class PaginationView: UIView, Loggable {
             (loadedViews[index])?.setSuppressingProgressionUpdates(false)
             return nil
         }
-        guard generation == reloadGeneration else {
+        // Cancelled (the pan controller's backstop) before the column moved: leave it alone.
+        guard generation == reloadGeneration, !Task.isCancelled else {
             return nil
         }
         let saved = scrollView.contentOffset
@@ -592,7 +597,8 @@ final class PaginationView: UIView, Loggable {
         scrollView.contentOffset = CGPoint(x: xOffsetForIndex(index), y: saved.y)
         layoutIfNeeded()
         await neighbor.awaitNextPaint()
-        guard generation == reloadGeneration else {
+        // `defer` puts the offset back.
+        guard generation == reloadGeneration, !Task.isCancelled else {
             return nil
         }
         return await PageCurlSnapshotter.capture(of: neighbor, backgroundColor: background)

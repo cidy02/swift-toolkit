@@ -543,8 +543,10 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
     /// resource has no further column.
     func prepareCurlIncoming(direction: Direction, background: UIColor) async -> UIImage? {
         // A cached drag whose session was dropped (reload) left its scroll here.
+        // A cancelled capture (the pan controller's backstop) does nothing more: it leaves
+        // `curlDelta` / `curlTargetOffset` as they are so the revert puts the column back.
         await awaitPendingCurlScroll()
-        guard let delta = pageDelta(for: direction) else {
+        guard !Task.isCancelled, let delta = pageDelta(for: direction) else {
             return nil
         }
         curlDelta = delta
@@ -553,8 +555,16 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         setSuppressingProgressionUpdates(true)
         await scrollByAwaitingPaint(delta)
         PageCurlLatency.mark("incoming-scrolled")
+        guard !Task.isCancelled else {
+            return nil
+        }
         guard var image = await PageCurlSnapshotter.capture(of: self, backgroundColor: background) else {
-            await revertCurlIncoming()
+            if !Task.isCancelled {
+                await revertCurlIncoming()
+            }
+            return nil
+        }
+        guard !Task.isCancelled else {
             return nil
         }
         PageCurlLatency.mark("incoming-snapshot")
@@ -574,6 +584,9 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
                 await scrollByAwaitingPaint(correction)
                 corrected = true
             }
+        }
+        guard !Task.isCancelled else {
+            return nil
         }
         if corrected,
            let target = curlTargetOffset,
@@ -838,7 +851,17 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         // moved by one page, and a fallback `scrollBy` would skip the next one.
         if result == .failed {
             let call = scrollCall.replacingOccurrences(of: "left: x", with: "left: \(x)")
-            await evaluateScript(call)
+            // Bounded like the paint wait: a web process that never answers must not hold the turn.
+            await ReadyResume.awaitFirst { (box: ReadyResumeBox<Void>) in
+                Task { @MainActor in
+                    try? await Task.sleep(seconds: PageTransitionAnimator.paintTimeout)
+                    box.resume()
+                }
+                Task { @MainActor in
+                    await self.evaluateScript(call)
+                    box.resume()
+                }
+            }
         }
     }
 

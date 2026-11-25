@@ -138,21 +138,45 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
     private var pendingCapture: Task<UIImage?, Never>?
     /// The turn is being cancelled: a page that arrives now is not uploaded.
     private var cancellingTurn = false
-    /// Longest `finish` waits for the real page. The capture's own steps are bounded
-    /// too (snapshot 1 s, neighbour load 1 s); this is the backstop that cannot wedge.
-    static var incomingDeadline: TimeInterval = 2.5
+    /// Longest `finish` waits for the real page. Must exceed the sum of the capture's own bounded
+    /// steps, worst case (reflowable: pending scroll 0.5 + 2 x (scroll 0.25 + its fallback 0.25) +
+    /// 2 snapshots of 1.0 = 3.5 s; neighbour: load 2.0 + paint 0.25 + snapshot 1.0 = 3.25 s), so it
+    /// only fires on a capture that is stuck, never on a slow one.
+    static let defaultIncomingDeadline: TimeInterval = 4.5
+    static var incomingDeadline: TimeInterval = defaultIncomingDeadline
+    /// After the backstop cancels a capture, how long its one remaining bounded step (a snapshot,
+    /// 1.0 s) may take to hand the column back before the cover is allowed to come off.
+    static let defaultCaptureSettleGrace: TimeInterval = 1.5
+    static var captureSettleGrace: TimeInterval = defaultCaptureSettleGrace
 
+    /// Waits for the capture. On the backstop the capture is cancelled (every step it takes
+    /// afterwards is a no-op) and given `captureSettleGrace` to put the column back; only then
+    /// does the caller go on, revert under the cover and drop it.
     private func boundedWait(_ task: Task<UIImage?, Never>) async -> UIImage? {
         let limit = Self.incomingDeadline
-        return await ReadyResume.awaitFirst { box in
+        let result: (image: UIImage?, timedOut: Bool) = await ReadyResume.awaitFirst { box in
             Task { @MainActor in
                 try? await Task.sleep(seconds: limit)
-                box.resume(returning: nil)
+                box.resume(returning: (nil, true))
             }
             Task { @MainActor in
-                box.resume(returning: await task.value)
+                box.resume(returning: (await task.value, false))
             }
         }
+        guard result.timedOut else { return result.image }
+        task.cancel()
+        let grace = Self.captureSettleGrace
+        await ReadyResume.awaitFirst { (box: ReadyResumeBox<Void>) in
+            Task { @MainActor in
+                try? await Task.sleep(seconds: grace)
+                box.resume()
+            }
+            Task { @MainActor in
+                _ = await task.value
+                box.resume()
+            }
+        }
+        return nil
     }
 
     override init() {
