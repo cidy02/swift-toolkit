@@ -18,6 +18,25 @@ struct PageCurlPanFrame {
     /// One-page turn back to the previous page. The cylinder runs backwards
     /// from the binding spine instead of peeling off the opposite edge.
     var reversed: Bool
+    /// Set when `incoming` is only a page-colour placeholder: the real bitmap is
+    /// still being taken (a cache miss). The finger tracks the placeholder at once
+    /// and the real page replaces it when this resolves. Nil result = it failed.
+    var pendingIncoming: Task<UIImage?, Never>? = nil
+}
+
+/// The incoming side of a turn whose real page is not cached yet: the page
+/// colour of the current theme, no text.
+enum PageCurlPlaceholder {
+    static func image(background: UIColor) -> UIImage {
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        format.opaque = true
+        format.preferredRange = .standard
+        return UIGraphicsImageRenderer(size: CGSize(width: 8, height: 8), format: format).image { context in
+            background.setFill()
+            context.fill(CGRect(x: 0, y: 0, width: 8, height: 8))
+        }
+    }
 }
 
 /// The navigator owns location and the web view. The controller owns the finger.
@@ -110,6 +129,10 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
     /// Set when the finger lifts before the incoming page is ready.
     private var pendingRelease: (commit: Bool, velocity: CGFloat, finger: CGPoint)?
     private var aborted = false
+    /// The real incoming page, arriving behind the placeholder. `finish` waits for it
+    /// before it commits or reverts, so the web view's column state is settled.
+    private var incomingArrival: Task<Void, Never>?
+    private var incomingFailed = false
 
     override init() {
         let pan = PageCurlPanRecognizer()
@@ -381,6 +404,9 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
         }
         let fingerPoint = sampled?.point ?? pendingRelease?.finger ?? lastFinger
         let progress = sampled?.progress ?? lastProgress
+        if frame.pendingIncoming != nil {
+            curl.expectIncomingPlaceholder()
+        }
         let armed = await curl.beginInteractive(
             outgoing: frame.outgoing,
             incoming: frame.incoming,
@@ -401,6 +427,29 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
             return
         }
         phase = .armed
+        if let pending = frame.pendingIncoming {
+            incomingArrival = Task { @MainActor [weak self, weak curl] in
+                let image = await pending.value
+                // A late snapshot of a drag that ended, aborted or moved on is dropped.
+                guard let self, let curl, self.curlView === curl, !self.aborted, self.phase != .idle else {
+                    return
+                }
+                PageCurlLatency.mark("incoming-arrived", "ok=\(image != nil)")
+                if let image {
+                    await curl.replaceIncoming(image, fade: true)
+                } else {
+                    // The page could not be taken: end the drag cleanly, back where it started.
+                    self.incomingFailed = true
+                    if self.phase == .armed, !self.endConsumed {
+                        self.endConsumed = true
+                        // Not awaited here: `finish` waits for this very task.
+                        Task { @MainActor in
+                            await self.finish(commit: false, velocity: 0)
+                        }
+                    }
+                }
+            }
+        }
         if gesture.state == .began || gesture.state == .changed {
             let now = fingerState(of: gesture, in: host)
             lastProgress = now.progress
@@ -489,9 +538,15 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
     func finish(commit: Bool, velocity: CGFloat) async {
         guard phase != .idle, phase != .finishing else { return }
         phase = .finishing
+        // The real page is still being taken behind the placeholder: its column
+        // scroll must finish before anything is committed or put back.
+        if let arrival = incomingArrival {
+            await arrival.value
+            incomingArrival = nil
+        }
         let width = delegate?.curlPanHostView()?.bounds.width ?? 1
         let progressVelocity = width > 1 ? velocity / width : 0
-        let willCommit = commit && !aborted
+        let willCommit = commit && !aborted && !incomingFailed
         // The leaf covers the web view for the whole spring, so the next
         // column can be rendered behind it now instead of at the next touch.
         var prerender: Task<Void, Never>?
@@ -534,6 +589,8 @@ final class PageCurlPanController: NSObject, UIGestureRecognizerDelegate {
         metalArmed = false
         pendingRelease = nil
         aborted = false
+        incomingFailed = false
+        incomingArrival = nil
         resumeAbortWaiter()
         if reportTurn {
             delegate?.curlPanDidCommitTurn(direction: turnDirection)

@@ -47,6 +47,11 @@ enum PageCurlShader {
         float paperB;
         float paperMix;
         float aspect;
+        float bgR;
+        float bgG;
+        float bgB;
+        float fadeFront;
+        float fadeBack;
     };
 
     struct CurlVertexOut {
@@ -71,6 +76,15 @@ enum PageCurlShader {
 
     static float3 sampleTex(texture2d<float> tex, float2 uv) {
         return tex.sample(curlSampler, clamp(uv, float2(0.0), float2(1.0))).rgb;
+    }
+
+    // A page that is still the placeholder fades in from the page colour.
+    static float3 sampleFront(texture2d<float> tex, float2 uv, constant CurlUniforms &u) {
+        return mix(float3(u.bgR, u.bgG, u.bgB), sampleTex(tex, uv), clamp(u.fadeFront, 0.0, 1.0));
+    }
+
+    static float3 sampleBack(texture2d<float> tex, float2 uv, constant CurlUniforms &u) {
+        return mix(float3(u.bgR, u.bgG, u.bgB), sampleTex(tex, uv), clamp(u.fadeBack, 0.0, 1.0));
     }
 
     static float3 paperBack(float3 src, constant CurlUniforms &u) {
@@ -110,12 +124,12 @@ enum PageCurlShader {
         constant CurlUniforms &u [[buffer(0)]]
     ) {
         float2 uv = in.uv;
-        float3 outC = sampleTex(outgoing, uv);
+        float3 outC = sampleFront(outgoing, uv, u);
         if (u.progress <= 0.001) {
             return float4(outC, 1.0);
         }
         if (u.progress >= 0.999) {
-            return float4(sampleTex(incoming, uv), 1.0);
+            return float4(sampleBack(incoming, uv, u), 1.0);
         }
         float aspect = max(u.aspect, 0.05);
         float pageH = 1.0 / aspect;
@@ -128,7 +142,7 @@ enum PageCurlShader {
         float len = length(delta);
         float envelope = sin(clamp(u.progress, 0.0, 1.0) * 3.14159265);
         if (len <= 0.0008) {
-            float3 flat = u.progress > 0.5 ? sampleTex(incoming, uv) : outC;
+            float3 flat = u.progress > 0.5 ? sampleBack(incoming, uv, u) : outC;
             return float4(flat, 1.0);
         }
 
@@ -156,9 +170,9 @@ enum PageCurlShader {
                     float far = max(1.0 - span, 0.0);
                     float versoAlong = -along * (far / span);
                     float versoX = u.spineX + sign * versoAlong;
-                    back = sampleTex(incoming, float2(versoX, clamp(q.y * aspect, 0.0, 1.0)));
+                    back = sampleBack(incoming, float2(versoX, clamp(q.y * aspect, 0.0, 1.0)), u);
                 } else {
-                    back = paperBack(sampleTex(outgoing, paperUV(q, aspect)), u);
+                    back = paperBack(sampleFront(outgoing, paperUV(q, aspect), u), u);
                 }
                 return float4(clamp(back * rollShade, 0.0, 1.0), 1.0);
             }
@@ -167,7 +181,7 @@ enum PageCurlShader {
         if (rolls && w >= 0.0 && w <= R) {
             float2 q = iso - N * (R * theta - w);
             if (inLeaf(q, u.spineX, sign, span, pageH)) {
-                float3 front = sampleTex(outgoing, paperUV(q, aspect));
+                float3 front = sampleFront(outgoing, paperUV(q, aspect), u);
                 return float4(clamp(front * rollShade, 0.0, 1.0), 1.0);
             }
         }
@@ -188,7 +202,7 @@ enum PageCurlShader {
         }
 
         // Next page, full contrast, with a faint shadow past the roll.
-        float3 inC = sampleTex(incoming, uv);
+        float3 inC = sampleBack(incoming, uv, u);
         float2 crest = iso - N * (R * 1.57079633 - w);
         float gap = max(w - R, 0.0) + leafGap(crest, u.spineX, sign, span, pageH);
         float shadow = exp(-gap / \#(rollShadowWidth)) * \#(rollShadowStrength) * envelope;

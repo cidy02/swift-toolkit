@@ -26,6 +26,8 @@ class PageCurlPanControllerTests: XCTestCase {
         var didCancel = 0
         var outgoingImage: UIImage?
         var incomingImage: UIImage?
+        /// A capture that has not arrived: the turn starts on a placeholder.
+        var heldCapture: Task<UIImage?, Never>?
 
         func curlPanContext(in view: UIView) -> PageCurlPanContext {
             PageCurlPanContext(
@@ -56,6 +58,19 @@ class PageCurlPanControllerTests: XCTestCase {
             outgoing: UIImage,
             background: UIColor
         ) async -> PageCurlPanFrame? {
+            if let held = heldCapture {
+                return PageCurlPanFrame(
+                    outgoing: outgoing,
+                    incoming: PageCurlPlaceholder.image(background: background),
+                    background: background,
+                    spine: .leading,
+                    peelSign: 1,
+                    realVerso: false,
+                    withinResource: true,
+                    reversed: direction == .backward,
+                    pendingIncoming: held
+                )
+            }
             guard let img = incomingImage else { return nil }
             return PageCurlPanFrame(
                 outgoing: outgoing,
@@ -188,6 +203,89 @@ class PageCurlPanControllerTests: XCTestCase {
     }
 
     private var windows: [UIWindow] = []
+
+    @MainActor private final class CaptureGate {
+        var continuation: CheckedContinuation<UIImage?, Never>?
+        func task() -> Task<UIImage?, Never> {
+            Task { @MainActor in await withCheckedContinuation { self.continuation = $0 } }
+        }
+        func release(_ image: UIImage?) async {
+            for _ in 0 ..< 100 where continuation == nil { try? await Task.sleep(nanoseconds: 10_000_000) }
+            continuation?.resume(returning: image)
+            continuation = nil
+        }
+    }
+
+    private func heldDrag(gate: CaptureGate) async -> (PageCurlPanController, Delegate) {
+        let bounds = CGRect(x: 0, y: 0, width: 402, height: 874)
+        let window = UIWindow(frame: bounds)
+        let host = UIView(frame: bounds)
+        window.addSubview(host)
+        window.makeKeyAndVisible()
+        windows.append(window)
+        let renderer = UIGraphicsImageRenderer(size: CGSize(width: 20, height: 20))
+        let delegate = Delegate()
+        delegate.accepts = true
+        delegate.hostView = host
+        delegate.makeSlide = true
+        delegate.outgoingImage = renderer.image { $0.fill(CGRect(x: 0, y: 0, width: 20, height: 20)) }
+        delegate.heldCapture = gate.task()
+        let controller = PageCurlPanController()
+        controller.delegate = delegate
+        controller.attach(to: host)
+        controller.begin(controller.recognizer)
+        for _ in 0 ..< 100 where !controller.isArmedForTesting {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        return (controller, delegate)
+    }
+
+    /// A cache miss must not make the finger wait: the drag arms on the placeholder
+    /// while the capture is still held, and the real page replaces it on arrival.
+    @MainActor
+    func testADragArmsOnAPlaceholderWhileTheCaptureIsHeldThenTheRealPageReplacesIt() async throws {
+        let gate = CaptureGate()
+        let (controller, delegate) = await heldDrag(gate: gate)
+        XCTAssertTrue(controller.isArmedForTesting, "armed with the capture still outstanding")
+        let slide = try XCTUnwrap(delegate.overlayMade as? PageSlideView)
+        let placeholder = try XCTUnwrap(slide.underImageForTesting)
+        XCTAssertEqual(placeholder.size, CGSize(width: 8, height: 8))
+
+        let real = UIGraphicsImageRenderer(size: CGSize(width: 20, height: 20)).image { $0.fill(CGRect(x: 0, y: 0, width: 20, height: 20)) }
+        await gate.release(real)
+        for _ in 0 ..< 100 where slide.underImageForTesting !== real { try? await Task.sleep(nanoseconds: 10_000_000) }
+        XCTAssertTrue(slide.underImageForTesting === real, "the real page replaced the placeholder")
+        await controller.finish(commit: true, velocity: 0)
+        XCTAssertEqual(delegate.commits, 1)
+    }
+
+    /// Cancelling before the snapshot arrives ends cleanly, and the late snapshot is dropped.
+    @MainActor
+    func testCancellingBeforeTheCaptureArrivesEndsCleanlyAndDropsTheLateImage() async throws {
+        let gate = CaptureGate()
+        let (controller, delegate) = await heldDrag(gate: gate)
+        let slide = try XCTUnwrap(delegate.overlayMade as? PageSlideView)
+        let release = Task { await gate.release(UIImage()) }
+        await controller.finish(commit: false, velocity: 0)
+        await release.value
+        XCTAssertEqual(delegate.commits, 0)
+        XCTAssertEqual(delegate.didCancel, 1)
+        XCTAssertEqual(delegate.didFinish, 1)
+        XCTAssertFalse(controller.turnInFlight)
+        XCTAssertNil(slide.superview)
+    }
+
+    /// A capture that fails mid-drag ends the turn back where it started.
+    @MainActor
+    func testACaptureThatFailsEndsTheDragWithoutACommit() async {
+        let gate = CaptureGate()
+        let (controller, delegate) = await heldDrag(gate: gate)
+        await gate.release(nil)
+        for _ in 0 ..< 100 where controller.turnInFlight { try? await Task.sleep(nanoseconds: 10_000_000) }
+        XCTAssertFalse(controller.turnInFlight)
+        XCTAssertEqual(delegate.commits, 0)
+        XCTAssertEqual(delegate.didCancel, 1)
+    }
 
     func testACommittedDragReportsItsTurnExactlyOnce() async {
         let (controller, delegate) = await armedSlideDrag()

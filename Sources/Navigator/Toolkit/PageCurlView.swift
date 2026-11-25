@@ -519,8 +519,49 @@ final class PageCurlView: UIView, PageTurnOverlayView {
             paperG: Float(paper.g),
             paperB: Float(paper.b),
             paperMix: Float(paper.mix),
-            aspect: Float(aspect)
+            aspect: Float(aspect),
+            bgR: Float(background.r),
+            bgG: Float(background.g),
+            bgB: Float(background.b),
+            fadeFront: reversed ? Float(incomingFade) : 1,
+            fadeBack: reversed ? 1 : Float(incomingFade)
         )
+    }
+
+    private var background: PageCurlRGB {
+        (backgroundColor ?? .white).pageCurlRGB
+    }
+
+    /// 0 while the incoming page is only the placeholder, then eases to 1.
+    private var incomingFade: CGFloat {
+        if incomingIsPlaceholder {
+            return 0
+        }
+        guard let start = incomingFadeStart else {
+            return 1
+        }
+        return min(1, max(0, (CACurrentMediaTime() - start) / Self.incomingFadeDuration))
+    }
+
+    private static let incomingFadeDuration: CFTimeInterval = 0.18
+    private var incomingIsPlaceholder = false
+    private var incomingFadeStart: CFTimeInterval?
+
+    /// The incoming bitmap of the next `beginInteractive` is a placeholder in the page colour.
+    func expectIncomingPlaceholder() {
+        incomingIsPlaceholder = true
+        incomingFadeStart = nil
+    }
+
+    /// The real page has arrived: swap its texture in and fade it up from the page colour.
+    func replaceIncoming(_ image: UIImage, fade: Bool) async {
+        guard interactivePhase != .none, let renderer, await renderer.replaceIncoming(image),
+              interactivePhase != .none
+        else {
+            return
+        }
+        incomingIsPlaceholder = false
+        incomingFadeStart = fade && !UIAccessibility.isReduceMotionEnabled ? CACurrentMediaTime() : nil
     }
 
     /// Drawable aspect when the layer has a size, otherwise the view's.
@@ -877,6 +918,14 @@ private final class PageCurlRenderer {
             releaseTextures()
             return false
         }
+        return true
+    }
+
+    func replaceIncoming(_ image: UIImage) async -> Bool {
+        guard let texture = await Self.upload(image, loader: loader).value else {
+            return false
+        }
+        incoming = texture
         return true
     }
 

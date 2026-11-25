@@ -1983,42 +1983,56 @@ extension EPUBNavigatorViewController: PageCurlPanDelegate {
         let spreadDirection = spreadDirection(for: direction)
 
         if spread.canGo(to: spreadDirection), let reflow = spread as? EPUBReflowableSpreadView {
-            let incoming: UIImage
             if let cached = cachedCurlNeighbor(direction, on: reflow),
                reflow.beginCurlIncomingScroll(direction: spreadDirection)
             {
-                incoming = cached
-            } else {
-                guard let shot = await reflow.prepareCurlIncoming(direction: spreadDirection, background: background) else {
-                    return nil
-                }
-                incoming = shot
+                curlDragIncoming = cached
+                return PageCurlPanFrame(
+                    outgoing: outgoing,
+                    incoming: cached,
+                    background: background,
+                    spine: spine,
+                    peelSign: peel,
+                    realVerso: columns >= 2,
+                    withinResource: true,
+                    reversed: reversed
+                )
             }
-            curlDragIncoming = incoming
+            // A miss: the finger starts on a page-colour placeholder, and the column
+            // is scrolled and photographed behind the leaf's cover (a drag only).
+            let pending = Task { @MainActor [weak self] () -> UIImage? in
+                let shot = await reflow.prepareCurlIncoming(direction: spreadDirection, background: background)
+                if let shot {
+                    self?.curlDragIncoming = shot
+                }
+                return shot
+            }
             return PageCurlPanFrame(
                 outgoing: outgoing,
-                incoming: incoming,
+                incoming: PageCurlPlaceholder.image(background: background),
                 background: background,
                 spine: spine,
                 peelSign: peel,
                 realVerso: columns >= 2,
                 withinResource: true,
-                reversed: reversed
+                reversed: reversed,
+                pendingIncoming: pending
             )
         }
 
-        guard let incoming = await paginationView?.captureNeighborForCurl(forward: forward, background: background) else {
-            return nil
+        let pending = Task { @MainActor [weak paginationView] () -> UIImage? in
+            await paginationView?.captureNeighborForCurl(forward: forward, background: background)
         }
         return PageCurlPanFrame(
             outgoing: outgoing,
-            incoming: incoming,
+            incoming: PageCurlPlaceholder.image(background: background),
             background: background,
             spine: spine,
             peelSign: peel,
             realVerso: columns >= 2,
             withinResource: false,
-            reversed: reversed
+            reversed: reversed,
+            pendingIncoming: pending
         )
     }
 

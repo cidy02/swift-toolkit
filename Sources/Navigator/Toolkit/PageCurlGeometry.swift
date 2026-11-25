@@ -975,4 +975,10 @@ struct PageCurlUniforms {
     var paperB: Float = 1
     var paperMix: Float = 0.75
     var aspect: Float = 1
+    /// The page colour, and how far each texture has faded in from it. 1 = fully shown.
+    var bgR: Float = 1
+    var bgG: Float = 1
+    var bgB: Float = 1
+    var fadeFront: Float = 1
+    var fadeBack: Float = 1
 }
