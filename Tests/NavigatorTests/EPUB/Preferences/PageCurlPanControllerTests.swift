@@ -5,6 +5,7 @@
 //
 
 @testable import ReadiumNavigator
+import ReadiumShared
 import UIKit
 import UIKit.UIGestureRecognizerSubclass
 import XCTest
@@ -437,6 +438,74 @@ class PageCurlPanControllerTests: XCTestCase {
         controller.handle(state: .began, sample: vertical, in: host)
         controller.handle(state: .ended, sample: vertical, in: host)
         XCTAssertEqual(delegate.turns.count, 3)
+    }
+
+    @MainActor
+    private func makeCacheNavigator() async throws -> (EPUBNavigatorViewController, UIWindow) {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kudos-cache-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        let body = (1 ... 120).map { "<p>Paragraph \($0). The city never switched its streetlamps off.</p>" }.joined()
+        try "<?xml version=\"1.0\" encoding=\"UTF-8\"?><html xmlns=\"http://www.w3.org/1999/xhtml\"><head><title>a</title></head><body>\(body)</body></html>"
+            .write(to: directory.appendingPathComponent("a.xhtml"), atomically: true, encoding: .utf8)
+        let container = try await DirectoryContainer(directory: XCTUnwrap(FileURL(url: directory)))
+        let publication = Publication(
+            manifest: Manifest(metadata: Metadata(title: "Cache"), readingOrder: [Link(href: "a.xhtml", mediaType: .xhtml)]),
+            container: container
+        )
+        let navigator = try EPUBNavigatorViewController(
+            publication: publication,
+            initialLocation: nil,
+            config: .init(preferences: EPUBPreferences(pageTransition: .curl))
+        )
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
+        window.rootViewController = navigator
+        window.makeKeyAndVisible()
+        addTeardownBlock { @MainActor in window.isHidden = true }
+        for _ in 0 ..< 200 where navigator.currentLocation == nil { try await Task.sleep(nanoseconds: 50_000_000) }
+        try await Task.sleep(nanoseconds: 800_000_000)
+        navigator.seedCurlPrerenderForTesting()
+        XCTAssertTrue(navigator.curlPrerenderIsSeededForTesting, "the seeded cache is readable under the current key")
+        return (navigator, window)
+    }
+
+    /// Events that cannot change a cached neighbour's pixels keep the cache.
+    @MainActor
+    func testLeavingAndReturningToTheAppAndHidingTheReaderKeepTheCache() async throws {
+        let (navigator, _) = try await makeCacheNavigator()
+        NotificationCenter.default.post(name: UIApplication.willResignActiveNotification, object: nil)
+        NotificationCenter.default.post(name: UIApplication.didBecomeActiveNotification, object: nil)
+        navigator.viewDidDisappear(false)
+        try await Task.sleep(nanoseconds: 300_000_000)
+        XCTAssertTrue(navigator.curlPrerenderIsSeededForTesting)
+    }
+
+    @MainActor
+    func testTheReadAloudDecorationGroupKeepsTheCacheButHighlightsClearIt() async throws {
+        let (navigator, _) = try await makeCacheNavigator()
+        navigator.transientDecorationGroups = ["tts"]
+        let locator = Locator(href: RelativeURL(string: "a.xhtml")!, mediaType: .xhtml, locations: .init(progression: 0.0))
+        let mark = Decoration(id: "w", locator: locator, style: .highlight(tint: .yellow))
+        navigator.apply(decorations: [mark], in: "tts")
+        try await Task.sleep(nanoseconds: 600_000_000)
+        XCTAssertTrue(navigator.curlPrerenderIsSeededForTesting, "a spoken-word mark does not empty the cache")
+
+        navigator.apply(decorations: [mark], in: "highlights")
+        try await Task.sleep(nanoseconds: 600_000_000)
+        XCTAssertFalse(navigator.curlPrerenderIsSeededForTesting, "a user highlight can be on the neighbour")
+    }
+
+    @MainActor
+    func testPreferencesAndMemoryPressureClearTheCache() async throws {
+        let (navigator, _) = try await makeCacheNavigator()
+        navigator.submitPreferences(EPUBPreferences(fontSize: 1.3, pageTransition: .curl))
+        XCTAssertFalse(navigator.curlPrerenderIsSeededForTesting, "a preference change can change every page")
+        try await Task.sleep(nanoseconds: 800_000_000)
+        navigator.seedCurlPrerenderForTesting()
+        NotificationCenter.default.post(name: UIApplication.didReceiveMemoryWarningNotification, object: nil)
+        try await Task.sleep(nanoseconds: 300_000_000)
+        XCTAssertFalse(navigator.curlPrerenderIsSeededForTesting, "memory pressure frees it")
     }
 
     private final class SyntheticPanGestureRecognizer: UIPanGestureRecognizer {

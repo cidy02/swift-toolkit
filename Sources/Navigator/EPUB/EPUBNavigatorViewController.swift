@@ -480,10 +480,19 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         // and submits Metal work the GPU will abort.
         curlPan?.abort(keepingCover: true)
         (paginationView?.currentView as? EPUBSpreadView)?.stopActiveCurlForLifecycle()
-        invalidateCurlPrerender("resign-active")
+        // The cached pages stay: nothing about them changed. Only the work in
+        // flight goes, and the system appearance is remembered (see `didBecomeActive`).
+        appearanceAtResign = traitCollection.userInterfaceStyle
+        cancelCurlTouchDownShot()
+        PageCurlView.dropPreloadedTextures()
     }
 
     @objc private func didBecomeActive() {
+        // Dark/light changed while away: the pages were taken in the other one.
+        if let style = appearanceAtResign, style != traitCollection.userInterfaceStyle {
+            invalidateCurlPrerender("appearance-changed")
+        }
+        appearanceAtResign = nil
         isActive = true
 
         // The device may have rotated since the last time the app was active.
@@ -558,10 +567,12 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         viewModel.viewSizeWillChange(view.bounds.size)
     }
 
-    /// Closing the reader frees the curl's cached bitmaps.
+    /// Hiding the reader keeps the curl's cached bitmaps; closing it frees them.
     override open func viewDidDisappear(_ animated: Bool) {
         super.viewDidDisappear(animated)
-        invalidateCurlPrerender("disappear")
+        // The cache stays until memory is needed (`didReceiveMemoryWarning`) or the reader closes.
+        cancelCurlTouchDownShot()
+        PageCurlView.dropPreloadedTextures()
     }
 
     override open func viewWillTransition(to size: CGSize, with coordinator: UIViewControllerTransitionCoordinator) {
@@ -800,6 +811,21 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     /// Bumped by every change that can alter a page's pixels. A bitmap taken
     /// under an older generation is never stored or shown from the cache.
     private var curlContentGeneration = 0
+    /// Test hooks for the cache rules.
+    func seedCurlPrerenderForTesting() {
+        guard let spread = paginationView?.currentView as? EPUBSpreadView else { return }
+        let image = UIGraphicsImageRenderer(size: CGSize(width: 4, height: 4)).image { _ in }
+        curlPrerender.set(image, for: .forward, key: curlPageKey(for: spread), current: nil)
+    }
+
+    var curlPrerenderIsSeededForTesting: Bool {
+        guard let spread = paginationView?.currentView as? EPUBSpreadView else { return false }
+        return curlPrerender.has(.forward, key: curlPageKey(for: spread))
+    }
+    private var appearanceAtResign: UIUserInterfaceStyle?
+    /// Decoration groups that only mark the page on screen for a moment (Read Aloud's
+    /// spoken word). Changing one does not empty the page-turn cache.
+    public var transientDecorationGroups: Set<DecorationGroup> = []
     /// The page under the finger at the latest touch-down, taken before the
     /// pan is recognised. Dropped when that touch turns out to be a tap.
     private var curlTouchDownShot: Task<CurlPageShot?, Never>?
@@ -1132,7 +1158,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                     return DiffableDecoration(decoration: d)
                 }
                 self.decorations[group] = target
-                if source != target {
+                if source != target, !self.transientDecorationGroups.contains(group) {
                     changed = true
                     self.invalidateCurlPrerender("decorations")
                 }
@@ -1362,8 +1388,10 @@ extension EPUBNavigatorViewController: EPUBNavigatorViewModelDelegate {
                 await view.evaluateScript(script, inHREF: href)
                 // The preferences invalidated before the script ran; a
                 // neighbour taken while it was in flight shows the old CSS.
-                await MainActor.run {
-                    self.invalidateCurlPrerender("script-applied")
+                if relayouts {
+                    await MainActor.run {
+                        self.invalidateCurlPrerender("script-applied")
+                    }
                 }
                 if relayouts {
                     // The script task is not on the main actor. The flag lives
